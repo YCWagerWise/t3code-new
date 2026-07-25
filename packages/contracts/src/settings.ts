@@ -339,6 +339,53 @@ export const GrokSettings = makeProviderSettingsSchema(
 );
 export type GrokSettings = typeof GrokSettings.Type;
 
+/**
+ * AtlasSettings — configuration for one Atlas fleet node.
+ *
+ * Unlike every other provider, Atlas is not a local CLI: there is no binary to
+ * spawn. An instance points at an Atlas node's HTTP surface and dispatches to
+ * its Agent durable object. One instance per node makes the Providers page a
+ * fleet console.
+ *
+ * `plugin` selects which *body* this lens addresses — `coder` is a coding
+ * agent, `k8s-agent` a cluster operator, `fliff-agent` a betting desk. The
+ * driver is identical in every case; only the body changes.
+ */
+export const AtlasSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    baseUrl: Schema.String.pipe(
+      Schema.withDecodingDefault(Effect.succeed("http://127.0.0.1:3010")),
+      Schema.annotateKey({
+        title: "Node URL",
+        description: "HTTP base URL of the Atlas node serving this instance.",
+        providerSettingsForm: {
+          placeholder: "http://127.0.0.1:3010",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    plugin: Schema.String.pipe(
+      Schema.withDecodingDefault(Effect.succeed("coder")),
+      Schema.annotateKey({
+        title: "Plugin",
+        description: "Which Atlas body to address (coder, k8s-agent, fliff-agent, ...).",
+        providerSettingsForm: {
+          placeholder: "coder",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+  },
+  {
+    order: ["baseUrl", "plugin"],
+  },
+);
+export type AtlasSettings = typeof AtlasSettings.Type;
+
 export const OpenCodeSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(

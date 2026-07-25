@@ -1,0 +1,245 @@
+/**
+ * AtlasClient tests.
+ *
+ * These run against a *stubbed* HTTP client, not a live node — CI has no Atlas
+ * ring, and a test that silently skips when the fleet is down is a test that
+ * lies. The live-node check is a manual step recorded in ATLAS-PORT-PLAN.md.
+ *
+ * What is pinned here is the wire contract we verified by hand against a real
+ * node: the URL shape, the JSON body keys, and that the plain-text response
+ * comes back verbatim. Those are exactly the things a refactor could silently
+ * break.
+ */
+import { assert, describe, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+
+import { type AtlasMember, atlasMembers, atlasRun, modelOptionsForMember } from "./AtlasClient.ts";
+
+interface CapturedRequest {
+  url: string;
+  method: string;
+  body: string;
+}
+
+/**
+ * Minimal HttpClient stub: records the outgoing request and replays a canned
+ * response, so assertions are about the wire shape we send.
+ */
+const stubHttpClient = (respondWith: { status: number; body: string }) => {
+  const captured: Array<CapturedRequest> = [];
+  const layer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.gen(function* () {
+        const bodyText =
+          request.body._tag === "Uint8Array"
+            ? new TextDecoder().decode(request.body.body)
+            : request.body._tag === "Raw"
+              ? String(request.body.body)
+              : "";
+        captured.push({ url: request.url, method: request.method, body: bodyText });
+        return HttpClientResponse.fromWeb(
+          request,
+          new Response(respondWith.body, { status: respondWith.status }),
+        );
+      }),
+    ),
+  );
+  return { captured, layer };
+};
+
+describe("AtlasClient", () => {
+  describe("atlasRun", () => {
+    it.effect("posts task and plugin to /Agent/{runId}/run and returns the body verbatim", () => {
+      const stub = stubHttpClient({ status: 200, body: "SEAM-OK" });
+      return atlasRun({
+        baseUrl: "http://127.0.0.1:3010",
+        runId: "run-42",
+        plugin: "coder",
+        task: "say hello",
+      }).pipe(
+        Effect.map((answer) => {
+          assert.strictEqual(answer, "SEAM-OK");
+          assert.strictEqual(stub.captured.length, 1);
+          const [sent] = stub.captured;
+          assert.strictEqual(sent?.url, "http://127.0.0.1:3010/Agent/run-42/run");
+          assert.strictEqual(sent?.method, "POST");
+          assert.deepStrictEqual(JSON.parse(sent?.body ?? "{}"), {
+            task: "say hello",
+            plugin: "coder",
+          });
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("strips a trailing slash so the path never doubles up", () => {
+      const stub = stubHttpClient({ status: 200, body: "ok" });
+      return atlasRun({
+        baseUrl: "http://127.0.0.1:3010/",
+        runId: "run-1",
+        plugin: "coder",
+        task: "t",
+      }).pipe(
+        Effect.map(() => {
+          assert.strictEqual(stub.captured[0]?.url, "http://127.0.0.1:3010/Agent/run-1/run");
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("encodes a run id that would otherwise break the path", () => {
+      const stub = stubHttpClient({ status: 200, body: "ok" });
+      return atlasRun({
+        baseUrl: "http://127.0.0.1:3010",
+        runId: "a/b c",
+        plugin: "coder",
+        task: "t",
+      }).pipe(
+        Effect.map(() => {
+          assert.strictEqual(stub.captured[0]?.url, "http://127.0.0.1:3010/Agent/a%2Fb%20c/run");
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("fails with a tagged AtlasClientError, not a bare Error", () => {
+      const stub = stubHttpClient({ status: 500, body: "boom" });
+      return atlasRun({
+        baseUrl: "http://127.0.0.1:3010",
+        runId: "run-err",
+        plugin: "coder",
+        task: "t",
+      }).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          assert.strictEqual(error._tag, "AtlasClientError");
+          assert.strictEqual(error.operation, "run");
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+  });
+
+  describe("atlasMembers", () => {
+    it.effect("decodes the gossip ring", () => {
+      const stub = stubHttpClient({
+        status: 200,
+        body: JSON.stringify({
+          members: [
+            { id: "macbook", url: "http://100.72.96.53:3010", tools: ["/tool/nodes"], age_ms: 0 },
+          ],
+        }),
+      });
+      return atlasMembers("http://127.0.0.1:3010").pipe(
+        Effect.map((members) => {
+          assert.strictEqual(stub.captured[0]?.url, "http://127.0.0.1:3010/_members");
+          assert.strictEqual(members.length, 1);
+          assert.strictEqual(members[0]?.id, "macbook");
+          assert.deepStrictEqual(members[0]?.tools, ["/tool/nodes"]);
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("tolerates a member missing optional fields", () => {
+      const stub = stubHttpClient({
+        status: 200,
+        body: JSON.stringify({ members: [{ id: "seraphim", url: "http://10.0.0.2:3010" }] }),
+      });
+      return atlasMembers("http://127.0.0.1:3010").pipe(
+        Effect.map((members) => {
+          assert.deepStrictEqual(members[0]?.tools, []);
+          assert.strictEqual(members[0]?.age_ms, 0);
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+  });
+
+  describe("modelOptionsForMember", () => {
+    /**
+     * Captured verbatim from the live `macbook` node's `/_members` vitals, so
+     * these assertions track the real wire shape rather than an invented one.
+     */
+    const liveMember = {
+      id: "macbook",
+      url: "http://100.72.96.53:3010",
+      tools: [],
+      age_ms: 0,
+      vitals: {
+        ollama: {
+          loaded: ["nomic-embed-text:latest", "qwen2.5-coder:14b"],
+          models: [
+            {
+              name: "nomic-embed-text:latest",
+              family: "nomic-bert",
+              params: "137M",
+              quant: "F16",
+              size: 274302450,
+              tools: false,
+            },
+            {
+              name: "deepseek-coder:6.7b",
+              family: "llama",
+              params: "7B",
+              quant: "Q4_0",
+              size: 3827834503,
+              tools: false,
+            },
+            {
+              name: "qwen2.5-coder:14b",
+              family: "qwen2",
+              params: "14.8B",
+              quant: "Q4_K_M",
+              size: 8988124298,
+              tools: true,
+            },
+          ],
+        },
+      },
+    } as unknown as AtlasMember;
+
+    it("never offers an embedding model as a chat model", () => {
+      const ids = modelOptionsForMember(liveMember).map((option) => option.id);
+      assert.ok(!ids.includes("nomic-embed-text:latest"));
+    });
+
+    it("reports tool support truthfully per model", () => {
+      const options = modelOptionsForMember(liveMember);
+      const byId = new Map(options.map((option) => [option.id, option]));
+      // The node says deepseek cannot tool-call and qwen can. Reporting both as
+      // equals is exactly the lie this function exists to prevent.
+      assert.strictEqual(byId.get("deepseek-coder:6.7b")?.supportsTools, false);
+      assert.strictEqual(byId.get("qwen2.5-coder:14b")?.supportsTools, true);
+    });
+
+    it("marks which ollama models are already resident", () => {
+      const byId = new Map(modelOptionsForMember(liveMember).map((o) => [o.id, o]));
+      assert.strictEqual(byId.get("qwen2.5-coder:14b")?.loaded, true);
+      assert.strictEqual(byId.get("deepseek-coder:6.7b")?.loaded, false);
+    });
+
+    it("always offers the CLI-backed routes", () => {
+      const ids = modelOptionsForMember(liveMember).map((option) => option.id);
+      assert.ok(ids.includes("claude"));
+      assert.ok(ids.includes("codex"));
+    });
+
+    it("carries params and quantization as user-visible detail", () => {
+      const byId = new Map(modelOptionsForMember(liveMember).map((o) => [o.id, o]));
+      assert.strictEqual(byId.get("qwen2.5-coder:14b")?.detail, "14.8B · Q4_K_M");
+    });
+
+    it("degrades to CLI-only when a node reports no ollama vitals", () => {
+      const bare = { id: "seraphim", url: "http://10.0.0.2:3010", tools: [], age_ms: 0 };
+      const options = modelOptionsForMember(bare as unknown as AtlasMember);
+      assert.deepStrictEqual(
+        options.map((option) => option.id),
+        ["claude", "codex"],
+      );
+    });
+  });
+});
