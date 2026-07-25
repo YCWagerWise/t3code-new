@@ -31,6 +31,14 @@ export const PROVIDER_OPTIONS: Array<{
   /** Shown on the model picker sidebar when relevant */
   pickerSidebarBadge?: "new" | "soon";
 }> = [
+  // Atlas leads: it is the fleet this build exists to drive, and its models come
+  // from whichever node an instance points at rather than from this machine.
+  {
+    value: ProviderDriverKind.make("atlas"),
+    label: "Atlas",
+    available: true,
+    pickerSidebarBadge: "new",
+  },
   { value: ProviderDriverKind.make("codex"), label: "Codex", available: true },
   { value: ProviderDriverKind.make("claudeAgent"), label: "Claude", available: true },
   {

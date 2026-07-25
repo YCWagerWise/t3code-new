@@ -647,6 +647,28 @@ export const AntigravityIcon: Icon = (props) => (
   </svg>
 );
 
+/**
+ * Atlas — a gossip ring: peer nodes around a hub, linked.
+ *
+ * Drawn with `currentColor` rather than fixed fills so it inherits the accent a
+ * provider instance is given, the way the lucide glyphs elsewhere do.
+ */
+export const AtlasIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="12" cy="12" r="2.6" fill="currentColor" />
+    <circle cx="12" cy="3.4" r="2" fill="currentColor" />
+    <circle cx="19.4" cy="16.2" r="2" fill="currentColor" />
+    <circle cx="4.6" cy="16.2" r="2" fill="currentColor" />
+    <path
+      d="M12 5.4v4M13.7 13.4l4 1.8M10.3 13.4l-4 1.8"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      opacity="0.65"
+    />
+  </svg>
+);
+
 export const OpenCodeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 32 40" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g clipPath="url(#opencode__clip0_1311_94969)">

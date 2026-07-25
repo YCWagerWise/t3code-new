@@ -1,4 +1,5 @@
 import {
+  AtlasSettings,
   ClaudeSettings,
   CodexSettings,
   CursorSettings,
@@ -7,7 +8,15 @@ import {
   ProviderDriverKind,
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
-import { ClaudeAI, CursorIcon, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import {
+  AtlasIcon,
+  ClaudeAI,
+  CursorIcon,
+  GrokIcon,
+  type Icon,
+  OpenAI,
+  OpenCodeIcon,
+} from "../Icons";
 
 type ProviderSettingsSchema = {
   readonly fields: Readonly<Record<string, Schema.Top>>;
@@ -35,6 +44,15 @@ export interface ProviderClientDefinition {
 }
 
 export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
+  {
+    // Unlike every other entry, an Atlas instance is a NODE, not a local CLI --
+    // its settings form asks for a URL and a plugin instead of a binary path,
+    // and its model list comes from whatever that node reports it can run.
+    value: ProviderDriverKind.make("atlas"),
+    label: "Atlas",
+    icon: AtlasIcon,
+    settingsSchema: AtlasSettings,
+  },
   {
     value: ProviderDriverKind.make("codex"),
     label: "Codex",
