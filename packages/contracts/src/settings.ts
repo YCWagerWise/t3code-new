@@ -379,6 +379,18 @@ export const AtlasSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    /**
+     * Model ids to offer beyond what the node reports.
+     *
+     * The catalog is normally derived from the node's own gossip vitals, which
+     * is what keeps it honest. This is the escape hatch for an id the node
+     * cannot enumerate — a newly released Ollama Cloud model, say — where the
+     * user is asserting it exists rather than the node confirming it.
+     */
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
   },
   {
     order: ["baseUrl", "plugin"],
@@ -475,6 +487,11 @@ export const ServerSettings = Schema.Struct({
   // owns its config in its own package, this struct shrinks to nothing and
   // is removed entirely.
   providers: Schema.Struct({
+    // Every driver advertised to the UI needs an entry here: the settings panel
+    // resolves a legacy config per driver and asserts it is present, so a
+    // driver listed in PROVIDER_CLIENT_DEFINITIONS without one crashes the
+    // Providers page on `legacyConfig.enabled`.
+    atlas: AtlasSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     codex: CodexSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
