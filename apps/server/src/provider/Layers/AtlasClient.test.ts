@@ -197,6 +197,15 @@ describe("AtlasClient", () => {
               size: 8988124298,
               tools: true,
             },
+            {
+              name: "gpt-oss:120b-cloud",
+              family: "gptoss",
+              params: "117B",
+              quant: "MXFP4",
+              size: 0,
+              tools: true,
+              cloud: true,
+            },
           ],
         },
       },
@@ -231,6 +240,16 @@ describe("AtlasClient", () => {
     it("carries params and quantization as user-visible detail", () => {
       const byId = new Map(modelOptionsForMember(liveMember).map((o) => [o.id, o]));
       assert.strictEqual(byId.get("qwen2.5-coder:14b")?.detail, "14.8B · Q4_K_M");
+    });
+
+    it("distinguishes a cloud model from a local one", () => {
+      const byId = new Map(modelOptionsForMember(liveMember).map((o) => [o.id, o]));
+      const cloud = byId.get("gpt-oss:120b-cloud");
+      assert.strictEqual(cloud?.source, "ollama-cloud");
+      // Nothing loads locally, so a cloud model is never a cold start.
+      assert.strictEqual(cloud?.loaded, true);
+      assert.strictEqual(cloud?.detail, "117B · cloud");
+      assert.strictEqual(byId.get("qwen2.5-coder:14b")?.source, "ollama");
     });
 
     it("degrades to CLI-only when a node reports no ollama vitals", () => {

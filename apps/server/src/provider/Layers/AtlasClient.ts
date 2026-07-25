@@ -73,6 +73,12 @@ export const AtlasOllamaModel = Schema.Struct({
   quant: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   size: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   tools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * Runs remotely through the node's signed-in Ollama Cloud daemon rather than
+   * from local weights. Cloud models never appear in `/api/tags`, so the node
+   * probes and confirms them; older nodes simply omit the field.
+   */
+  cloud: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type AtlasOllamaModel = typeof AtlasOllamaModel.Type;
 
@@ -110,10 +116,13 @@ const EMBEDDING_FAMILIES = new Set(["nomic-bert", "bert"]);
 export interface AtlasModelOption {
   readonly id: string;
   readonly label: string;
-  readonly source: "claude" | "codex" | "ollama";
+  readonly source: "claude" | "codex" | "ollama" | "ollama-cloud";
   /** False ⇒ cannot drive a tool-enabled plugin. */
   readonly supportsTools: boolean;
-  /** Ollama only: already resident in memory, so no cold-load delay. */
+  /**
+   * Ready to answer without a cold start. Local Ollama models are resident in
+   * memory; cloud models have no local load step at all.
+   */
   readonly loaded: boolean;
   readonly detail: string;
 }
@@ -136,16 +145,20 @@ export const modelOptionsForMember = (member: AtlasMember): ReadonlyArray<AtlasM
   const loaded = new Set(ollama?.loaded ?? []);
   const ollamaOptions = (ollama?.models ?? [])
     .filter((model) => !EMBEDDING_FAMILIES.has(model.family))
-    .map(
-      (model): AtlasModelOption => ({
+    .map((model): AtlasModelOption => {
+      const detail = [model.params, model.cloud ? "cloud" : model.quant]
+        .filter((part) => part !== "")
+        .join(" · ");
+      return {
         id: model.name,
         label: model.name,
-        source: "ollama",
+        source: model.cloud ? "ollama-cloud" : "ollama",
         supportsTools: model.tools,
-        loaded: loaded.has(model.name),
-        detail: [model.params, model.quant].filter((part) => part !== "").join(" · "),
-      }),
-    );
+        // A cloud model has nothing to load locally, so it is never "cold".
+        loaded: model.cloud ? true : loaded.has(model.name),
+        detail,
+      };
+    });
 
   return [
     {
