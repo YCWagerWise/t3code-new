@@ -1,167 +1,231 @@
-# Atlas Terminal × T3 Code — port plan
+# Atlas Console port plan
 
-Fork: `~/atlas/git-forks/t3code` @ `5719e8a` (2026-07-24), MIT, upstream `pingdotgg/t3code`.
-Upstream is not accepting contributions → this is fork-and-diverge, not contribute-back.
+Fork: `git-forks/t3code`, donor upstream `pingdotgg/t3code`.
 
 ## Goal
 
-T3 Code is the chassis (web GUI, project model, remote environments). Atlas is the heart
-(LLM provider + fleet). Warden's terminal wins get ported in. Warden becomes `atlas-terminal`.
+Build Atlas Console as a visual lens over Atlas and its deployments, using the
+T3 React application as donor UI.
 
-Not: a Rust rewrite of T3 on day one. See "Rust path" below for why that's staged.
+Atlas is the body. The Console owns presentation only.
 
-## Oracle (definition of DONE, chased in this order)
-
-1. `pnpm typecheck` clean in the fork — errors are the work queue.
-2. Atlas appears as a selectable provider in the UI; `providers.startSession` returns a session.
-3. A real turn round-trips: prompt → Atlas → streamed tokens rendered in the browser.
-4. Provider adapter tests pass alongside the existing Codex/Grok ones.
-
-Oracle 3 is the honest one. 1 and 2 can be green while the thing does nothing.
-
-## CORRECTION (2026-07-25): T3 Code is lens #3, not warden's replacement
-
-Per `~/atlas/atlas-rs/docs/ATLAS-ARCHITECTURE.md` (verified against the code this session:
-`/run` `/start` `/output` `/transcript` `/_members` all present in `crates/`, capability
-manifests in `gossip.rs` + `probe.rs`).
-
-Atlas + deployments are the **BODY**. A view is a **LENS**, and a lens holds NO logic.
-Telegram is lens #1. warden is lens #2. **T3 Code is lens #3 — Telegram with a much better screen.**
-
-One lens addresses N bodies:
-
-```
-T3 Code → coder       = a coding GUI
-T3 Code → k8s-agent   = a cluster-ops console
-T3 Code → fliff-agent = a betting desk
-T3 Code → the fleet   = a workforce console
+```text
+Atlas Console
+      ↕ authenticated Atlas snapshots, commands, and durable events
+Atlas substrate and deployments
+      ↕
+nodes, bodies, backends, tools, workspaces, and runs
 ```
 
-**Therefore the ACP seam terminates at the Atlas Agent DO, NOT at warden.** An earlier draft of
-this plan said "T3 → warden over ACP" — that is lens→lens and violates the layer rule. The
-AtlasAdapter talks to the same body Telegram and warden already address.
+The target is not T3 Code with Atlas registered as another provider.
 
-### Placement table — Telegram test applied
+## Architectural rule
 
-"Could a pure window do this?" No → body. Yes → lens.
+Run the Telegram test on every feature:
 
-| Capability                                                 | Today                                  | Belongs                                             | Why                                                                                                    |
-| ---------------------------------------------------------- | -------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Project/thread tiers, sidebar, ⌘K search, settings         | T3                                     | **LENS (T3)**                                       | Pure render/navigate                                                                                   |
-| Workspace tier, sub-chat nesting                           | nowhere                                | **LENS (T3)**                                       | Organizational view over body-owned threads                                                            |
-| Provider auth/health screen                                | T3, probes **local CLIs only**         | **BODY** (`atlas-tools/probe.rs`, gossip manifests) | "Which providers exist on which node" is _knowledge about a node_. Should list the fleet, not this Mac |
-| `--nodes` / `--on` / `--fan`                               | warden CLI one-shots                   | **BODY** (already: gossip ring + Agent DO)          | Telegram could trivially do "run on all nodes"                                                         |
-| `coord.rs` (1111), `subagent.rs` (941), `mailbox.rs` (316) | **warden**                             | **BODY (atlas-rs)**                                 | Fleet capability in a lens — the exact misread the doc names                                           |
-| `watchdog.rs` (751)                                        | **warden** AND `crates/atlas-watchdog` | **BODY** — delete warden's copy                     | Forked capability; violates rule #4 "one canonical home"                                               |
-| `--remember` / `--recall`                                  | warden CLI flags                       | **BODY**                                            | Telegram should recall too. Capability in a lens                                                       |
-| Git worktree per thread (`branch`, `worktreePath`)         | T3 contracts                           | **BODY** executes, **LENS** renders                 | Execution on a node                                                                                    |
-| `/model`, `/mode`                                          | warden                                 | **LENS**                                            | Doc: a lens "drives its own model backend"                                                             |
-| `/diff`, `/pr`, `/plan`                                    | warden                                 | **BODY**                                            | Real work on a repo                                                                                    |
+> If Telegram could not drive the same capability without implementing it,
+> that capability belongs in Atlas rather than the lens.
 
-Net: warden shrinks. Most of what makes it feel powerful is misplaced body capability that
-every lens should inherit. Porting it "into T3" would repeat the original mistake one layer over.
+| Capability                                      | Owner                      |
+| ----------------------------------------------- | -------------------------- |
+| Navigation, layout, search, display preferences | Console lens               |
+| Event and snapshot rendering                    | Console lens               |
+| Fleet and node knowledge                        | Atlas substrate            |
+| Body, backend, and model availability           | Atlas substrate/deployment |
+| Durable runs and turn execution                 | Atlas substrate            |
+| Tool execution and policy                       | Atlas substrate            |
+| Repository, Git, worktree, and checkpoints      | Atlas substrate            |
+| Terminal and filesystem execution               | Atlas substrate            |
+| Approval suspension, response, and audit        | Atlas substrate            |
 
-### Blocked on
+## Current seam
 
-`atlas-rs` is on branch `feat/lesson-efficacy-rigor`, diverged from `origin/main`
-(`c4bd52c` vs `982bf3b`), with uncommitted edits to `crates/atlas-host/Cargo.toml` and
-`crates/atlas-host/src/lib.rs` — the `full_system_prompt` seam. Discipline rule #2: do not
-edit on a stale base. Resolve before any substrate work.
+Atlas currently exposes HTTP:
 
-## P1 CORRECTION (2026-07-25): no ACP — direct HTTP
+- `/start`, `/run`, `/say`
+- `/output`, `/since`, `/transcript`, `/status`, `/spans`
+- `/_members` and `/_presence` when gossip is enabled
+- delivery, inbox, migration, trace, and compatibility routes
 
-Evidence, gathered before writing code:
+Verified useful path:
 
-- `apps/server/src/provider/acp/AcpSessionRuntime.ts` **hard-requires a spawned child process**:
-  `readonly spawn: AcpSpawnInput` (:61), `ChildProcessSpawner` (:274),
-  `spawner.spawn(ChildProcess.make(...))` (:337). The transport is not pluggable.
-- Atlas is HTTP. `crates/atlas-host/src/lib.rs` handles `/start` (:839), `/run` (:888),
-  `/output` (:1039), `/transcript` (:1089).
-- Going through ACP would mean spawning a local proxy process purely to relay into Atlas HTTP —
-  a shim over the real seam. Forbidden by "substrates over shims."
-
-**Verified live seam** (macbook node, `127.0.0.1:3010`):
-
-```
-POST /Agent/{run_id}/run   {"task": "...", "plugin": "coder"}
-→ 200, plain-text answer inline, 12.4s
+```text
+POST /Agent/{run_id}/run
+{"task":"...","plugin":"coder"}
+→ final plain-text response
 ```
 
-`/run` is documented in-source as "rpc-style one-shot: seed, DRIVE THE RUN TO COMPLETION INLINE,
-and RETURN the answer in this one call — no caller poll."
+`plugin` is the one-lens-many-bodies selector.
 
-**`plugin` is the one-lens-N-bodies switch.** `coder` → coding GUI, `k8s-agent` → cluster console,
-`fliff-agent` → betting desk. Same driver, different body.
+This seam is suitable for one-shot commands and early integration. It is not a
+complete interactive Console protocol: `/since` is poll-based assistant text,
+tools flatten through `/transcript`, and Atlas publishes no structured live
+run feed.
 
-So P1 is not "teach Atlas ACP." P1 is: `AtlasDriver` speaks HTTP to the Agent DO directly.
-`effect-acp` and `AcpSessionRuntime` stay in the tree for Cursor/Grok but Atlas does not use them.
+## Transport decision
 
-## The finding that sets the approach: ACP
+Do not use ACP. Atlas is a networked body, and routing through a spawned
+stdio proxy would place a shim over the real seam.
 
-T3's provider layer is a clean 13-method interface — `ProviderAdapterShape` in
-`apps/server/src/provider/Services/ProviderAdapter.ts`: startSession, sendTurn, interruptTurn,
-respondToRequest, respondToUserInput, stopSession, listSessions, hasSession, readThread,
-rollbackThread, stopAll, streamEvents, capabilities.
+Use StudyOS as the transport donor:
 
-Five providers ship today (docs claim one — docs are stale, code is truth):
-Codex, Claude, Cursor, Grok, OpenCode.
+- authenticated Axum WebSocket
+- durable do-rs event channel
+- append-only sequence
+- replay from a cursor
+- LISTEN/NOTIFY wake-up
+- duplex read/write handles
+- presence and heartbeat
 
-`ProviderDriverKind` is a **branded slug**, not an enum (`packages/contracts/src/providerInstance.ts:70`).
-`ProviderDriverKind.make("atlas")` is the entire contract change. No schema surgery.
+Use Warden as the initial event and command vocabulary donor:
 
-Cost comparison, measured:
+- user, thinking, assistant
+- tool call/result
+- approval, question, deny
+- turn, context, usage, edge
+- interrupt, approve, answer, mode, rewind, model, fork, resume, compact
 
-| Path           | Files                                                               | Lines                              |
-| -------------- | ------------------------------------------------------------------- | ---------------------------------- |
-| **ACP** (Grok) | `GrokAdapter.ts` 16 + `GrokDriver.ts` 164 + `GrokAcpSupport.ts` 108 | **288**                            |
-| Native (Codex) | `CodexAdapter.ts` 19 + `CodexDriver.ts` 214                         | 233 + bespoke JSON-RPC schema work |
+Atlas adopts and owns the resulting versioned protocol. The Console does not
+connect through Warden.
 
-`apps/server/src/provider/acp/AcpSessionRuntime.ts` (1005 lines) is the shared engine both
-Cursor and Grok ride on. Take the ACP path and you inherit it free.
+## Delivery oracle
 
-**Decision: Atlas speaks ACP over stdio.** Warden already runs a JSON-RPC-over-stdio server
-(`--mcp`, `--mcp-tools`, `src/mcp_server.rs`). ACP is JSON-RPC over stdio with a different
-schema. Same plumbing, new message set — a substrate change, not a shim.
+Chase these outcomes in order:
 
-## Phases (each ends deployable)
+1. Atlas can authenticate a browser and open a durable Console channel.
+2. A Console command starts or continues a real Atlas run.
+3. AgentDO publishes ordered run, message, and tool events with replay.
+4. The React timeline renders those events without polling or duplication.
+5. An approval suspends execution, appears in the Console, accepts one
+   idempotent response, and resumes.
+6. Fleet, workspace, and run catalogs populate Atlas-native navigation.
+7. Terminal, files, Git/diff, and preview bind only after their Atlas
+   capabilities exist.
 
-**P0 — Rename warden → atlas-terminal.** Mechanical, but the blast radius is live:
-1,188 files mention `warden`; most are inert transcripts, but these are load-bearing —
-`~/.claude/CLAUDE.md`, the `/remember` and `/recall` skills, `atlas/warden-launch.sh`.
-The binary path is hardcoded in all of them. Renaming it blind **breaks fleet memory recall**.
-Sequence: rename crate + binary → symlink old path → migrate live refs → verify `--recall`
-returns hits → drop symlink last.
+The honest first vertical slice is:
 
-**P1 — ACP server in atlas-terminal.** Add `--acp` to the Rust binary. Reuse the stdio
-transport from `mcp_server.rs`. Oracle: T3's own `AcpJsonRpcConnection.test.ts` harness
-plus `effect-acp`'s `protocol.test.ts` as the conformance check — their tests, unchanged,
-are the spec.
+```text
+prompt
+→ Atlas command acknowledgement
+→ turn.started
+→ assistant/tool events
+→ turn.completed
+→ reconnect and replay without duplicates
+```
 
-**P2 — AtlasAdapter in T3.** ~290 lines against the Grok template. Register in
-`ProviderAdapterRegistry.ts`. Oracle 1→3 above.
+## Phases
 
-**P3 — Port the terminal wins.** Warden has fleet machinery T3 has no equivalent for:
-`coord.rs` 1111, `subagent.rs` 941, `watchdog.rs` 751, `mailbox.rs` 316, plus `--nodes`,
-`--on <box>`, `--fan`. T3 has the surface (environments, relay, ssh, tailscale) with a
-thinner engine; Atlas has the engine with no surface. **This gap is the product.**
-NOT YET INVENTORIED — P3 scope is unknown until warden's TUI is read properly.
+### P0 — Documentation and donor classification
 
-## Rust path — staged, not big-bang
+- Inventory every tracked non-test file in `apps/web/src`.
+- Map T3 concepts and RPC methods to Atlas.
+- Classify each donor file.
+- Record every absent Atlas capability.
 
-T3's server is Node (~1,965 TS files). A Rust rewrite is real but must be faithful-first and
-never leave a window where nothing runs:
+Output: `docs/atlas-console/`.
 
-- Atlas-terminal already _is_ the Rust engine. P1/P2 make it the brain behind T3's Node server.
-- Rewrite the server only after the ACP boundary is proven — that boundary is exactly the seam
-  a rewrite needs, because it lets Rust replace Node one service at a time with the existing
-  TS test suite as the unchanged oracle.
-- Do not start the rewrite before P2 is green. There is no oracle before then.
+### P1 — Atlas Console protocol
+
+- Port the StudyOS durable channel pattern into Atlas.
+- Add `version`, `epoch`, `seq`, and server timestamp.
+- Add fleet/node/body/workspace/run scope.
+- Define structured commands, acknowledgements, and errors.
+- Define replay boundary, stale-cursor snapshot fallback, payload limits, and
+  slow-consumer behavior.
+- Add focused transport and recovery tests.
+
+### P2 — AgentDO publisher
+
+- Publish turn lifecycle and message events.
+- Publish tool calls and results from the existing ledger.
+- Publish errors, context, usage, and delegation edges.
+- Preserve REST snapshots and one-shot `/run`.
+- Prove reconnect replay against a real run.
+
+### P3 — Catalogs and navigation
+
+- Make the fleet snapshot available for a solo node.
+- Add bodies, backends, and real-model catalogs.
+- Add workspace and run catalogs.
+- Rebuild the sidebar around fleet → node → workspace → run.
+
+### P4 — Supervision
+
+- Enforce Atlas policy on the execution path.
+- Persist pending approvals/questions.
+- Publish requests to authorized lenses.
+- Accept idempotent responses.
+- Resume suspended execution and record the outcome.
+
+### P5 — Workspace capabilities
+
+In body-owned dependency order:
+
+1. Hearth terminal attach surface
+2. Repository, Git, worktree, diff, and checkpoint substrate
+3. Filesystem product/security decision and API
+4. Preview and browser-automation substrate
+5. Asset handling for large output
+
+Rebind donor panels only when their owner-side capability is real.
+
+### P6 — Donor strip
+
+Drive removal and migration from `03-classification.json`:
+
+- Remove unsupported desktop/mobile/Clerk/T3 Connect paths.
+- Remove non-Atlas provider orchestration.
+- Remove duplicated T3 server capability after Atlas replacements pass.
+- Consolidate Sidebar V1/V2.
+- Retain reusable primitives and rendering components.
+
+## Staged Rust path
+
+Do not rewrite the T3 server wholesale before the Atlas contracts exist.
+
+The transition is:
+
+1. Prove Atlas protocol and publisher.
+2. Bind the existing React client through a thin typed adapter.
+3. Move body capability into Atlas one domain at a time.
+4. Delete T3 server domains only after their Atlas oracle passes.
+5. Reduce the final web-serving layer to static delivery, browser auth
+   bootstrap, and lens concerns if those cannot be served directly by Atlas.
+
+## Warden rename risk
+
+Warden contains live paths, scripts, skills, and memory references. Renaming it
+to `atlas-terminal` is independent of the Console protocol and must follow:
+
+1. Rename crate and binary.
+2. Preserve the old executable path with a temporary compatibility link.
+3. Migrate live references.
+4. Verify memory recall and fleet workflows.
+5. Remove the compatibility link last.
+
+Do not copy Warden capability into the Console while renaming it. Use Warden as
+donor evidence and move shared capability into Atlas.
 
 ## Risks
 
-- **Rename breaks memory.** Highest-probability failure. Mitigated by symlink-then-migrate.
-- **ACP may not cover Atlas's fleet verbs.** `--fan`/`--on` have no ACP equivalent; they'll need
-  an extension (T3 has precedent: `XAiAcpExtension.ts`, `CursorAcpExtension.ts`).
-- **Effect-TS learning curve.** The whole server is Effect. Adapters return `Effect.Effect<_, E>`
-  and `Stream.Stream<_>`. Non-negotiable to learn; it's the house style.
-- **Fork drift.** Upstream is active (HEAD is yesterday). Decide rebase cadence early.
+- Treating working WebSocket transport as a working Atlas publisher
+- Rebuilding body capability in the lens to make a panel appear functional
+- Calling `/since` streaming even though it is cursor polling
+- Presenting synthetic `/v1/models` output as real model availability
+- Depending on `/_members` without handling a solo node
+- Exposing filesystem or terminal access before browser authorization exists
+- Stripping donor code before its Atlas replacement has an executable oracle
+- Allowing historical ACP/provider language to re-enter the architecture
+
+## Reference documents
+
+- `docs/atlas-console/00-OVERVIEW.md`
+- `docs/atlas-console/03-CLASSIFICATION.md`
+- `docs/atlas-console/04-PROTOCOL-BINDING.md`
+- `docs/atlas-console/05-GAPS.md`
+- `atlas-rs/docs/ATLAS-ARCHITECTURE.md`
+- `atlas/docs/ATLAS-SYSTEM-REFERENCE.md`
+- `studyos-mcp/src/ws.rs`
+- `studyos-mcp/src/session.rs`
+- `warden/src/events.rs`
+- `warden/src/runtime.rs`

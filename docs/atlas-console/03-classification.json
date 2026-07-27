@@ -1,0 +1,4322 @@
+[
+  {
+    "path": "apps/web/src/AppRoot.tsx",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "App shell; overlay set changes with the removed products.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 21
+  },
+  {
+    "path": "apps/web/src/assets/assetUrls.ts",
+    "area": "assets",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 68
+  },
+  {
+    "path": "apps/web/src/branding.logic.ts",
+    "area": "(root)",
+    "level": "primitive",
+    "verdict": "restyle",
+    "reason": "Theme tokens and branding; Atlas identity replaces T3's.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 38
+  },
+  {
+    "path": "apps/web/src/branding.ts",
+    "area": "(root)",
+    "level": "primitive",
+    "verdict": "restyle",
+    "reason": "Theme tokens and branding; Atlas identity replaces T3's.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 27
+  },
+  {
+    "path": "apps/web/src/browser/BrowserDeviceToolbar.tsx",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 340
+  },
+  {
+    "path": "apps/web/src/browser/BrowserSurfaceSlot.tsx",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/browser/BrowserViewportResizeHandles.tsx",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 169
+  },
+  {
+    "path": "apps/web/src/browser/ElectronBrowserHost.tsx",
+    "area": "browser",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Electron/webview host path; this fork ships the browser client only.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 92
+  },
+  {
+    "path": "apps/web/src/browser/HostedBrowserWebview.tsx",
+    "area": "browser",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Electron/webview host path; this fork ships the browser client only.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 261
+  },
+  {
+    "path": "apps/web/src/browser/annotationTheme.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/browser/browserDeviceToolbarState.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 18
+  },
+  {
+    "path": "apps/web/src/browser/browserPointerStore.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 25
+  },
+  {
+    "path": "apps/web/src/browser/browserRecording.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 455
+  },
+  {
+    "path": "apps/web/src/browser/browserRecordingScope.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/browser/browserSurfaceStore.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 170
+  },
+  {
+    "path": "apps/web/src/browser/browserTargetResolver.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 141
+  },
+  {
+    "path": "apps/web/src/browser/browserViewportActions.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 66
+  },
+  {
+    "path": "apps/web/src/browser/browserViewportLayout.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 286
+  },
+  {
+    "path": "apps/web/src/browser/desktopTabLifetime.ts",
+    "area": "browser",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Electron/webview host path; this fork ships the browser client only.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 44
+  },
+  {
+    "path": "apps/web/src/browser/hostedBrowserWebviewStyle.ts",
+    "area": "browser",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Electron/webview host path; this fork ships the browser client only.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 49
+  },
+  {
+    "path": "apps/web/src/browser/openFileInPreview.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 98
+  },
+  {
+    "path": "apps/web/src/browser/previewWebviewConfigState.ts",
+    "area": "browser",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Electron/webview host path; this fork ships the browser client only.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 76
+  },
+  {
+    "path": "apps/web/src/browser/useBrowserViewportResize.ts",
+    "area": "browser",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 260
+  },
+  {
+    "path": "apps/web/src/clientPersistenceStorage.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 30
+  },
+  {
+    "path": "apps/web/src/cloud/connectCliAuth.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 91
+  },
+  {
+    "path": "apps/web/src/cloud/connectOnboarding.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 18
+  },
+  {
+    "path": "apps/web/src/cloud/dpop.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 185
+  },
+  {
+    "path": "apps/web/src/cloud/linkEnvironment.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 485
+  },
+  {
+    "path": "apps/web/src/cloud/linkEnvironmentAtoms.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 46
+  },
+  {
+    "path": "apps/web/src/cloud/managedAuth.tsx",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 116
+  },
+  {
+    "path": "apps/web/src/cloud/managedRelayLayer.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 82
+  },
+  {
+    "path": "apps/web/src/cloud/managedRelayState.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 101
+  },
+  {
+    "path": "apps/web/src/cloud/primaryCloudLinkState.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 85
+  },
+  {
+    "path": "apps/web/src/cloud/publicConfig.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 83
+  },
+  {
+    "path": "apps/web/src/cloud/relayClientInstallDialog.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 126
+  },
+  {
+    "path": "apps/web/src/cloud/useCloudLinkController.ts",
+    "area": "cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud/relay client runtime; superseded by tailnet addressing.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 163
+  },
+  {
+    "path": "apps/web/src/commandPaletteBus.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Command palette structure is reusable; its result sources become Atlas nouns and need list endpoints.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 30
+  },
+  {
+    "path": "apps/web/src/components/AnimatedHeight.tsx",
+    "area": "components",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Presentational; no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 91
+  },
+  {
+    "path": "apps/web/src/components/AppSidebarLayout.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 188
+  },
+  {
+    "path": "apps/web/src/components/BranchToolbar.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 225
+  },
+  {
+    "path": "apps/web/src/components/BranchToolbar.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 363
+  },
+  {
+    "path": "apps/web/src/components/BranchToolbarBranchSelector.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 835
+  },
+  {
+    "path": "apps/web/src/components/BranchToolbarEnvModeSelector.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 123
+  },
+  {
+    "path": "apps/web/src/components/BranchToolbarEnvironmentSelector.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 91
+  },
+  {
+    "path": "apps/web/src/components/ChatMarkdown.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 1566
+  },
+  {
+    "path": "apps/web/src/components/ChatView.logic.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 544
+  },
+  {
+    "path": "apps/web/src/components/ChatView.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 6053
+  },
+  {
+    "path": "apps/web/src/components/CommandPalette.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Command palette structure is reusable; its result sources become Atlas nouns and need list endpoints.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 380
+  },
+  {
+    "path": "apps/web/src/components/CommandPalette.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Command palette structure is reusable; its result sources become Atlas nouns and need list endpoints.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 2094
+  },
+  {
+    "path": "apps/web/src/components/CommandPaletteResults.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Command palette structure is reusable; its result sources become Atlas nouns and need list endpoints.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 146
+  },
+  {
+    "path": "apps/web/src/components/ComposerPromptEditor.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 1842
+  },
+  {
+    "path": "apps/web/src/components/ConnectionStatusDot.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Connection and request feedback bound to the Atlas socket.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 56
+  },
+  {
+    "path": "apps/web/src/components/DiffPanel.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 941
+  },
+  {
+    "path": "apps/web/src/components/DiffPanelShell.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 88
+  },
+  {
+    "path": "apps/web/src/components/DiffWorkerPoolProvider.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "reuse",
+    "reason": "Panel tabbing is lens-local layout; the content of each tab is classified separately.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 84
+  },
+  {
+    "path": "apps/web/src/components/GitActionsControl.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 417
+  },
+  {
+    "path": "apps/web/src/components/GitActionsControl.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 2035
+  },
+  {
+    "path": "apps/web/src/components/Icons.tsx",
+    "area": "components",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Presentational; no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 720
+  },
+  {
+    "path": "apps/web/src/components/JetBrainsIcons.tsx",
+    "area": "components",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Presentational; no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 610
+  },
+  {
+    "path": "apps/web/src/components/KeybindingsUpdateToast.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Tied to the T3 server-update notification family.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/components/NoActiveThreadState.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Connection and request feedback bound to the Atlas socket.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 44
+  },
+  {
+    "path": "apps/web/src/components/PlanSidebar.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Plan surface; needs a plan frame in the normalized vocabulary.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 284
+  },
+  {
+    "path": "apps/web/src/components/ProjectFavicon.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Connection and request feedback bound to the Atlas socket.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 76
+  },
+  {
+    "path": "apps/web/src/components/ProjectScriptsControl.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 623
+  },
+  {
+    "path": "apps/web/src/components/ProviderUpdateEnvironmentRows.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 397
+  },
+  {
+    "path": "apps/web/src/components/ProviderUpdateLaunchNotification.environments.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 97
+  },
+  {
+    "path": "apps/web/src/components/ProviderUpdateLaunchNotification.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 835
+  },
+  {
+    "path": "apps/web/src/components/ProviderUpdateLaunchNotification.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 198
+  },
+  {
+    "path": "apps/web/src/components/ProviderUpdatePrimaryNotification.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 331
+  },
+  {
+    "path": "apps/web/src/components/PullRequestThreadDialog.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 304
+  },
+  {
+    "path": "apps/web/src/components/RightPanelSheet.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "reuse",
+    "reason": "Panel tabbing is lens-local layout; the content of each tab is classified separately.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 30
+  },
+  {
+    "path": "apps/web/src/components/RightPanelTabs.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "reuse",
+    "reason": "Panel tabbing is lens-local layout; the content of each tab is classified separately.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 497
+  },
+  {
+    "path": "apps/web/src/components/ServerUpdateAction.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 201
+  },
+  {
+    "path": "apps/web/src/components/Sidebar.logic.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 833
+  },
+  {
+    "path": "apps/web/src/components/Sidebar.snooze.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 127
+  },
+  {
+    "path": "apps/web/src/components/Sidebar.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 3643
+  },
+  {
+    "path": "apps/web/src/components/SidebarStageBackdrop.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 330
+  },
+  {
+    "path": "apps/web/src/components/SidebarV2.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 2732
+  },
+  {
+    "path": "apps/web/src/components/SlowRpcRequestToastCoordinator.tsx",
+    "area": "components",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Connection and request feedback bound to the Atlas socket.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 73
+  },
+  {
+    "path": "apps/web/src/components/SplashScreen.tsx",
+    "area": "components",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Presentational; no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 9
+  },
+  {
+    "path": "apps/web/src/components/ThreadStatusIndicators.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 358
+  },
+  {
+    "path": "apps/web/src/components/ThreadTerminalDrawer.tsx",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 1549
+  },
+  {
+    "path": "apps/web/src/components/auth/AuthSurfaceShell.tsx",
+    "area": "components/auth",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 44
+  },
+  {
+    "path": "apps/web/src/components/auth/PairingRouteSurface.tsx",
+    "area": "components/auth",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 323
+  },
+  {
+    "path": "apps/web/src/components/chat/ChangedFilesTree.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 330
+  },
+  {
+    "path": "apps/web/src/components/chat/ChatComposer.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 2747
+  },
+  {
+    "path": "apps/web/src/components/chat/ChatHeader.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 161
+  },
+  {
+    "path": "apps/web/src/components/chat/CompactComposerControlsMenu.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 91
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerBannerStack.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 208
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerCommandMenu.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 258
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingApprovalActions.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Approvals and questions. Atlas has the kernel (policy.rs Verdict::Confirm, Trust) but no round-trip; warden's Approval/Question frames and Cmd::Approve/Answer are the donor.",
+    "atlasBinding": null,
+    "gapId": "GAP-006",
+    "loc": 55
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingApprovalPanel.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Approvals and questions. Atlas has the kernel (policy.rs Verdict::Confirm, Trust) but no round-trip; warden's Approval/Question frames and Cmd::Approve/Answer are the donor.",
+    "atlasBinding": null,
+    "gapId": "GAP-006",
+    "loc": 49
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingElementContexts.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 95
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingReviewComments.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 60
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingTerminalContexts.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 44
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Approvals and questions. Atlas has the kernel (policy.rs Verdict::Confirm, Trust) but no round-trip; warden's Approval/Question frames and Cmd::Approve/Answer are the donor.",
+    "atlasBinding": null,
+    "gapId": "GAP-006",
+    "loc": 227
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPlanFollowUpBanner.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Plan surface; needs a plan frame in the normalized vocabulary.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPreviewAnnotationCards.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 144
+  },
+  {
+    "path": "apps/web/src/components/chat/ComposerPrimaryActions.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 241
+  },
+  {
+    "path": "apps/web/src/components/chat/ContextWindowMeter.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Context-pressure meter; warden already emits a ctx frame (pane.rs:605), Atlas does not.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 139
+  },
+  {
+    "path": "apps/web/src/components/chat/DiffStatLabel.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 53
+  },
+  {
+    "path": "apps/web/src/components/chat/DraftHeroHeadline.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 158
+  },
+  {
+    "path": "apps/web/src/components/chat/ExpandedImageDialog.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 110
+  },
+  {
+    "path": "apps/web/src/components/chat/ExpandedImagePreview.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 32
+  },
+  {
+    "path": "apps/web/src/components/chat/FileTagChip.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 39
+  },
+  {
+    "path": "apps/web/src/components/chat/MessageCopyButton.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 82
+  },
+  {
+    "path": "apps/web/src/components/chat/MessagesTimeline.logic.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 640
+  },
+  {
+    "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 2081
+  },
+  {
+    "path": "apps/web/src/components/chat/ModelListRow.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 141
+  },
+  {
+    "path": "apps/web/src/components/chat/ModelPickerContent.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 677
+  },
+  {
+    "path": "apps/web/src/components/chat/ModelPickerSidebar.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 250
+  },
+  {
+    "path": "apps/web/src/components/chat/OpenInPicker.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 312
+  },
+  {
+    "path": "apps/web/src/components/chat/PanelLayoutControls.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 112
+  },
+  {
+    "path": "apps/web/src/components/chat/PierreEntryIcon.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 95
+  },
+  {
+    "path": "apps/web/src/components/chat/ProposedPlanCard.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Plan surface; needs a plan frame in the normalized vocabulary.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 256
+  },
+  {
+    "path": "apps/web/src/components/chat/ProviderInstanceIcon.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 79
+  },
+  {
+    "path": "apps/web/src/components/chat/ProviderModelPicker.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 211
+  },
+  {
+    "path": "apps/web/src/components/chat/ProviderStatusBanner.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 79
+  },
+  {
+    "path": "apps/web/src/components/chat/SkillInlineText.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 92
+  },
+  {
+    "path": "apps/web/src/components/chat/TerminalContextInlineChip.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 47
+  },
+  {
+    "path": "apps/web/src/components/chat/ThreadErrorBanner.tsx",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 37
+  },
+  {
+    "path": "apps/web/src/components/chat/TraitsPicker.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 523
+  },
+  {
+    "path": "apps/web/src/components/chat/changedFilesPresentation.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 102
+  },
+  {
+    "path": "apps/web/src/components/chat/composerMentionDrag.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 98
+  },
+  {
+    "path": "apps/web/src/components/chat/composerMenuHighlight.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 20
+  },
+  {
+    "path": "apps/web/src/components/chat/composerProviderState.tsx",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 126
+  },
+  {
+    "path": "apps/web/src/components/chat/composerSlashCommandSearch.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 83
+  },
+  {
+    "path": "apps/web/src/components/chat/draftHeroTransition.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 82
+  },
+  {
+    "path": "apps/web/src/components/chat/externalLinkContextMenu.ts",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 78
+  },
+  {
+    "path": "apps/web/src/components/chat/modelPickerModelHighlights.ts",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 13
+  },
+  {
+    "path": "apps/web/src/components/chat/modelPickerSearch.ts",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 87
+  },
+  {
+    "path": "apps/web/src/components/chat/providerIconUtils.ts",
+    "area": "components/chat",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 60
+  },
+  {
+    "path": "apps/web/src/components/chat/timelineScrollAnchoring.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "The activity timeline. Atlas stores message and tool_call rows per run but publishes nothing; needs the feed publisher.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 78
+  },
+  {
+    "path": "apps/web/src/components/chat/userMessageTerminalContexts.ts",
+    "area": "components/chat",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 58
+  },
+  {
+    "path": "apps/web/src/components/clerk/MobileClientsUserProfilePage.logic.ts",
+    "area": "components/clerk",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Clerk / T3 Connect account product; Atlas authenticates against the fleet, not a SaaS identity provider.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 39
+  },
+  {
+    "path": "apps/web/src/components/clerk/MobileClientsUserProfilePage.tsx",
+    "area": "components/clerk",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Clerk / T3 Connect account product; Atlas authenticates against the fleet, not a SaaS identity provider.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 166
+  },
+  {
+    "path": "apps/web/src/components/clerk/T3ConnectSidebarSignIn.tsx",
+    "area": "components/clerk",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Clerk / T3 Connect account product; Atlas authenticates against the fleet, not a SaaS identity provider.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 69
+  },
+  {
+    "path": "apps/web/src/components/clerk/useT3ConnectAuthPrompt.tsx",
+    "area": "components/clerk",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Clerk / T3 Connect account product; Atlas authenticates against the fleet, not a SaaS identity provider.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 9
+  },
+  {
+    "path": "apps/web/src/components/cloud/CloudEnvironmentConnectList.tsx",
+    "area": "components/cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud onboarding and managed relay; Atlas reaches nodes over the tailnet.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 260
+  },
+  {
+    "path": "apps/web/src/components/cloud/ConnectCliAuthSurface.tsx",
+    "area": "components/cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud onboarding and managed relay; Atlas reaches nodes over the tailnet.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 188
+  },
+  {
+    "path": "apps/web/src/components/cloud/ConnectOnboardingDialog.tsx",
+    "area": "components/cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud onboarding and managed relay; Atlas reaches nodes over the tailnet.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 433
+  },
+  {
+    "path": "apps/web/src/components/cloud/RelayClientInstallDialog.tsx",
+    "area": "components/cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud onboarding and managed relay; Atlas reaches nodes over the tailnet.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 123
+  },
+  {
+    "path": "apps/web/src/components/cloud/cloudEnvironmentConnectionPresentation.ts",
+    "area": "components/cloud",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "T3 Connect cloud onboarding and managed relay; Atlas reaches nodes over the tailnet.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 58
+  },
+  {
+    "path": "apps/web/src/components/color-selector.tsx",
+    "area": "components",
+    "level": "primitive",
+    "verdict": "restyle",
+    "reason": "Theme tokens and branding; Atlas identity replaces T3's.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 101
+  },
+  {
+    "path": "apps/web/src/components/composerFooterLayout.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 24
+  },
+  {
+    "path": "apps/web/src/components/composerInlineChip.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 20
+  },
+  {
+    "path": "apps/web/src/components/composerInlineTokenPaste.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 104
+  },
+  {
+    "path": "apps/web/src/components/desktop/SshPasswordPromptDialog.tsx",
+    "area": "components/desktop",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop-only dialog; apps/desktop has zero tracked files in this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 221
+  },
+  {
+    "path": "apps/web/src/components/desktopUpdate.logic.ts",
+    "area": "components",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 115
+  },
+  {
+    "path": "apps/web/src/components/diffs/AnnotatableCodeView.tsx",
+    "area": "components/diffs",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 268
+  },
+  {
+    "path": "apps/web/src/components/files/FileBrowserPanel.tsx",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 268
+  },
+  {
+    "path": "apps/web/src/components/files/FilePreviewPanel.tsx",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 951
+  },
+  {
+    "path": "apps/web/src/components/files/LocalCommentAnnotation.tsx",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 90
+  },
+  {
+    "path": "apps/web/src/components/files/fileCommentAnnotations.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 54
+  },
+  {
+    "path": "apps/web/src/components/files/fileContentRevision.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 12
+  },
+  {
+    "path": "apps/web/src/components/files/fileEditorDismissal.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 53
+  },
+  {
+    "path": "apps/web/src/components/files/filePath.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 17
+  },
+  {
+    "path": "apps/web/src/components/files/filePreviewMode.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 18
+  },
+  {
+    "path": "apps/web/src/components/files/fileSaveCoordinator.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 76
+  },
+  {
+    "path": "apps/web/src/components/files/fileTreeDragMention.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 95
+  },
+  {
+    "path": "apps/web/src/components/files/projectFilesQueryState.ts",
+    "area": "components/files",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 163
+  },
+  {
+    "path": "apps/web/src/components/preview/AgentBrowserCursor.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 78
+  },
+  {
+    "path": "apps/web/src/components/preview/BrowserMockup.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 24
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewAutomationHosts.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 608
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewChromeRow.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 291
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewEmptyState.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 65
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewLocalServerCard.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 52
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewMoreMenu.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 177
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewPanel.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 41
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewPanelShell.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 88
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewUnreachable.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 90
+  },
+  {
+    "path": "apps/web/src/components/preview/PreviewView.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 666
+  },
+  {
+    "path": "apps/web/src/components/preview/RightPanelResizeHandle.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 34
+  },
+  {
+    "path": "apps/web/src/components/preview/ZoomIndicator.tsx",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 54
+  },
+  {
+    "path": "apps/web/src/components/preview/addBrowserSurface.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 24
+  },
+  {
+    "path": "apps/web/src/components/preview/agentBrowserCursorLogic.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 6
+  },
+  {
+    "path": "apps/web/src/components/preview/closePreviewSession.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 37
+  },
+  {
+    "path": "apps/web/src/components/preview/errorCodeMessages.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 12
+  },
+  {
+    "path": "apps/web/src/components/preview/fileExplorerLabel.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 6
+  },
+  {
+    "path": "apps/web/src/components/preview/openDiscoveredPort.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 26
+  },
+  {
+    "path": "apps/web/src/components/preview/openPreviewSession.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 42
+  },
+  {
+    "path": "apps/web/src/components/preview/openTerminalLinkInPreview.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 109
+  },
+  {
+    "path": "apps/web/src/components/preview/previewActionBus.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 31
+  },
+  {
+    "path": "apps/web/src/components/preview/previewAutomationClientId.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 4
+  },
+  {
+    "path": "apps/web/src/components/preview/previewAutomationErrors.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 235
+  },
+  {
+    "path": "apps/web/src/components/preview/previewAutomationOpenReadiness.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 8
+  },
+  {
+    "path": "apps/web/src/components/preview/previewAutomationRequestConsumer.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 121
+  },
+  {
+    "path": "apps/web/src/components/preview/previewAutomationTarget.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 37
+  },
+  {
+    "path": "apps/web/src/components/preview/previewBridge.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 9
+  },
+  {
+    "path": "apps/web/src/components/preview/previewConstants.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 21
+  },
+  {
+    "path": "apps/web/src/components/preview/previewEmptyStateLogic.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 11
+  },
+  {
+    "path": "apps/web/src/components/preview/previewUrlPresentation.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 27
+  },
+  {
+    "path": "apps/web/src/components/preview/previewViewportReadiness.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 37
+  },
+  {
+    "path": "apps/web/src/components/preview/useDiscoveredLocalServers.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 138
+  },
+  {
+    "path": "apps/web/src/components/preview/useLoadingProgress.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/components/preview/usePreviewBridge.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 148
+  },
+  {
+    "path": "apps/web/src/components/preview/usePreviewSession.ts",
+    "area": "components/preview",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 120
+  },
+  {
+    "path": "apps/web/src/components/settings/AddProviderInstanceDialog.logic.ts",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 36
+  },
+  {
+    "path": "apps/web/src/components/settings/AddProviderInstanceDialog.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 437
+  },
+  {
+    "path": "apps/web/src/components/settings/AddProviderInstanceWizardSteps.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 73
+  },
+  {
+    "path": "apps/web/src/components/settings/BetaSettingsPanel.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 108
+  },
+  {
+    "path": "apps/web/src/components/settings/ConnectionsSettings.logic.ts",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Becomes the fleet page: nodes, their backends, models and capabilities. Most of the remote/relay connection machinery falls away with the tailnet.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 21
+  },
+  {
+    "path": "apps/web/src/components/settings/ConnectionsSettings.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Becomes the fleet page: nodes, their backends, models and capabilities. Most of the remote/relay connection machinery falls away with the tailnet.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 3398
+  },
+  {
+    "path": "apps/web/src/components/settings/DiagnosticsSettings.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "Diagnostics. Atlas exposes causal spans at /_trace and node vitals in gossip beats.",
+    "atlasBinding": "/_trace",
+    "gapId": "GAP-012",
+    "loc": 1355
+  },
+  {
+    "path": "apps/web/src/components/settings/KeybindingsSettings.logic.ts",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 340
+  },
+  {
+    "path": "apps/web/src/components/settings/KeybindingsSettings.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 1337
+  },
+  {
+    "path": "apps/web/src/components/settings/ProviderAccentColorPicker.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Becomes the fleet page: nodes, their backends, models and capabilities. Most of the remote/relay connection machinery falls away with the tailnet.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 335
+  },
+  {
+    "path": "apps/web/src/components/settings/ProviderInstanceCard.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 806
+  },
+  {
+    "path": "apps/web/src/components/settings/ProviderModelsSection.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Becomes the fleet page: nodes, their backends, models and capabilities. Most of the remote/relay connection machinery falls away with the tailnet.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 411
+  },
+  {
+    "path": "apps/web/src/components/settings/ProviderSettingsForm.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 304
+  },
+  {
+    "path": "apps/web/src/components/settings/RedactedSensitiveText.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 61
+  },
+  {
+    "path": "apps/web/src/components/settings/SettingsPanels.logic.ts",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 125
+  },
+  {
+    "path": "apps/web/src/components/settings/SettingsPanels.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 1765
+  },
+  {
+    "path": "apps/web/src/components/settings/SettingsSidebarNav.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 127
+  },
+  {
+    "path": "apps/web/src/components/settings/SourceControlSettings.tsx",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 518
+  },
+  {
+    "path": "apps/web/src/components/settings/itemRows.ts",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/components/settings/pairingUrls.ts",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 20
+  },
+  {
+    "path": "apps/web/src/components/settings/providerDriverMeta.ts",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 108
+  },
+  {
+    "path": "apps/web/src/components/settings/providerStatus.ts",
+    "area": "components/settings",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Provider-instance CRUD models 'a provider = a local CLI install you configure'. Atlas discovers backends and their models from gossip manifests and vitals; there is nothing for a lens to configure.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 117
+  },
+  {
+    "path": "apps/web/src/components/settings/settingsLayout.tsx",
+    "area": "components/settings",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 129
+  },
+  {
+    "path": "apps/web/src/components/sidebar/SidebarChrome.tsx",
+    "area": "components/sidebar",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 128
+  },
+  {
+    "path": "apps/web/src/components/sidebar/SidebarProviderUpdatePill.tsx",
+    "area": "components/sidebar",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 208
+  },
+  {
+    "path": "apps/web/src/components/sidebar/SidebarUpdatePill.tsx",
+    "area": "components/sidebar",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 233
+  },
+  {
+    "path": "apps/web/src/components/threadSidebarWidth.ts",
+    "area": "components",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 22
+  },
+  {
+    "path": "apps/web/src/components/ui/alert-dialog.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 144
+  },
+  {
+    "path": "apps/web/src/components/ui/alert.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 113
+  },
+  {
+    "path": "apps/web/src/components/ui/autocomplete.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 271
+  },
+  {
+    "path": "apps/web/src/components/ui/badge.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 56
+  },
+  {
+    "path": "apps/web/src/components/ui/button.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 74
+  },
+  {
+    "path": "apps/web/src/components/ui/card.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 196
+  },
+  {
+    "path": "apps/web/src/components/ui/checkbox.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 60
+  },
+  {
+    "path": "apps/web/src/components/ui/collapsible.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 39
+  },
+  {
+    "path": "apps/web/src/components/ui/combobox.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 403
+  },
+  {
+    "path": "apps/web/src/components/ui/command.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 240
+  },
+  {
+    "path": "apps/web/src/components/ui/dialog-styles.ts",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 10
+  },
+  {
+    "path": "apps/web/src/components/ui/dialog.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 183
+  },
+  {
+    "path": "apps/web/src/components/ui/draft-input.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 21
+  },
+  {
+    "path": "apps/web/src/components/ui/empty.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 114
+  },
+  {
+    "path": "apps/web/src/components/ui/field.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 59
+  },
+  {
+    "path": "apps/web/src/components/ui/fieldset.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 26
+  },
+  {
+    "path": "apps/web/src/components/ui/form.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 17
+  },
+  {
+    "path": "apps/web/src/components/ui/group.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 93
+  },
+  {
+    "path": "apps/web/src/components/ui/input-group.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 95
+  },
+  {
+    "path": "apps/web/src/components/ui/input.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 73
+  },
+  {
+    "path": "apps/web/src/components/ui/kbd.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/components/ui/label.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 24
+  },
+  {
+    "path": "apps/web/src/components/ui/menu.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 302
+  },
+  {
+    "path": "apps/web/src/components/ui/number-field.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 156
+  },
+  {
+    "path": "apps/web/src/components/ui/popover.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 111
+  },
+  {
+    "path": "apps/web/src/components/ui/qr-code.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 81
+  },
+  {
+    "path": "apps/web/src/components/ui/radio-group.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 36
+  },
+  {
+    "path": "apps/web/src/components/ui/scroll-area.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 74
+  },
+  {
+    "path": "apps/web/src/components/ui/select.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 240
+  },
+  {
+    "path": "apps/web/src/components/ui/separator.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 19
+  },
+  {
+    "path": "apps/web/src/components/ui/sheet.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 200
+  },
+  {
+    "path": "apps/web/src/components/ui/sidebar.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 1028
+  },
+  {
+    "path": "apps/web/src/components/ui/sidebarState.ts",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 9
+  },
+  {
+    "path": "apps/web/src/components/ui/skeleton.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 16
+  },
+  {
+    "path": "apps/web/src/components/ui/spinner.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 15
+  },
+  {
+    "path": "apps/web/src/components/ui/switch.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 27
+  },
+  {
+    "path": "apps/web/src/components/ui/table.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 87
+  },
+  {
+    "path": "apps/web/src/components/ui/textarea.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/components/ui/toast.logic.ts",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 115
+  },
+  {
+    "path": "apps/web/src/components/ui/toast.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 813
+  },
+  {
+    "path": "apps/web/src/components/ui/toastHelpers.ts",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 58
+  },
+  {
+    "path": "apps/web/src/components/ui/toggle-group.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 96
+  },
+  {
+    "path": "apps/web/src/components/ui/toggle.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 48
+  },
+  {
+    "path": "apps/web/src/components/ui/tooltip.tsx",
+    "area": "components/ui",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Design-system primitive; no data binding, no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 59
+  },
+  {
+    "path": "apps/web/src/composer-editor-mentions.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 223
+  },
+  {
+    "path": "apps/web/src/composer-logic.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 287
+  },
+  {
+    "path": "apps/web/src/composerDraftStore.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 3574
+  },
+  {
+    "path": "apps/web/src/composerHandleContext.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Composer. Submit binds to /say for a warm thread and /start for a new run; draft state stays lens-local.",
+    "atlasBinding": "/say",
+    "gapId": null,
+    "loc": 10
+  },
+  {
+    "path": "apps/web/src/connection/catalog.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/connection/desktopLocal.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 104
+  },
+  {
+    "path": "apps/web/src/connection/onboarding.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 38
+  },
+  {
+    "path": "apps/web/src/connection/platform.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 622
+  },
+  {
+    "path": "apps/web/src/connection/runtime.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 29
+  },
+  {
+    "path": "apps/web/src/connection/storage.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 656
+  },
+  {
+    "path": "apps/web/src/connection/useDesktopLocalBootstraps.ts",
+    "area": "connection",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/contextMenuFallback.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 307
+  },
+  {
+    "path": "apps/web/src/diffFileActions.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 25
+  },
+  {
+    "path": "apps/web/src/diffPanelStore.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 144
+  },
+  {
+    "path": "apps/web/src/editorPreferences.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 115
+  },
+  {
+    "path": "apps/web/src/env.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 8
+  },
+  {
+    "path": "apps/web/src/environments/primary/auth.ts",
+    "area": "environments",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 548
+  },
+  {
+    "path": "apps/web/src/environments/primary/context.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 106
+  },
+  {
+    "path": "apps/web/src/environments/primary/desktopAuth.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 21
+  },
+  {
+    "path": "apps/web/src/environments/primary/httpClient.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 17
+  },
+  {
+    "path": "apps/web/src/environments/primary/httpLayer.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 58
+  },
+  {
+    "path": "apps/web/src/environments/primary/index.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 54
+  },
+  {
+    "path": "apps/web/src/environments/primary/sessionState.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 37
+  },
+  {
+    "path": "apps/web/src/environments/primary/target.ts",
+    "area": "environments",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Environment connection model is replaced by fleet membership; a node is discovered, not configured.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-003",
+    "loc": 294
+  },
+  {
+    "path": "apps/web/src/filePathDisplay.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 57
+  },
+  {
+    "path": "apps/web/src/historyBootstrap.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side run recovery and history bootstrap; Atlas runs are durable isolates that resume on their own alarm.",
+    "atlasBinding": "/status",
+    "gapId": null,
+    "loc": 139
+  },
+  {
+    "path": "apps/web/src/hooks/useCommitOnBlur.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 43
+  },
+  {
+    "path": "apps/web/src/hooks/useCopyToClipboard.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 109
+  },
+  {
+    "path": "apps/web/src/hooks/useHandleNewThread.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 325
+  },
+  {
+    "path": "apps/web/src/hooks/useLocalStorage.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 182
+  },
+  {
+    "path": "apps/web/src/hooks/useMediaQuery.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 87
+  },
+  {
+    "path": "apps/web/src/hooks/useNowMinute.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 69
+  },
+  {
+    "path": "apps/web/src/hooks/useResizableWidth.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 168
+  },
+  {
+    "path": "apps/web/src/hooks/useSettings.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 305
+  },
+  {
+    "path": "apps/web/src/hooks/useT3ProjectFileScripts.ts",
+    "area": "hooks",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 34
+  },
+  {
+    "path": "apps/web/src/hooks/useTheme.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 324
+  },
+  {
+    "path": "apps/web/src/hooks/useThreadActions.ts",
+    "area": "hooks",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 580
+  },
+  {
+    "path": "apps/web/src/hooks/useTurnDiffSummaries.ts",
+    "area": "hooks",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 19
+  },
+  {
+    "path": "apps/web/src/hostedPairing.ts",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 89
+  },
+  {
+    "path": "apps/web/src/index.css",
+    "area": "(root)",
+    "level": "primitive",
+    "verdict": "restyle",
+    "reason": "Theme tokens and branding; Atlas identity replaces T3's.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 1580
+  },
+  {
+    "path": "apps/web/src/keybindings.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 529
+  },
+  {
+    "path": "apps/web/src/lib/archivedThreadsState.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 50
+  },
+  {
+    "path": "apps/web/src/lib/baseRefChoices.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 61
+  },
+  {
+    "path": "apps/web/src/lib/chatThreadActions.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 67
+  },
+  {
+    "path": "apps/web/src/lib/checkpointDiffState.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 18
+  },
+  {
+    "path": "apps/web/src/lib/composerPathSearchState.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 18
+  },
+  {
+    "path": "apps/web/src/lib/contextWindow.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Context-pressure meter; warden already emits a ctx frame (pane.rs:605), Atlas does not.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 112
+  },
+  {
+    "path": "apps/web/src/lib/diffCollapse.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 13
+  },
+  {
+    "path": "apps/web/src/lib/diffRendering.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 152
+  },
+  {
+    "path": "apps/web/src/lib/elementContext.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 244
+  },
+  {
+    "path": "apps/web/src/lib/favicon.ts",
+    "area": "lib",
+    "level": "primitive",
+    "verdict": "restyle",
+    "reason": "Theme tokens and branding; Atlas identity replaces T3's.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 20
+  },
+  {
+    "path": "apps/web/src/lib/lruCache.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 68
+  },
+  {
+    "path": "apps/web/src/lib/openPullRequestLink.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 75
+  },
+  {
+    "path": "apps/web/src/lib/previewAnnotation.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 111
+  },
+  {
+    "path": "apps/web/src/lib/previewFocus.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 15
+  },
+  {
+    "path": "apps/web/src/lib/projectPaths.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "A workspace is not a modeled entity in Atlas today; it is only a shell workdir.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 17
+  },
+  {
+    "path": "apps/web/src/lib/projectScriptKeybindings.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 61
+  },
+  {
+    "path": "apps/web/src/lib/runtime.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 75
+  },
+  {
+    "path": "apps/web/src/lib/sourceControlActions.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 10
+  },
+  {
+    "path": "apps/web/src/lib/storage.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 67
+  },
+  {
+    "path": "apps/web/src/lib/terminalContext.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 372
+  },
+  {
+    "path": "apps/web/src/lib/terminalFocus.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 14
+  },
+  {
+    "path": "apps/web/src/lib/terminalUiStateCleanup.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 33
+  },
+  {
+    "path": "apps/web/src/lib/threadSort.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/lib/turnDiffTree.ts",
+    "area": "lib",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 172
+  },
+  {
+    "path": "apps/web/src/lib/utils.ts",
+    "area": "lib",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 43
+  },
+  {
+    "path": "apps/web/src/lib/windowControlsOverlay.ts",
+    "area": "lib",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 66
+  },
+  {
+    "path": "apps/web/src/localApi.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Local HTTP shim; Atlas is addressed directly.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 113
+  },
+  {
+    "path": "apps/web/src/logicalProject.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "A workspace is not a modeled entity in Atlas today; it is only a shell workdir.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 14
+  },
+  {
+    "path": "apps/web/src/main.tsx",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "App shell; overlay set changes with the removed products.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 54
+  },
+  {
+    "path": "apps/web/src/markdown-clipboard.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 311
+  },
+  {
+    "path": "apps/web/src/markdown-links.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 213
+  },
+  {
+    "path": "apps/web/src/markdown-list-indentation.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Content rendering; reusable, but attachment and asset URLs resolve through Atlas.",
+    "atlasBinding": null,
+    "gapId": "GAP-011",
+    "loc": 143
+  },
+  {
+    "path": "apps/web/src/modelOrdering.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side provider/model catalogue; Atlas owns model availability per node.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 86
+  },
+  {
+    "path": "apps/web/src/modelPickerVisibility.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 13
+  },
+  {
+    "path": "apps/web/src/modelSelection.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "Model choice becomes 'which body on which node', not 'which local CLI'. Backed by per-node manifests and the Ollama catalog in gossip vitals.",
+    "atlasBinding": "/_members",
+    "gapId": "GAP-005",
+    "loc": 329
+  },
+  {
+    "path": "apps/web/src/observability/clientTracing.ts",
+    "area": "observability",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "Diagnostics. Atlas exposes causal spans at /_trace and node vitals in gossip beats.",
+    "atlasBinding": "/_trace",
+    "gapId": "GAP-012",
+    "loc": 146
+  },
+  {
+    "path": "apps/web/src/orchestrationEventEffects.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 94
+  },
+  {
+    "path": "apps/web/src/orchestrationRecovery.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side run recovery and history bootstrap; Atlas runs are durable isolates that resume on their own alarm.",
+    "atlasBinding": "/status",
+    "gapId": null,
+    "loc": 211
+  },
+  {
+    "path": "apps/web/src/pairingUrl.ts",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/pendingUserInput.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Approvals and questions. Atlas has the kernel (policy.rs Verdict::Confirm, Trust) but no round-trip; warden's Approval/Question frames and Cmd::Approve/Answer are the donor.",
+    "atlasBinding": null,
+    "gapId": "GAP-006",
+    "loc": 172
+  },
+  {
+    "path": "apps/web/src/pierre-icons.ts",
+    "area": "(root)",
+    "level": "primitive",
+    "verdict": "reuse",
+    "reason": "Presentational; no product concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 117
+  },
+  {
+    "path": "apps/web/src/portDiscoveryState.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 51
+  },
+  {
+    "path": "apps/web/src/previewStateStore.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 428
+  },
+  {
+    "path": "apps/web/src/projectScripts.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 87
+  },
+  {
+    "path": "apps/web/src/proposedPlan.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Plan surface; needs a plan frame in the normalized vocabulary.",
+    "atlasBinding": null,
+    "gapId": "GAP-002",
+    "loc": 122
+  },
+  {
+    "path": "apps/web/src/providerInstances.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side provider/model catalogue; Atlas owns model availability per node.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 362
+  },
+  {
+    "path": "apps/web/src/providerModels.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side provider/model catalogue; Atlas owns model availability per node.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 101
+  },
+  {
+    "path": "apps/web/src/providerSkillPresentation.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side provider/model catalogue; Atlas owns model availability per node.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 53
+  },
+  {
+    "path": "apps/web/src/providerSkillSearch.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-duplicate",
+    "reason": "Client-side provider/model catalogue; Atlas owns model availability per node.",
+    "atlasBinding": "/_members",
+    "gapId": null,
+    "loc": 105
+  },
+  {
+    "path": "apps/web/src/providerUpdateDismissal.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 93
+  },
+  {
+    "path": "apps/web/src/pullRequestReference.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 59
+  },
+  {
+    "path": "apps/web/src/reviewCommentContext.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 459
+  },
+  {
+    "path": "apps/web/src/rightPanelLayout.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "reuse",
+    "reason": "Panel tabbing is lens-local layout; the content of each tab is classified separately.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 3
+  },
+  {
+    "path": "apps/web/src/rightPanelStore.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "reuse",
+    "reason": "Panel tabbing is lens-local layout; the content of each tab is classified separately.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 560
+  },
+  {
+    "path": "apps/web/src/routeTree.gen.ts",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "App shell; overlay set changes with the removed products.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 392
+  },
+  {
+    "path": "apps/web/src/router.ts",
+    "area": "(root)",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "App shell; overlay set changes with the removed products.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 19
+  },
+  {
+    "path": "apps/web/src/routes/__root.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "rebind",
+    "reason": "App shell; overlay set changes with the removed products.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 418
+  },
+  {
+    "path": "apps/web/src/routes/_chat.$environmentId.$threadId.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Route shape changes from /:environmentId/:threadId to fleet/workspace/run addressing.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 88
+  },
+  {
+    "path": "apps/web/src/routes/_chat.draft.$draftId.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Route shape changes from /:environmentId/:threadId to fleet/workspace/run addressing.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 88
+  },
+  {
+    "path": "apps/web/src/routes/_chat.index.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Route shape changes from /:environmentId/:threadId to fleet/workspace/run addressing.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 185
+  },
+  {
+    "path": "apps/web/src/routes/_chat.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Route shape changes from /:environmentId/:threadId to fleet/workspace/run addressing.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 196
+  },
+  {
+    "path": "apps/web/src/routes/connect.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 13
+  },
+  {
+    "path": "apps/web/src/routes/connect_.callback.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 13
+  },
+  {
+    "path": "apps/web/src/routes/pair.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Atlas has no auth on :3010 at all. T3's one-time pairing-token flow is the closest donor, but the target is an Atlas-owned scheme.",
+    "atlasBinding": null,
+    "gapId": "GAP-001",
+    "loc": 54
+  },
+  {
+    "path": "apps/web/src/routes/settings.archived.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/routes/settings.beta.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 11
+  },
+  {
+    "path": "apps/web/src/routes/settings.connections.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/routes/settings.diagnostics.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/routes/settings.general.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 11
+  },
+  {
+    "path": "apps/web/src/routes/settings.keybindings.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/routes/settings.providers.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 11
+  },
+  {
+    "path": "apps/web/src/routes/settings.source-control.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 7
+  },
+  {
+    "path": "apps/web/src/routes/settings.tsx",
+    "area": "routes",
+    "level": "route",
+    "verdict": "redesign",
+    "reason": "Settings hierarchy re-sections around Atlas: fleet, backends, workspaces, console preferences.",
+    "atlasBinding": null,
+    "gapId": "GAP-003",
+    "loc": 130
+  },
+  {
+    "path": "apps/web/src/rpc/atomRegistry.ts",
+    "area": "rpc",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 14
+  },
+  {
+    "path": "apps/web/src/rpc/requestLatencyState.ts",
+    "area": "rpc",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 135
+  },
+  {
+    "path": "apps/web/src/rpc/transportError.ts",
+    "area": "rpc",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 4
+  },
+  {
+    "path": "apps/web/src/session-logic.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 1401
+  },
+  {
+    "path": "apps/web/src/shortcutModifierState.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "reuse",
+    "reason": "Local display and input preference; correctly lens-owned.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 96
+  },
+  {
+    "path": "apps/web/src/sidebarProjectGrouping.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "redesign",
+    "reason": "Primary navigation gains a tier: fleet -> workspace -> run. T3 has project -> thread and no node concept.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 262
+  },
+  {
+    "path": "apps/web/src/sourceControlPresentation.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 62
+  },
+  {
+    "path": "apps/web/src/state/assets.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/auth.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/desktopNetworkAccess.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 98
+  },
+  {
+    "path": "apps/web/src/state/desktopSshHosts.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 53
+  },
+  {
+    "path": "apps/web/src/state/desktopUpdate.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 86
+  },
+  {
+    "path": "apps/web/src/state/desktopWslState.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 60
+  },
+  {
+    "path": "apps/web/src/state/entities.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 239
+  },
+  {
+    "path": "apps/web/src/state/environments.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 91
+  },
+  {
+    "path": "apps/web/src/state/filesystem.ts",
+    "area": "state",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "File browser and editor. Filesystem access is deliberately absent from Atlas (NATIVE_DISALLOWED_TOOLS); this needs a decision, not just an endpoint.",
+    "atlasBinding": null,
+    "gapId": "GAP-008",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/git.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/orchestration.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/presentation.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 31
+  },
+  {
+    "path": "apps/web/src/state/preview.ts",
+    "area": "state",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Application preview and the embedded browser. No Atlas equivalent for local-server discovery or preview hosting on a node.",
+    "atlasBinding": null,
+    "gapId": "GAP-010",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/primaryEnvironment.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 12
+  },
+  {
+    "path": "apps/web/src/state/projects.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "A workspace is not a modeled entity in Atlas today; it is only a shell workdir.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 12
+  },
+  {
+    "path": "apps/web/src/state/queries.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 257
+  },
+  {
+    "path": "apps/web/src/state/query.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 36
+  },
+  {
+    "path": "apps/web/src/state/relay.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 6
+  },
+  {
+    "path": "apps/web/src/state/review.ts",
+    "area": "state",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Diff and review. Git awareness does not exist in atlas-host; warden/src/checkpoint.rs has it in the wrong layer.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/server.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 100
+  },
+  {
+    "path": "apps/web/src/state/session.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/state/shell.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 48
+  },
+  {
+    "path": "apps/web/src/state/sourceControl.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/sourceControlActions.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 390
+  },
+  {
+    "path": "apps/web/src/state/terminal.ts",
+    "area": "state",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 5
+  },
+  {
+    "path": "apps/web/src/state/terminalSessions.ts",
+    "area": "state",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 90
+  },
+  {
+    "path": "apps/web/src/state/threads.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/state/use-atom-command.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 23
+  },
+  {
+    "path": "apps/web/src/state/use-atom-query-runner.ts",
+    "area": "state",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 30
+  },
+  {
+    "path": "apps/web/src/state/vcs.ts",
+    "area": "state",
+    "level": "feature",
+    "verdict": "rebind",
+    "reason": "Source control. Needs an Atlas git/worktree surface; execution belongs on the node, the console only renders.",
+    "atlasBinding": null,
+    "gapId": "GAP-009",
+    "loc": 9
+  },
+  {
+    "path": "apps/web/src/terminal-links.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 286
+  },
+  {
+    "path": "apps/web/src/terminalUiStateStore.ts",
+    "area": "(root)",
+    "level": "workspace",
+    "verdict": "rebind",
+    "reason": "Terminal. hearth is a real PTY behind the run_bash tool but has no attach/list/keys HTTP surface.",
+    "atlasBinding": null,
+    "gapId": "GAP-007",
+    "loc": 781
+  },
+  {
+    "path": "apps/web/src/threadRoutes.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 103
+  },
+  {
+    "path": "apps/web/src/threadSelectionStore.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "rebind",
+    "reason": "Atom wiring and thread actions over the RPC client; the shape survives, the transport and payloads change.",
+    "atlasBinding": "/since",
+    "gapId": "GAP-002",
+    "loc": 122
+  },
+  {
+    "path": "apps/web/src/timestampFormat.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 225
+  },
+  {
+    "path": "apps/web/src/types.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 57
+  },
+  {
+    "path": "apps/web/src/uiStateStore.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 421
+  },
+  {
+    "path": "apps/web/src/versionSkew.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Updating a locally installed provider CLI or the T3 server binary; Atlas backends are fleet nodes, updated by deploy, not by the console.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 147
+  },
+  {
+    "path": "apps/web/src/vite-env.d.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 28
+  },
+  {
+    "path": "apps/web/src/vite-plus-browser-matchers.d.ts",
+    "area": "(root)",
+    "level": "internal",
+    "verdict": "reuse",
+    "reason": "Framework-level utility with no Atlas concept.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 11
+  },
+  {
+    "path": "apps/web/src/workspaceTitlebar.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 2
+  },
+  {
+    "path": "apps/web/src/worktreeCleanup.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "redesign",
+    "reason": "A workspace is not a modeled entity in Atlas today; it is only a shell workdir.",
+    "atlasBinding": null,
+    "gapId": "GAP-004",
+    "loc": 45
+  },
+  {
+    "path": "apps/web/src/wslPaths.ts",
+    "area": "(root)",
+    "level": "feature",
+    "verdict": "remove-unsupported",
+    "reason": "Desktop/WSL host integration; not shipped by this fork.",
+    "atlasBinding": null,
+    "gapId": null,
+    "loc": 159
+  }
+]

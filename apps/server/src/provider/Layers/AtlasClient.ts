@@ -91,12 +91,53 @@ export const AtlasVitals = Schema.Struct({
   ollama: Schema.optional(AtlasOllamaVitals),
 });
 
+/**
+ * Versioned, non-secret deployment description advertised by newer Atlas
+ * nodes. It is optional because a fleet can contain old and new binaries
+ * during a rolling upgrade.
+ */
+export const AtlasBodyManifest = Schema.Struct({
+  id: Schema.String,
+  tools: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+});
+export type AtlasBodyManifest = typeof AtlasBodyManifest.Type;
+
+export const AtlasMachineManifest = Schema.Struct({
+  label: Schema.String,
+  hostname: Schema.String,
+  os: Schema.String,
+  arch: Schema.String,
+  roles: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+});
+
+export const AtlasRuntimeManifest = Schema.Struct({
+  name: Schema.String,
+  version: Schema.String,
+});
+
+export const AtlasExecutionManifest = Schema.Struct({
+  default_body: Schema.NullOr(Schema.String),
+  default_model: Schema.NullOr(Schema.String),
+  backend: Schema.NullOr(Schema.String),
+  workspace: Schema.NullOr(Schema.String),
+});
+
+export const AtlasNodeManifest = Schema.Struct({
+  schema_version: Schema.Number,
+  machine: AtlasMachineManifest,
+  runtime: AtlasRuntimeManifest,
+  bodies: Schema.Array(AtlasBodyManifest).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  execution: AtlasExecutionManifest,
+});
+export type AtlasNodeManifest = typeof AtlasNodeManifest.Type;
+
 export const AtlasMember = Schema.Struct({
   id: Schema.String,
   url: Schema.String,
   tools: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   age_ms: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   vitals: Schema.optional(AtlasVitals),
+  manifest: Schema.optional(AtlasNodeManifest),
 });
 export type AtlasMember = typeof AtlasMember.Type;
 
@@ -277,3 +318,35 @@ export const atlasMembers = (
         }),
     ),
   );
+
+export interface AtlasFeedUrlInput {
+  readonly baseUrl: string;
+  readonly runId: string;
+  readonly plugin: string;
+  readonly token: string;
+  /** Replay only events after this `seq`. Omit to replay the whole feed. */
+  readonly after?: number;
+  /** The epoch `after` was issued under; Atlas discards a cursor from another one. */
+  readonly epoch?: number;
+}
+
+/**
+ * The Console feed socket for one run.
+ *
+ * The token rides the query string because a browser cannot set headers on a
+ * `WebSocket` — Atlas accepts it there or as a bearer header. That makes the URL
+ * sensitive: it must not be logged verbatim.
+ */
+export const atlasFeedUrl = (input: AtlasFeedUrlInput): string => {
+  const base = normalizeBaseUrl(input.baseUrl).replace(/^http/, "ws");
+  const params = new URLSearchParams({
+    run_id: input.runId,
+    plugin: input.plugin,
+    ...(input.token ? { access_token: input.token } : {}),
+    // Sent together or not at all: a cursor without its epoch is unsafe to honour.
+    ...(input.after !== undefined && input.epoch !== undefined
+      ? { after: String(input.after), epoch: String(input.epoch) }
+      : {}),
+  });
+  return `${base}/_feed?${params.toString()}`;
+};

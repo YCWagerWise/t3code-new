@@ -87,6 +87,14 @@ export const checkAtlasProviderStatus = (
       // node still yields a catalog.
       const self = members.find((member) => input.config.baseUrl.includes(member.id)) ?? members[0];
       const reachable = members.length > 0;
+      const bodyCount = self?.manifest?.bodies.length ?? 0;
+      const authLabel = self
+        ? [
+            self.manifest?.machine.label ?? self.id,
+            ...(bodyCount > 0 ? [`${bodyCount} bodies`] : []),
+            `${self.tools.length} tools`,
+          ].join(" · ")
+        : undefined;
       return {
         instanceId: input.instanceId,
         driver: ATLAS_DRIVER_KIND,
@@ -99,7 +107,7 @@ export const checkAtlasProviderStatus = (
         auth: {
           status: reachable ? "authenticated" : "unknown",
           type: "node",
-          ...(self ? { label: `${self.id} · ${self.tools.length} tools` } : {}),
+          ...(authLabel ? { label: authLabel } : {}),
         },
         checkedAt: input.checkedAt,
         ...(reachable ? {} : { message: `No members reported by ${input.config.baseUrl}` }),
