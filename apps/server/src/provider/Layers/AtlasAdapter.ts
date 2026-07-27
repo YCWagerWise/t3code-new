@@ -235,9 +235,12 @@ export const eventsForFrame = (
       if (turnState === "error") {
         return [
           {
-            type: "turn.aborted",
+            type: "turn.completed",
             ...base,
-            payload: { reason: str(payload.text) ?? "Atlas run failed" },
+            payload: {
+              state: "failed",
+              errorMessage: str(payload.text) ?? "Atlas run failed",
+            },
             raw,
           },
         ];

@@ -3477,4 +3477,213 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("runtime still processed");
   });
+
+  /**
+   * `turn.aborted` is now a genuine user cancellation and nothing else.
+   *
+   * Adapters used to reach for it to report execution failures too, which conflated
+   * "the user stopped this" with "the backend broke" — the second is a
+   * completed-but-failed turn and carries an error the UI must show. With that split
+   * made in the adapters, abort has to terminate the turn on its own here, or a
+   * cancelled thread sits on "Working" forever with no event left to close it.
+   */
+  const startTurn = async (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    turnId: string,
+    now: string,
+  ) => {
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId(`evt-started-${turnId}`),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId(turnId),
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "running" && thread.session?.activeTurnId === turnId,
+    );
+  };
+
+  const abortTurn = (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    eventId: string,
+    now: string,
+    turnId?: string,
+  ) => {
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId(eventId),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      ...(turnId === undefined ? {} : { turnId: asTurnId(turnId) }),
+      payload: { reason: "stopped by user" },
+    });
+  };
+
+  it("returns the session to ready when the active turn is cancelled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-cancel", now);
+    abortTurn(harness, "evt-abort-cancel", now, "turn-cancel");
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "ready" && entry.session?.activeTurnId === null,
+    );
+    // An ordinary cancellation is not a failure, so no error is left behind to
+    // render in the banner.
+    expect(thread.session?.lastError).toBeNull();
+  });
+
+  it("keeps the session in error when a provider error preceded the abort", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-error-then-abort", now);
+    harness.emit({
+      type: "runtime.error",
+      eventId: asEventId("evt-runtime-error-before-abort"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-error-then-abort"),
+      payload: { message: "backend exploded" },
+    });
+    await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.lastError === "backend exploded",
+    );
+
+    abortTurn(harness, "evt-abort-after-error", now, "turn-error-then-abort");
+
+    // The abort still has to clear the turn, but downgrading the session to
+    // "ready" would erase the reason the user needs to see.
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.activeTurnId === null && entry.session?.status === "error",
+    );
+    expect(thread.session?.lastError).toBe("backend exploded");
+  });
+
+  it("ignores a stale abort for a turn that is no longer active", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-old", now);
+    abortTurn(harness, "evt-abort-old", now, "turn-old");
+    await waitForThread(harness.readModel, (entry) => entry.session?.activeTurnId === null);
+
+    await startTurn(harness, "turn-new", now);
+    // Arriving late, this names a turn that already ended. Letting it through
+    // would kill the turn the user is currently watching.
+    abortTurn(harness, "evt-abort-stale", now, "turn-old");
+
+    await Effect.runPromise(Effect.yieldNow);
+    await harness.drain();
+    const snapshot = await harness.readModel();
+    const thread = snapshot.threads.find((entry) => entry.id === "thread-1");
+    expect(thread?.session?.activeTurnId).toBe("turn-new");
+    expect(thread?.session?.status).toBe("running");
+  });
+
+  it("does not close the active turn when the abort carries no turn id", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-unidentified", now);
+    abortTurn(harness, "evt-abort-no-turn", now);
+
+    await Effect.runPromise(Effect.yieldNow);
+    await harness.drain();
+    const snapshot = await harness.readModel();
+    const thread = snapshot.threads.find((entry) => entry.id === "thread-1");
+    // An abort that cannot say which turn it ends is not evidence that THIS one did.
+    expect(thread?.session?.activeTurnId).toBe("turn-unidentified");
+    expect(thread?.session?.status).toBe("running");
+  });
+
+  it("treats a duplicate abort as harmless", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-dup", now);
+    abortTurn(harness, "evt-abort-dup-1", now, "turn-dup");
+    await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "ready" && entry.session?.activeTurnId === null,
+    );
+
+    abortTurn(harness, "evt-abort-dup-2", now, "turn-dup");
+    await Effect.runPromise(Effect.yieldNow);
+    await harness.drain();
+
+    const snapshot = await harness.readModel();
+    const thread = snapshot.threads.find((entry) => entry.id === "thread-1");
+    expect(thread?.session?.activeTurnId).toBeNull();
+    expect(thread?.session?.status).toBe("ready");
+  });
+
+  it("finalizes partial assistant output instead of leaving it streaming", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-partial", now);
+    harness.emit({
+      type: "content.delta",
+      eventId: asEventId("evt-partial-delta"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-partial"),
+      itemId: asItemId("item-partial"),
+      payload: { streamKind: "assistant_text", delta: "half an ans" },
+    });
+
+    abortTurn(harness, "evt-abort-partial", now, "turn-partial");
+
+    // Cancelling mid-sentence must still commit what arrived; otherwise the
+    // message stays in a streaming state no later event will ever close.
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.activeTurnId === null &&
+        entry.messages.some((message: ProviderRuntimeTestMessage) =>
+          String(message.text ?? "").includes("half an ans"),
+        ),
+    );
+    expect(thread.session?.activeTurnId).toBeNull();
+  });
+
+  it("finalizes a buffered proposed plan when the turn is cancelled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await startTurn(harness, "turn-plan-abort", now);
+    harness.emit({
+      type: "turn.proposed.delta",
+      eventId: asEventId("evt-plan-delta-abort"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-plan-abort"),
+      payload: { delta: "## Half-written plan" },
+    });
+
+    abortTurn(harness, "evt-abort-plan", now, "turn-plan-abort");
+
+    // Same reasoning as the assistant buffer: the plan is either committed or
+    // dropped, never left pending on a turn that has ended.
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.activeTurnId === null,
+    );
+    const plan = thread.proposedPlans.find(
+      (entry: ProviderRuntimeTestProposedPlan) => entry.id === "plan:thread-1:turn:turn-plan-abort",
+    );
+    expect(plan?.planMarkdown).toBe("## Half-written plan");
+  });
 });

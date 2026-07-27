@@ -39,20 +39,25 @@ describe("eventsForFrame", () => {
   it("maps a turn boundary to the matching lifecycle event", () => {
     expect(types({ kind: "turn", payload: { state: "start" } })).toEqual(["turn.started"]);
     expect(types({ kind: "turn", payload: { state: "done" } })).toEqual(["turn.completed"]);
-    expect(types({ kind: "turn", payload: { state: "error" } })).toEqual(["turn.aborted"]);
+    expect(types({ kind: "turn", payload: { state: "error" } })).toEqual(["turn.completed"]);
   });
 
-  it("carries the Atlas failure reason onto the aborted turn", () => {
+  it("carries the Atlas failure reason onto a failed completed turn", () => {
     // The whole point of Atlas declaring `state:"error"` is that the reason
     // survives instead of being recovered by substring-matching an error string.
     const [event] = map({ kind: "turn", payload: { state: "error", text: "backend down" } });
-    expect(event).toMatchObject({ type: "turn.aborted", payload: { reason: "backend down" } });
+    expect(event).toMatchObject({
+      type: "turn.completed",
+      payload: { state: "failed", errorMessage: "backend down" },
+    });
   });
 
   it("falls back to a reason when Atlas reports an error with no text", () => {
     const [event] = map({ kind: "turn", payload: { state: "error" } });
     // TrimmedNonEmptyString would reject "", so a placeholder is required, not cosmetic.
-    expect(event).toMatchObject({ payload: { reason: "Atlas run failed" } });
+    expect(event).toMatchObject({
+      payload: { state: "failed", errorMessage: "Atlas run failed" },
+    });
   });
 
   it("expands an assistant answer into a complete item lifecycle", () => {
