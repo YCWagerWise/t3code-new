@@ -8,7 +8,12 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 
 import { atlasFeedUrl } from "./AtlasClient.ts";
-import { eventsForFrame, type FrameContext } from "./AtlasAdapter.ts";
+import {
+  eventsForFrame,
+  type FrameContext,
+  outboundDisposition,
+  socketLossEvents,
+} from "./AtlasAdapter.ts";
 
 const CTX: FrameContext = {
   runId: "thr-abc",
@@ -228,5 +233,51 @@ describe("atlasFeedUrl", () => {
       token: "t",
     });
     expect(url).toContain("//127.0.0.1:3010/_feed?");
+  });
+});
+
+describe("socket lifecycle", () => {
+  // The bug this guards: with only `onmessage` wired, a socket that failed or
+  // dropped emitted nothing — no error, no turn boundary — so a thread sat on
+  // "Working" indefinitely. Atlas cannot report it; the transport is what broke.
+  const loss = (over: { activeTurnId: TurnId | undefined; closing: boolean }) =>
+    socketLossEvents({ ...CTX, ...over }, "the feed died", STAMP);
+
+  it("ends the turn when the feed dies mid-run", () => {
+    const events = loss({ activeTurnId: CTX.activeTurnId, closing: false });
+    expect(events.map((e) => e.type)).toEqual(["runtime.error", "turn.aborted"]);
+    expect(events[0]).toMatchObject({ payload: { class: "transport_error" } });
+    // Without turn.aborted the timeline never leaves the running state, which is
+    // worse than an error: it reads as work still in progress.
+    expect(events[1]).toMatchObject({ turnId: CTX.activeTurnId });
+  });
+
+  it("reports an idle disconnect without inventing a turn", () => {
+    expect(loss({ activeTurnId: undefined, closing: false }).map((e) => e.type)).toEqual([
+      "runtime.error",
+    ]);
+  });
+
+  it("says nothing when the close was deliberate", () => {
+    // stopSession detaching the lens is not a failure — the Atlas run continues.
+    expect(loss({ activeTurnId: CTX.activeTurnId, closing: true })).toEqual([]);
+  });
+});
+
+describe("outboundDisposition", () => {
+  it("queues a frame written before the handshake completes", () => {
+    // startSession returns as soon as `new WebSocket()` is constructed, so a
+    // prompt sendTurn arrives while CONNECTING. Discarding it there produced a
+    // turn that never started and never failed.
+    expect(outboundDisposition(0)).toBe("queue");
+  });
+
+  it("sends straight through once open", () => {
+    expect(outboundDisposition(1)).toBe("send");
+  });
+
+  it("drops rather than buffering into a socket that will never flush", () => {
+    expect(outboundDisposition(2)).toBe("drop"); // CLOSING
+    expect(outboundDisposition(3)).toBe("drop"); // CLOSED
   });
 });

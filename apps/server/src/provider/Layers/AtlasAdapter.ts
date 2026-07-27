@@ -81,6 +81,18 @@ interface AtlasSessionState {
    * cursor without its epoch names a different event.
    */
   cursor: { seq: number; epoch: number } | undefined;
+  /**
+   * Frames written before the socket finished opening.
+   *
+   * `startSession` returns as soon as `new WebSocket()` is constructed, which is
+   * BEFORE the handshake completes, so a prompt `sendTurn` would otherwise be
+   * dropped: the old `send` checked `readyState === OPEN` and silently did
+   * nothing. A command lost that way produced a turn that never started and never
+   * failed — the thread sat on "Working" indefinitely.
+   */
+  outbox: string[];
+  /** Set by `stopSession`, so a deliberate close is not reported as a failure. */
+  closing: boolean;
   readonly session: ProviderSession;
 }
 
@@ -134,6 +146,56 @@ const declaredErrorClass = (frame: AtlasFrame): RuntimeErrorClassName =>
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
+
+/** WebSocket readyState values, named so the intent survives a reader. */
+const WS_CONNECTING = 0;
+const WS_OPEN = 1;
+
+/**
+ * Where an outbound frame goes, given the socket's state.
+ *
+ * `queue` is the case that matters: `startSession` returns as soon as
+ * `new WebSocket()` is constructed, before the handshake completes, so a prompt
+ * `sendTurn` arrives while CONNECTING. Discarding it there produced a turn that
+ * never started and never failed — a thread stuck on "Working" forever.
+ *
+ * `drop` is deliberate for a CLOSING/CLOSED socket: it will never flush, so
+ * queueing would leak the frame instead of losing it.
+ */
+export const outboundDisposition = (readyState: number): "send" | "queue" | "drop" =>
+  readyState === WS_OPEN ? "send" : readyState === WS_CONNECTING ? "queue" : "drop";
+
+/**
+ * What to emit when the feed dies.
+ *
+ * Atlas cannot report this — the transport is precisely what broke — so the
+ * adapter has to. Emitting only an error would leave the timeline running; the
+ * `turn.aborted` is what returns it to a terminal state.
+ */
+export const socketLossEvents = (
+  ctx: FrameContext & { readonly closing: boolean },
+  detail: string,
+  stamp: { readonly eventId: EventId; readonly createdAt: string },
+): ReadonlyArray<ProviderRuntimeEvent> => {
+  if (ctx.closing) return []; // a deliberate detach is not a failure
+  const base = {
+    ...stamp,
+    provider: ATLAS_ADAPTER_KIND,
+    providerInstanceId: ctx.instanceId,
+    threadId: ctx.threadId,
+    ...(ctx.activeTurnId ? { turnId: ctx.activeTurnId } : {}),
+  };
+  const error = {
+    type: "runtime.error" as const,
+    ...base,
+    payload: { message: detail, class: "transport_error" as const },
+  };
+  // Only when a turn was in flight — an idle disconnect must not invent an
+  // aborted turn that never ran.
+  return ctx.activeTurnId === undefined
+    ? [error]
+    : [error, { type: "turn.aborted" as const, ...base, payload: { reason: detail } }];
+};
 
 /** Everything the frame mapper needs, without a live session behind it. */
 export interface FrameContext {
@@ -373,8 +435,18 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
   const send = (state: AtlasSessionState, kind: string, payload: Record<string, unknown>) =>
     Effect.sync(() => {
       const encoded = encodeUnknownJsonStringExit({ kind, payload });
-      if (Exit.isSuccess(encoded) && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(encoded.value);
+      if (!Exit.isSuccess(encoded)) return;
+      // Queue rather than discard when the handshake has not finished. Dropping it
+      // silently is how a turn ends up neither started nor failed.
+      switch (outboundDisposition(state.socket.readyState)) {
+        case "send":
+          state.socket.send(encoded.value);
+          break;
+        case "queue":
+          state.outbox.push(encoded.value);
+          break;
+        case "drop":
+          break;
       }
     });
 
@@ -450,9 +522,46 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
       // slowly must not block the session from being usable.
       const runtimeContext = yield* Effect.context<never>();
       const runFork = Effect.runForkWith(runtimeContext);
+
+      socket.onopen = () => {
+        for (const frame of state.outbox.splice(0)) socket.send(frame);
+      };
+
       socket.onmessage = (message: MessageEvent) => {
         if (typeof message.data !== "string") return;
         runFork(handleFrameText(state, message.data));
+      };
+
+      /**
+       * A dead socket must END the turn, not leave it running.
+       *
+       * With only `onmessage` wired, a socket that failed to connect or dropped
+       * mid-turn emitted nothing at all — no error, no turn boundary — and the
+       * thread sat on "Working" indefinitely, because the timeline's only source
+       * of turn state is the feed and the feed had gone silent. Atlas cannot
+       * report this: the transport is precisely what broke. So the adapter must.
+       */
+      const reportSocketLoss = (detail: string) =>
+        Effect.gen(function* () {
+          const stamp = yield* makeEventStamp();
+          const ctx = {
+            runId: state.runId,
+            threadId: state.threadId,
+            instanceId: options.instanceId,
+            activeTurnId: state.activeTurnId,
+            closing: state.closing,
+          };
+          const events = socketLossEvents(ctx, detail, stamp);
+          for (const event of events) yield* publish(event);
+          if (events.some((e) => e.type === "turn.aborted")) state.activeTurnId = undefined;
+        });
+
+      socket.onerror = () => {
+        runFork(reportSocketLoss(`Lost the Atlas feed for ${state.runId}.`));
+      };
+      socket.onclose = (event: CloseEvent) => {
+        const why = event.reason !== "" ? event.reason : `closed with code ${event.code}`;
+        runFork(reportSocketLoss(`The Atlas feed for ${state.runId} ${why}.`));
       };
 
       return session;
@@ -509,6 +618,9 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
       const state = sessions.get(threadId);
       if (state === undefined) return;
       sessions.delete(threadId);
+      // Mark it BEFORE closing, so the close handler does not report a deliberate
+      // detach as a transport failure.
+      state.closing = true;
       // Closing the socket detaches the lens. The Atlas run is durable and keeps
       // going — there is no process here to kill, which is the whole difference
       // between this adapter and the CLI-backed ones.
