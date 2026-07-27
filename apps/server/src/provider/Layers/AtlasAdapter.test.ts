@@ -1,4 +1,5 @@
 import {
+  AtlasSettings,
   EventId,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
@@ -6,11 +7,15 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 import { atlasFeedUrl } from "./AtlasClient.ts";
 import {
   eventsForFrame,
   type FrameContext,
+  makeAtlasAdapter,
   outboundDisposition,
   socketLossEvents,
 } from "./AtlasAdapter.ts";
@@ -280,4 +285,113 @@ describe("outboundDisposition", () => {
     expect(outboundDisposition(2)).toBe("drop"); // CLOSING
     expect(outboundDisposition(3)).toBe("drop"); // CLOSED
   });
+});
+
+/**
+ * A socket the test drives by hand, parked in CONNECTING until `open()` is called.
+ *
+ * The adapter only ever touches `readyState`, `send`, and the four handlers, so this
+ * stands in for the browser type without pulling in a real server.
+ */
+class FakeSocket {
+  static last: FakeSocket | undefined;
+  readyState = 0; // CONNECTING
+  readonly sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((event: unknown) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: ((event: unknown) => void) | null = null;
+  readonly url: string;
+  constructor(url: string) {
+    this.url = url;
+    FakeSocket.last = this;
+  }
+  send(data: string): void {
+    this.sent.push(data);
+  }
+  close(): void {
+    this.readyState = 3;
+  }
+  /** Complete the handshake, as the runtime would. */
+  open(): void {
+    this.readyState = 1;
+    this.onopen?.();
+  }
+}
+
+const withFakeSocket = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const original = globalThis.WebSocket;
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeSocket;
+      return original;
+    }),
+    () => body,
+    (original) =>
+      Effect.sync(() => {
+        (globalThis as unknown as { WebSocket: unknown }).WebSocket = original;
+      }),
+  );
+
+const SETTINGS = Schema.decodeUnknownSync(AtlasSettings)({});
+const decodeFrame = Schema.decodeUnknownSync(Schema.UnknownFromJsonString);
+const sentFrame = (socket: FakeSocket | undefined, index: number): unknown =>
+  decodeFrame(socket?.sent[index] ?? "{}");
+
+/**
+ * The pure-function tests above cover the *decisions*; these cover the *wiring*.
+ *
+ * That distinction is not academic. `outboundDisposition` correctly returned "queue"
+ * while the queue it named was never initialized, so `send` threw
+ * `Cannot read properties of undefined (reading 'push')` on the first prompt — with
+ * every decision test passing. Nothing here constructed the adapter, so nothing saw it.
+ */
+describe("session wiring", () => {
+  it.effect("queues a turn sent before the handshake, then flushes it on open", () =>
+    withFakeSocket(
+      Effect.gen(function* () {
+        const adapter = yield* makeAtlasAdapter(SETTINGS, {
+          instanceId: ProviderInstanceId.make("atlas"),
+        });
+        const threadId = ThreadId.make("wiring-queue");
+
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        const socket = FakeSocket.last;
+        expect(socket?.readyState).toBe(0);
+
+        // The real crash site: startSession returns before the handshake, so this
+        // lands while CONNECTING and must be buffered rather than thrown on.
+        yield* adapter.sendTurn({ threadId, input: "hello" });
+        expect(socket?.sent).toEqual([]);
+
+        socket?.open();
+        expect(socket?.sent).toHaveLength(1);
+        expect(sentFrame(socket, 0)).toMatchObject({
+          kind: "cmd",
+          payload: { text: "hello" },
+        });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("sends straight through once the socket is open", () =>
+    withFakeSocket(
+      Effect.gen(function* () {
+        const adapter = yield* makeAtlasAdapter(SETTINGS, {
+          instanceId: ProviderInstanceId.make("atlas"),
+        });
+        const threadId = ThreadId.make("wiring-open");
+
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        FakeSocket.last?.open();
+        yield* adapter.sendTurn({ threadId, input: "second" });
+
+        // Flushed on open, not queued a second time.
+        expect(FakeSocket.last?.sent).toHaveLength(1);
+        expect(sentFrame(FakeSocket.last, 0)).toMatchObject({
+          payload: { text: "second" },
+        });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

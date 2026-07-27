@@ -513,6 +513,8 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
         activeTurnId: undefined,
         model,
         cursor: resume,
+        outbox: [],
+        closing: false,
         session,
       };
       sessions.set(input.threadId, state);
