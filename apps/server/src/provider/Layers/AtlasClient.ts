@@ -176,10 +176,13 @@ export interface AtlasModelOption {
  * model (…)" — so a static list would let a user pick something that does not
  * exist. Everything here comes from what the node reported.
  *
- * `claude` and `codex` are included per `build_backend_named`'s routing rules
- * (`claude*` → Claude CLI, `codex`/`gpt*`/`o<n>` → Codex CLI). Whether those
- * CLIs are installed is a property of the node, not of this list — an absent
- * CLI surfaces as a run-time error the same way a bad Ollama tag does.
+ * The CLI-backed entry is whatever the node DECLARES in
+ * `manifest.execution.{default_model, backend}` — not a hardcoded `claude`/`codex`
+ * pair. That pair was a lie in two directions: the id `"claude"` reached the CLI
+ * verbatim as `claude --model claude`, which is not a valid model, and both were
+ * offered on nodes that have neither CLI installed. A node that declares nothing
+ * contributes no CLI entry, which is honest — an empty picker beats one listing
+ * models that cannot run.
  */
 export const modelOptionsForMember = (member: AtlasMember): ReadonlyArray<AtlasModelOption> => {
   const ollama = member.vitals?.ollama;
@@ -201,25 +204,43 @@ export const modelOptionsForMember = (member: AtlasMember): ReadonlyArray<AtlasM
       };
     });
 
-  return [
-    {
-      id: "claude",
-      label: "Claude",
-      source: "claude",
-      supportsTools: true,
-      loaded: true,
-      detail: "Claude CLI login",
-    },
-    {
-      id: "codex",
-      label: "Codex",
-      source: "codex",
-      supportsTools: true,
-      loaded: true,
-      detail: "Codex CLI login",
-    },
-    ...ollamaOptions,
-  ];
+  const execution = member.manifest?.execution;
+  const declaredModel = execution?.default_model?.trim();
+  // `backend` names the CLI the node routes through; absent means the Claude path,
+  // which is `build_backend_named`'s own default.
+  const backend = execution?.backend?.trim();
+  const cliOptions: ReadonlyArray<AtlasModelOption> =
+    declaredModel === undefined || declaredModel === ""
+      ? []
+      : [
+          {
+            id: declaredModel,
+            label: declaredModel,
+            source: backend === "codex" ? "codex" : "claude",
+            supportsTools: true,
+            loaded: true,
+            detail: `${member.id} default${backend === undefined || backend === "" ? "" : ` · ${backend}`}`,
+          },
+        ];
+
+  return [...cliOptions, ...ollamaOptions];
+};
+
+/**
+ * The bodies this node can actually run, as it declares them.
+ *
+ * `plugin` is the one-lens-many-bodies selector, and an unknown name does not
+ * fail — `resolve_plugin` silently degrades it to the node's default — so a
+ * console that guesses `"coder"` would show one body while another answered.
+ */
+export const bodiesForMember = (member: AtlasMember): ReadonlyArray<string> =>
+  (member.manifest?.bodies ?? []).map((body) => body.id);
+
+/** The body a node runs when the caller names none. */
+export const defaultBodyForMember = (member: AtlasMember): string | undefined => {
+  const declared = member.manifest?.execution?.default_body?.trim();
+  if (declared !== undefined && declared !== "") return declared;
+  return bodiesForMember(member)[0];
 };
 
 export const AtlasMembers = Schema.Struct({

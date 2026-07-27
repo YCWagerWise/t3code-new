@@ -231,10 +231,36 @@ describe("AtlasClient", () => {
       assert.strictEqual(byId.get("deepseek-coder:6.7b")?.loaded, false);
     });
 
-    it("always offers the CLI-backed routes", () => {
-      const ids = modelOptionsForMember(liveMember).map((option) => option.id);
-      assert.ok(ids.includes("claude"));
-      assert.ok(ids.includes("codex"));
+    it("takes the CLI-backed model from what the node declares", () => {
+      // Not a hardcoded `claude`/`codex` pair. That id reached the CLI verbatim as
+      // `claude --model claude`, which is not a valid model, and it was offered on
+      // nodes with neither CLI installed.
+      const withManifest = {
+        ...liveMember,
+        manifest: {
+          schema_version: 1,
+          machine: { label: "mb", hostname: "mb", os: "macos", arch: "arm64", roles: [] },
+          runtime: { name: "atlas-host", version: "0.1.0" },
+          bodies: [{ id: "triage", tools: [] }],
+          execution: {
+            default_body: "triage",
+            default_model: "claude-opus-4-8",
+            backend: null,
+            workspace: null,
+          },
+        },
+      };
+      const options = modelOptionsForMember(withManifest);
+      const cli = options.find((o) => o.source === "claude");
+      assert.strictEqual(cli?.id, "claude-opus-4-8");
+      assert.ok(!options.some((o) => o.id === "claude"), "the bare slug must be gone");
+      assert.ok(!options.some((o) => o.id === "codex"));
+    });
+
+    it("offers no CLI route when the node declares no model", () => {
+      // An empty picker beats one listing models that cannot run.
+      const options = modelOptionsForMember(liveMember);
+      assert.ok(options.every((o) => o.source === "ollama" || o.source === "ollama-cloud"));
     });
 
     it("carries params and quantization as user-visible detail", () => {
@@ -252,13 +278,10 @@ describe("AtlasClient", () => {
       assert.strictEqual(byId.get("qwen2.5-coder:14b")?.source, "ollama");
     });
 
-    it("degrades to CLI-only when a node reports no ollama vitals", () => {
+    it("yields nothing for a node that reports neither ollama nor a manifest", () => {
       const bare = { id: "seraphim", url: "http://10.0.0.2:3010", tools: [], age_ms: 0 };
       const options = modelOptionsForMember(bare as unknown as AtlasMember);
-      assert.deepStrictEqual(
-        options.map((option) => option.id),
-        ["claude", "codex"],
-      );
+      assert.deepStrictEqual(options, [], "silence is honest; a fabricated catalogue is not");
     });
   });
 });

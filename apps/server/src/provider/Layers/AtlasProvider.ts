@@ -28,13 +28,43 @@ import {
 
 export const ATLAS_DRIVER_KIND = ProviderDriverKind.make("atlas");
 
+/** Host and port, ignoring scheme and trailing slash, so two spellings of one node match. */
+const authorityOf = (raw: string): string | undefined => {
+  try {
+    return new URL(raw).host;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
- * How a model option is labelled for the picker.
+ * The member that IS the node we asked.
  *
- * `subProvider` carries the routing origin so the UI can group a 117B cloud
- * model apart from a 7B local one instead of listing them as peers, and
- * `shortName` keeps the tag readable when the full id is long.
+ * The node tells us directly: `members_json` stamps `age_ms: 0` on its own entry
+ * and a real age on every peer it learned by gossip, so self-identification is a
+ * declaration rather than something to infer. That is the primary signal.
+ *
+ * The URL comparison is only a fallback for a node that reports no ages. Matching
+ * on the advertised authority beats the previous `baseUrl.includes(member.id)`,
+ * which could never match an id like `macbook` against `http://127.0.0.1:3010` and
+ * so always fell through to `members[0]` — harmless with one member, and silently
+ * describing the wrong box's models once the ring repopulated.
  */
+export const selfMember = (
+  members: ReadonlyArray<AtlasMember>,
+  baseUrl: string,
+): AtlasMember | undefined => {
+  const declared = members.filter((m) => m.age_ms === 0);
+  // Exactly one claimant is the normal case. Two would mean the ring disagrees
+  // about who is local, and guessing between them is how you end up describing
+  // the wrong node's models.
+  if (declared.length === 1) return declared[0];
+
+  const want = authorityOf(baseUrl);
+  if (want === undefined) return undefined;
+  return members.find((m) => authorityOf(m.url) === want);
+};
+
 const toServerProviderModel = (option: AtlasModelOption): ServerProviderModel => ({
   slug: option.id,
   name: option.label,
@@ -82,10 +112,13 @@ export const checkAtlasProviderStatus = (
 ): Effect.Effect<ServerProvider, never, HttpClient.HttpClient> =>
   atlasMembers(input.config.baseUrl).pipe(
     Effect.map((members): ServerProvider => {
-      // A node reports the whole ring it can see. Prefer its own entry when the
-      // base URL identifies it, else fall back to the first member so a seed
-      // node still yields a catalog.
-      const self = members.find((member) => input.config.baseUrl.includes(member.id)) ?? members[0];
+      // A node reports the whole ring it can see, and the FIRST entry is not
+      // reliably the one we asked. Match on the URL the member advertises rather
+      // than on its id: an id like `macbook` never appears inside
+      // `http://127.0.0.1:3010`, so the old id-substring check always fell
+      // through to members[0] — harmless with one member, wrong the moment the
+      // ring repopulates, and it would describe the wrong box's models.
+      const self = selfMember(members, input.config.baseUrl) ?? members[0];
       const reachable = members.length > 0;
       const bodyCount = self?.manifest?.bodies.length ?? 0;
       const authLabel = self
