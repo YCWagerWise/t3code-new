@@ -136,8 +136,15 @@ export const AtlasMember = Schema.Struct({
   url: Schema.String,
   tools: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   age_ms: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
-  vitals: Schema.optional(AtlasVitals),
-  manifest: Schema.optional(AtlasNodeManifest),
+  // NullOr *and* optional. A node omits these for itself when it has nothing to
+  // report, but sends an explicit `null` for any PEER whose gossip beat carried
+  // none — which is every node running a build older than the manifest work. A
+  // mixed-version fleet therefore yields `null` here, and `Schema.optional`
+  // alone rejects it, failing the decode of the ENTIRE member list over one
+  // stale peer. That takes the whole provider offline: no models, no picker
+  // entry, `installed: false`.
+  vitals: Schema.optional(Schema.NullOr(AtlasVitals)),
+  manifest: Schema.optional(Schema.NullOr(AtlasNodeManifest)),
 });
 export type AtlasMember = typeof AtlasMember.Type;
 

@@ -13,9 +13,18 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
-import { type AtlasMember, atlasMembers, atlasRun, modelOptionsForMember } from "./AtlasClient.ts";
+import {
+  type AtlasMember,
+  AtlasMembers,
+  atlasMembers,
+  atlasRun,
+  bodiesForMember,
+  defaultBodyForMember,
+  modelOptionsForMember,
+} from "./AtlasClient.ts";
 
 interface CapturedRequest {
   url: string;
@@ -283,5 +292,71 @@ describe("AtlasClient", () => {
       const options = modelOptionsForMember(bare as unknown as AtlasMember);
       assert.deepStrictEqual(options, [], "silence is honest; a fabricated catalogue is not");
     });
+  });
+});
+
+describe("a mixed-version fleet", () => {
+  // Exactly the shape a rebuilt node broadcasts while its peers are still on an
+  // older build: itself with a manifest, everyone else with an explicit null.
+  const mixed = {
+    members: [
+      {
+        id: "macbook",
+        url: "http://127.0.0.1:3010",
+        tools: ["/tool/nodes"],
+        age_ms: 0,
+        vitals: { ollama: { loaded: [], models: [] } },
+        manifest: {
+          schema_version: 1,
+          machine: { label: "mb", hostname: "mb", os: "macos", arch: "arm64", roles: [] },
+          runtime: { name: "atlas-host", version: "0.1.0" },
+          bodies: [{ id: "triage", tools: [] }],
+          execution: {
+            default_body: "triage",
+            default_model: "claude-opus-4-8",
+            backend: null,
+            workspace: null,
+          },
+        },
+      },
+      {
+        id: "seraphim",
+        url: "http://100.65.119.87:3010",
+        tools: [],
+        age_ms: 1142,
+        vitals: null,
+        manifest: null,
+      },
+      { id: "metatron", url: "http://100.117.113.5:3010", tools: [], age_ms: 900, manifest: null },
+    ],
+  };
+
+  it("decodes when a peer reports null manifest and vitals", () => {
+    // `Schema.optional` alone accepts absent-or-object but NOT null, so one stale
+    // peer failed the decode of the ENTIRE member list — taking the whole provider
+    // offline: installed:false, no models, no picker entry. Needs a MIXED fleet to
+    // reproduce; all-old and all-new both decode cleanly, which is why it hid.
+    const decoded = Schema.decodeUnknownSync(AtlasMembers)(mixed);
+    assert.strictEqual(decoded.members.length, 3);
+    assert.strictEqual(decoded.members[1]?.manifest ?? null, null);
+    assert.strictEqual(decoded.members[2]?.vitals ?? null, null);
+  });
+
+  it("still reads the declared model off the node that does report one", () => {
+    const decoded = Schema.decodeUnknownSync(AtlasMembers)(mixed);
+    const self = decoded.members[0];
+    assert.ok(self !== undefined);
+    assert.deepStrictEqual(
+      modelOptionsForMember(self).map((o) => o.id),
+      ["claude-opus-4-8"],
+    );
+  });
+
+  it("treats a null-manifest peer as declaring no bodies rather than throwing", () => {
+    const decoded = Schema.decodeUnknownSync(AtlasMembers)(mixed);
+    const stale = decoded.members[1];
+    assert.ok(stale !== undefined);
+    assert.deepStrictEqual(bodiesForMember(stale), []);
+    assert.strictEqual(defaultBodyForMember(stale), undefined);
   });
 });
