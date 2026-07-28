@@ -139,6 +139,29 @@ describe("eventsForFrame", () => {
     expect(map({ kind: "question", payload: { request_id: "r2" } })).toEqual([]);
   });
 
+  it("maps a heartbeat to a liveness event, not to timeline activity", () => {
+    const events = map({ kind: "hb", run_id: "thr-abc", seq: 4, ts: 1785206752998 });
+    expect(events.map((e) => e.type)).toEqual(["session.heartbeat"]);
+    expect(events[0]).toMatchObject({
+      payload: { observedAt: "2026-07-28T02:45:52.998Z", sequence: 4 },
+    });
+  });
+
+  it("never attaches the active turn to a heartbeat", () => {
+    // A heartbeat speaks for the connection, not the work running over it. Carrying a
+    // turnId would let a liveness frame advance or close a turn — and Atlas emits these
+    // on an idle window, so they keep arriving from a run that has silently died.
+    const [event] = map({ kind: "hb", ts: 1785206752998 });
+    expect(event).not.toHaveProperty("turnId");
+    expect(CTX.activeTurnId).toBeDefined(); // the context DOES have one; it must be ignored
+  });
+
+  it("accepts a heartbeat that carries neither timestamp nor cursor", () => {
+    // An older node may send a barer frame; liveness is the arrival itself.
+    const [event] = map({ kind: "hb" });
+    expect(event).toMatchObject({ type: "session.heartbeat", payload: {} });
+  });
+
   it("ignores frames it does not recognise instead of throwing", () => {
     expect(map({ kind: "some_future_frame", payload: {} })).toEqual([]);
     expect(map({})).toEqual([]);

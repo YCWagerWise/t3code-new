@@ -152,6 +152,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "session.configured",
   "session.state.changed",
   "session.exited",
+  "session.heartbeat",
   "thread.started",
   "thread.state.changed",
   "thread.metadata.updated",
@@ -202,6 +203,7 @@ const SessionStartedType = Schema.Literal("session.started");
 const SessionConfiguredType = Schema.Literal("session.configured");
 const SessionStateChangedType = Schema.Literal("session.state.changed");
 const SessionExitedType = Schema.Literal("session.exited");
+const SessionHeartbeatType = Schema.Literal("session.heartbeat");
 const ThreadStartedType = Schema.Literal("thread.started");
 const ThreadStateChangedType = Schema.Literal("thread.state.changed");
 const ThreadMetadataUpdatedType = Schema.Literal("thread.metadata.updated");
@@ -288,6 +290,25 @@ const SessionExitedPayload = Schema.Struct({
   exitKind: Schema.optional(RuntimeSessionExitKind),
 });
 export type SessionExitedPayload = typeof SessionExitedPayload.Type;
+
+/**
+ * Liveness only — "the transport to this provider is still up".
+ *
+ * Deliberately NOT evidence that work is progressing. A provider emits these while
+ * idle, so a heartbeat continues arriving from a run that has silently died. It can
+ * therefore support a transport deadline and must never support a progress deadline;
+ * conflating the two is how a healthy long-running turn gets reaped.
+ *
+ * Carries no turn: a heartbeat speaks for the connection, not for whatever is running
+ * over it, so it must never be able to close or advance a turn.
+ */
+const SessionHeartbeatPayload = Schema.Struct({
+  /** Provider-side send time, when the provider states one. */
+  observedAt: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Highest sequence the provider believes this client should hold, when known. */
+  sequence: Schema.optional(Schema.Number),
+});
+export type SessionHeartbeatPayload = typeof SessionHeartbeatPayload.Type;
 
 const ThreadStartedPayload = Schema.Struct({
   providerThreadId: Schema.optional(TrimmedNonEmptyStringSchema),
@@ -643,6 +664,13 @@ const ProviderRuntimeSessionExitedEvent = Schema.Struct({
 });
 export type ProviderRuntimeSessionExitedEvent = typeof ProviderRuntimeSessionExitedEvent.Type;
 
+const ProviderRuntimeSessionHeartbeatEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: SessionHeartbeatType,
+  payload: SessionHeartbeatPayload,
+});
+export type ProviderRuntimeSessionHeartbeatEvent = typeof ProviderRuntimeSessionHeartbeatEvent.Type;
+
 const ProviderRuntimeThreadStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: ThreadStartedType,
@@ -971,6 +999,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeSessionConfiguredEvent,
   ProviderRuntimeSessionStateChangedEvent,
   ProviderRuntimeSessionExitedEvent,
+  ProviderRuntimeSessionHeartbeatEvent,
   ProviderRuntimeThreadStartedEvent,
   ProviderRuntimeThreadStateChangedEvent,
   ProviderRuntimeThreadMetadataUpdatedEvent,

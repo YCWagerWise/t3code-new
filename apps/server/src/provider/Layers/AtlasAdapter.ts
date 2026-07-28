@@ -93,6 +93,8 @@ interface AtlasSessionState {
   outbox: string[];
   /** Set by `stopSession`, so a deliberate close is not reported as a failure. */
   closing: boolean;
+  /** Prevent the error frame plus close event from reporting the same failure twice. */
+  feedFailureReported: boolean;
   readonly session: ProviderSession;
 }
 
@@ -115,6 +117,8 @@ interface AtlasFrame {
   readonly version?: number;
   readonly seq?: number;
   readonly epoch?: number;
+  /** Provider send time, milliseconds. Present on transport frames such as `hb`. */
+  readonly ts?: number;
   readonly kind?: string;
   readonly role?: string;
   readonly payload?: Record<string, unknown>;
@@ -227,6 +231,37 @@ export const eventsForFrame = (
   const raw = { source: "atlas.feed", payload: frame as unknown } as const;
 
   switch (frame.kind) {
+    // Transport liveness. Atlas sends one at connect and then on every idle window,
+    // so its arrival proves the socket is alive — and nothing more. It is emitted
+    // WITHOUT a turnId even mid-turn: a heartbeat speaks for the connection, not for
+    // the work running over it, and letting one carry a turn would give it the power
+    // to advance or close that turn.
+    //
+    // Absence is not death. A node too old to send these must read as "cannot be
+    // supervised this way", never as "stalled" — most of the fleet is still on a
+    // build that has no idea this frame exists.
+    case "hb": {
+      const sentAt = num(frame.ts);
+      const cursor = num(frame.seq);
+      return [
+        {
+          // Built from `stamp` rather than `base`: `base` carries the active turn, and
+          // a heartbeat must not.
+          ...stamp,
+          type: "session.heartbeat",
+          provider: ATLAS_ADAPTER_KIND,
+          providerInstanceId: ctx.instanceId,
+          threadId: ctx.threadId,
+          payload: {
+            ...(sentAt !== undefined
+              ? { observedAt: DateTime.formatIso(DateTime.makeUnsafe(sentAt)) }
+              : {}),
+            ...(cursor !== undefined ? { sequence: cursor } : {}),
+          },
+          raw,
+        },
+      ];
+    }
     case "turn": {
       const turnState = str(payload.state);
       if (turnState === "start") {
@@ -346,18 +381,21 @@ export const eventsForFrame = (
       ];
     }
 
-    case "error":
-      return [
-        {
-          type: "runtime.error",
-          ...base,
-          payload: {
-            message: frame.error ?? str(payload.text) ?? "Atlas error",
-            class: declaredErrorClass(frame),
-          },
-          raw,
-        },
-      ];
+    case "error": {
+      const message = frame.error ?? str(payload.text) ?? "Atlas error";
+      const error = {
+        type: "runtime.error" as const,
+        ...base,
+        payload: { message, class: declaredErrorClass(frame) },
+        raw,
+      };
+      // A feed-level rejection can arrive before Atlas has emitted
+      // `turn.started`. The adapter already owns a turn id at that point, so
+      // make it terminal here instead of leaving the thread at "starting".
+      return ctx.activeTurnId === undefined
+        ? [error]
+        : [error, { type: "turn.aborted" as const, ...base, payload: { reason: message }, raw }];
+    }
 
     // Carried by the protocol but not yet enforced on the Atlas side (GAP-006):
     // surfacing them as runtime events would put an approval in the UI that
@@ -429,6 +467,7 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
       }
       // A console never echoes its own commands back into the timeline.
       if (parsed.role === "console") return;
+      if (parsed.kind === "error") state.feedFailureReported = true;
       const stamp = yield* makeEventStamp();
       for (const event of eventsForFrameHere(state, parsed, stamp)) {
         yield* publish(event);
@@ -436,21 +475,30 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
     });
 
   const send = (state: AtlasSessionState, kind: string, payload: Record<string, unknown>) =>
-    Effect.sync(() => {
-      const encoded = encodeUnknownJsonStringExit({ kind, payload });
-      if (!Exit.isSuccess(encoded)) return;
-      // Queue rather than discard when the handshake has not finished. Dropping it
-      // silently is how a turn ends up neither started nor failed.
-      switch (outboundDisposition(state.socket.readyState)) {
-        case "send":
-          state.socket.send(encoded.value);
-          break;
-        case "queue":
-          state.outbox.push(encoded.value);
-          break;
-        case "drop":
-          break;
-      }
+    Effect.try({
+      try: () => {
+        const encoded = encodeUnknownJsonStringExit({ kind, payload });
+        if (!Exit.isSuccess(encoded)) throw new Error("Could not encode Atlas feed command.");
+        // Queue rather than discard when the handshake has not finished. Dropping it
+        // silently is how a turn ends up neither started nor failed.
+        switch (outboundDisposition(state.socket.readyState)) {
+          case "send":
+            state.socket.send(encoded.value);
+            break;
+          case "queue":
+            state.outbox.push(encoded.value);
+            break;
+          case "drop":
+            throw new Error("Atlas feed is no longer connected.");
+        }
+      },
+      catch: (cause) =>
+        new ProviderAdapterRequestError({
+          provider: ATLAS_ADAPTER_KIND,
+          method: "feed/send",
+          detail: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
     });
 
   const requireSession = (threadId: ThreadId) => {
@@ -518,6 +566,7 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
         cursor: resume,
         outbox: [],
         closing: false,
+        feedFailureReported: false,
         session,
       };
       sessions.set(input.threadId, state);
@@ -548,6 +597,8 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
        */
       const reportSocketLoss = (detail: string) =>
         Effect.gen(function* () {
+          if (state.feedFailureReported) return;
+          state.feedFailureReported = true;
           const stamp = yield* makeEventStamp();
           const ctx = {
             runId: state.runId,
@@ -576,7 +627,6 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
   const sendTurn: AtlasAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const state = yield* requireSession(input.threadId);
     const turnId = TurnId.make(yield* randomUUIDv4);
-    state.activeTurnId = turnId;
     // A per-turn pick overrides the session's; absent leaves the node's own default.
     const model = input.modelSelection?.model ?? state.model;
     // Atlas publishes its own turn.started off the feed once the drive begins.
@@ -585,6 +635,7 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
       text: input.input ?? "",
       ...(model ? { model } : {}),
     });
+    state.activeTurnId = turnId;
     return {
       threadId: input.threadId,
       turnId,
