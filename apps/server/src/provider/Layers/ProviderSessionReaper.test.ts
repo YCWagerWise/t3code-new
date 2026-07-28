@@ -683,15 +683,23 @@ describe("ProviderSessionReaper", () => {
     expect(repairCommand(harness)?.session?.lastError).toBe("backend exploded");
   });
 
-  it("leaves a just-stopped runtime alone so a normal shutdown can settle itself", async () => {
-    // An ordinary stop briefly holds both states while its terminal event projects.
-    // Repairing inside that window would race a shutdown that is working correctly.
+  it("settles a stranded thread at boot without waiting out a grace period", async () => {
+    // The restart case must not be discovered by polling. Any binding already on disk
+    // when the reaper starts belongs to a process that is gone — no session has been
+    // created yet — so there is nothing to wait for and nothing to infer. A fresh
+    // `lastSeenAt` would hold the periodic sweep back; boot must repair regardless,
+    // or a `--watch` restart leaves the thread hung for a whole sweep interval.
     const threadId = ThreadId.make("thread-reaper-stranded-fresh");
     const harness = await seedStrandedThread({
       threadId,
       lastSeenAt: DateTime.formatIso(DateTime.makeUnsafe(Date.now())),
     });
 
-    expect(repairCommand(harness)).toBeUndefined();
+    const repair = repairCommand(harness);
+    expect(
+      repair,
+      "a restart's stranded turn must settle at boot, not on a later sweep",
+    ).toBeDefined();
+    expect(repair?.session?.activeTurnId).toBeNull();
   });
 });

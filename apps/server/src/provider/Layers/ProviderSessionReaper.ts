@@ -200,8 +200,68 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       }
     });
 
+    /**
+     * Settle every thread stranded by the process that ran before this one.
+     *
+     * This is the case the periodic sweep can only ever guess at. `runStopAll` nulls
+     * the runtime's `activeTurnId` and emits no terminal orchestration event, so a
+     * restart leaves the projection asserting a turn that no living process owns —
+     * and under `--watch`, that is every file save. A crash or `kill -9` produces the
+     * same wreckage without running shutdown at all, which is why fixing this only in
+     * the shutdown path would still leave the hole.
+     *
+     * At boot there is nothing to infer: no session has been created yet, so any
+     * binding on disk belongs to a process that is gone. That makes this the one
+     * place the contradiction can be settled by knowing rather than by waiting, and
+     * the grace period the sweep needs is deliberately not applied here.
+     */
+    const reconcileOnBoot = Effect.gen(function* () {
+      const bindings = yield* directory.listBindings();
+      const now = yield* Clock.currentTimeMillis;
+      let repaired = 0;
+
+      for (const binding of bindings) {
+        const thread = yield* projectionSnapshotQuery
+          .getThreadShellById(binding.threadId)
+          .pipe(Effect.map(Option.getOrUndefined));
+        const activeTurnId = thread?.session?.activeTurnId ?? null;
+        if (activeTurnId == null) {
+          continue;
+        }
+        yield* repairStrandedSession({
+          threadId: binding.threadId,
+          session: thread?.session ?? {},
+          activeTurnId,
+          nowMs: now,
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.reaper.boot-repair-failed", {
+              threadId: binding.threadId,
+              cause,
+            }),
+          ),
+        );
+        repaired += 1;
+      }
+
+      if (repaired > 0) {
+        yield* Effect.logInfo("provider.session.reaper.boot-reconciled", {
+          repaired,
+          totalBindings: bindings.length,
+        });
+      }
+    });
+
     const start: ProviderSessionReaperShape["start"] = () =>
       Effect.gen(function* () {
+        // Before the sweep loop: a restart's wreckage is settled at once rather than
+        // waiting out a sweep interval the user experiences as a hung thread.
+        yield* reconcileOnBoot.pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.reaper.boot-reconcile-failed", { cause }),
+          ),
+        );
+
         yield* Effect.forkScoped(
           sweep.pipe(
             Effect.catch((error: unknown) =>
