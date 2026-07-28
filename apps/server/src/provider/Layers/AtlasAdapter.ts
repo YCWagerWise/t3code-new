@@ -75,6 +75,14 @@ interface AtlasSessionState {
   /** Model pinned for this session; a per-turn selection overrides it. */
   model: string | undefined;
   /**
+   * Workspace this thread runs in, sent with every command.
+   *
+   * Recorded on the session for the whole run rather than read per turn: the directory
+   * belongs to the thread, and an agent that changed working directory between turns
+   * would silently split its own shell state across two hearth sessions.
+   */
+  readonly cwd: string | undefined;
+  /**
    * Highest `seq` delivered, and the `epoch` it belongs to. Returned as the
    * resume cursor so a reconnect replays only what it missed. The epoch is not
    * decoration: a feed's `seq` restarts when its isolate is recreated, so a
@@ -563,6 +571,7 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
         socket,
         activeTurnId: undefined,
         model,
+        cwd: input.cwd,
         cursor: resume,
         outbox: [],
         closing: false,
@@ -634,6 +643,11 @@ export const makeAtlasAdapter = Effect.fn("makeAtlasAdapter")(function* (
     yield* send(state, "cmd", {
       text: input.input ?? "",
       ...(model ? { model } : {}),
+      // The workspace this thread owns. Without it every thread on a node shares one
+      // shell, so two agents working at once edit the same tree and trample each other —
+      // and per-thread worktree isolation cannot work at all. Atlas ignores a relative or
+      // missing directory rather than guessing, so sending it is always safe.
+      ...(state.cwd ? { cwd: state.cwd } : {}),
     });
     state.activeTurnId = turnId;
     return {

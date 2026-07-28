@@ -402,6 +402,51 @@ describe("session wiring", () => {
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("sends the thread's workspace with the command", () =>
+    withFakeSocket(
+      Effect.gen(function* () {
+        const adapter = yield* makeAtlasAdapter(SETTINGS, {
+          instanceId: ProviderInstanceId.make("atlas"),
+        });
+        const threadId = ThreadId.make("wiring-cwd");
+
+        // Without this the node runs every thread in one shared shell, so two agents
+        // working at once edit the same tree — and per-thread worktrees do nothing.
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          cwd: "/tmp/workspace-a",
+        });
+        FakeSocket.last?.open();
+        yield* adapter.sendTurn({ threadId, input: "go" });
+
+        expect(sentFrame(FakeSocket.last, 0)).toMatchObject({
+          kind: "cmd",
+          payload: { text: "go", cwd: "/tmp/workspace-a" },
+        });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("omits the workspace when the thread has none", () =>
+    withFakeSocket(
+      Effect.gen(function* () {
+        const adapter = yield* makeAtlasAdapter(SETTINGS, {
+          instanceId: ProviderInstanceId.make("atlas"),
+        });
+        const threadId = ThreadId.make("wiring-no-cwd");
+
+        yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+        FakeSocket.last?.open();
+        yield* adapter.sendTurn({ threadId, input: "go" });
+
+        // Sending an empty cwd would be a claim about the workspace; saying nothing
+        // leaves the node's own default, which is what an older lens did.
+        expect(sentFrame(FakeSocket.last, 0)).not.toHaveProperty("payload.cwd");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends straight through once the socket is open", () =>
     withFakeSocket(
       Effect.gen(function* () {
