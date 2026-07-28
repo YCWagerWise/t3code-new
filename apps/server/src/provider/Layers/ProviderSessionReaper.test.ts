@@ -17,6 +17,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
@@ -142,6 +143,7 @@ describe("ProviderSessionReaper", () => {
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
   }) {
     const stoppedThreadIds = new Set<ThreadId>();
+    const dispatched: Array<unknown> = [];
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
       (request) =>
         (input.stopSessionImplementation
@@ -214,11 +216,23 @@ describe("ProviderSessionReaper", () => {
           getThreadDetailSnapshot: () => Effect.die("unused"),
         }),
       ),
+      Layer.provideMerge(
+        Layer.succeed(OrchestrationEngineService, {
+          readEvents: () => Stream.empty,
+          dispatch: (command: unknown) =>
+            Effect.sync(() => {
+              dispatched.push(command);
+              return { sequence: dispatched.length };
+            }),
+          streamDomainEvents: Stream.empty,
+          latestSequence: Effect.succeed(0),
+        } as never),
+      ),
       Layer.provideMerge(NodeServices.layer),
     );
 
     runtime = ManagedRuntime.make(layer);
-    return { stopSession, stoppedThreadIds };
+    return { stopSession, stoppedThreadIds, dispatched };
   }
 
   it("reaps stale persisted sessions without active turns", async () => {
@@ -587,5 +601,97 @@ describe("ProviderSessionReaper", () => {
       defectThreadId,
       reapedThreadId,
     ]);
+  });
+
+  /**
+   * A stopped runtime whose projection still shows a turn is the state that strands a
+   * thread on "Working" forever. Nothing else repairs it: shutdown records the runtime
+   * stopped without emitting a terminal event, and Stop cannot help because there is no
+   * live session left to interrupt. Both guards in the sweep used to skip this row.
+   */
+  const seedStrandedThread = async (input: {
+    readonly threadId: ThreadId;
+    readonly lastSeenAt: string;
+    readonly lastError?: string | null;
+  }) => {
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: input.threadId,
+          session: {
+            threadId: input.threadId,
+            status: "running",
+            providerName: "atlas",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("11111111-1111-4111-8111-111111111111"),
+            lastError: input.lastError ?? null,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId: input.threadId,
+        providerName: "atlas",
+        providerInstanceId: null,
+        adapterKey: "atlas",
+        runtimeMode: "full-access",
+        status: "stopped",
+        lastSeenAt: input.lastSeenAt,
+        resumeCursor: null,
+        runtimePayload: null,
+      }),
+    );
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await Effect.runPromise(drainFibers);
+    return harness;
+  };
+
+  const repairCommand = (harness: { dispatched: Array<unknown> }) =>
+    harness.dispatched.find(
+      (command) => (command as { type?: string }).type === "thread.session.set",
+    ) as { session?: { activeTurnId?: unknown; status?: string; lastError?: unknown } } | undefined;
+
+  it("settles a thread whose runtime stopped while its projection still shows a turn", async () => {
+    const threadId = ThreadId.make("thread-reaper-stranded");
+    const harness = await seedStrandedThread({
+      threadId,
+      lastSeenAt: "2026-04-14T00:00:00.000Z",
+    });
+
+    const repair = repairCommand(harness);
+    expect(repair, "the stranded turn must be settled, not skipped").toBeDefined();
+    expect(repair?.session?.activeTurnId).toBeNull();
+    expect(repair?.session?.status).toBe("stopped");
+  });
+
+  it("preserves the provider's last error when repairing a stranded turn", async () => {
+    // Losing the reason a turn failed is worse than leaving it unattributed.
+    const threadId = ThreadId.make("thread-reaper-stranded-error");
+    const harness = await seedStrandedThread({
+      threadId,
+      lastSeenAt: "2026-04-14T00:00:00.000Z",
+      lastError: "backend exploded",
+    });
+
+    expect(repairCommand(harness)?.session?.lastError).toBe("backend exploded");
+  });
+
+  it("leaves a just-stopped runtime alone so a normal shutdown can settle itself", async () => {
+    // An ordinary stop briefly holds both states while its terminal event projects.
+    // Repairing inside that window would race a shutdown that is working correctly.
+    const threadId = ThreadId.make("thread-reaper-stranded-fresh");
+    const harness = await seedStrandedThread({
+      threadId,
+      lastSeenAt: DateTime.formatIso(DateTime.makeUnsafe(Date.now())),
+    });
+
+    expect(repairCommand(harness)).toBeUndefined();
   });
 });
