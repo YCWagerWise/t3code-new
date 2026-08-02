@@ -18,6 +18,10 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./atlas": {
+      "types": "./src/atlas/index.ts",
+      "import": "./src/atlas/index.ts"
     }
   },
   "scripts": {
