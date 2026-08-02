@@ -14,6 +14,7 @@ const workspaceFiles = [
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",
   "apps/server/package.json",
+  "apps/desktop/package.json",
   "apps/web/package.json",
   "infra/relay/package.json",
   "oxlint-plugin-t3code/package.json",
