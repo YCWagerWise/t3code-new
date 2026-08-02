@@ -75,6 +75,13 @@ const frame = (
     payload: overrides?.payload ?? { text: `m${seq}` },
   });
 
+const PERMISSION_ERROR_FRAME = JSON.stringify({
+  version: 1,
+  kind: "error",
+  class: "permission_error",
+  error: "forbidden: this run belongs to someone else",
+});
+
 const heartbeat = (seq: number, epoch = EPOCH) =>
   JSON.stringify({ version: 1, kind: "hb", run_id: "thr-t", ts: 1700000000500, seq, epoch });
 
@@ -270,14 +277,7 @@ it.effect("a permission refusal fails the stream — retrying cannot fix auth", 
     const h = yield* harness();
     const ws = h.sockets[0]!;
     ws.open();
-    ws.serverMessage(
-      JSON.stringify({
-        version: 1,
-        kind: "error",
-        class: "permission_error",
-        error: "forbidden: this run belongs to someone else",
-      }),
-    );
+    ws.serverMessage(PERMISSION_ERROR_FRAME);
     yield* h.drain;
 
     const exit = yield* Fiber.await(h.fiber);
