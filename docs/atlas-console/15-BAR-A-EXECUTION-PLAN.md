@@ -7,20 +7,20 @@ ticked as we go. Branches: `feat/console-feed-exposure` (atlas-rs),
 
 ## Stage 1 — slice-2 live integration (closes doc 14 §7)
 
-- [ ] **1.1 Boot rig.** `atlas-host serve` on :3199 (ATLAS_BASH=1, WS token, temp workspace
+- [x] **1.1 Boot rig.** `atlas-host serve` on :3199 (ATLAS*BASH=1, WS token, temp workspace
       root), drive one real coding turn (the Phase-1 recipe). Keep node + thread for 1.2–1.4.
-      _Verify:_ `/feed?after=0` returns the full transcript by curl.
-- [ ] **1.2 ThreadFeed live replay** (§7.10). Node test script (tsx) using client-runtime's
+      \_Verify:* `/feed?after=0` returns the full transcript by curl.
+- [x] **1.2 ThreadFeed live replay** (§7.10). Node test script (tsx) using client-runtime's
       `openThreadFeed` against :3199 with the real thread.
       _Verify:_ frames arrive in order; `replay-complete.head` == the curl `head`; kinds
       match the curl transcript exactly.
-- [ ] **1.3 Mid-replay kill → resume** (§7.11). Same script; kill the TCP socket after ~5
+- [x] **1.3 Mid-replay kill → resume** (§7.11). Same script; kill the TCP socket after ~5
       frames; let it reconnect.
       _Verify:_ no duplicate seq across the whole received sequence; total set == 1.2's.
-- [ ] **1.4 Command idempotency observed client-side** (§7.12). `postCommand` start twice
+- [x] **1.4 Command idempotency observed client-side** (§7.12). `postCommand` start twice
       with one `request_id`; then `cancel`.
       _Verify:_ one `turn:start` on the feed; cancel produces one cancelled outcome.
-- [ ] **1.5 Commit** the rig script under `packages/client-runtime/integration/` +
+- [x] **1.5 Commit** the rig script under `packages/client-runtime/integration/` +
       results in the commit message.
 
 ## Stage 2 — slice 3: the projection store
@@ -29,7 +29,7 @@ ticked as we go. Branches: `feat/console-feed-exposure` (atlas-rs),
       M1 event set (messages, tools, turn lifecycle, approvals, questions, usage, diffs) —
       write the arm→frame table into this doc before porting.
 - [ ] **2.2 `projection.ts`:** pure function `(state, ThreadFeedEvent) → (state,
-    OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor scheme
+  OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor scheme
       (`{runId}:{seq}`, `{runId}:tool:{call_id}`).
       _Verify:_ unit tests replay the REAL 14-frame fixture → assert the exact
       OrchestrationEvent list (turn started/items/completed); unknown-frame no-op;
@@ -68,8 +68,8 @@ ticked as we go. Branches: `feat/console-feed-exposure` (atlas-rs),
 - [ ] **4.1 `cordon` crate** (port sandbox.rs; `mechanism()`; writable-roots param; bwrap
       default-on-when-present; escape + writable-root tests migrated).
 - [ ] **4.2 atlas-tools wiring:** fail-closed in `open_runner_at` (no hatch), `.shell(argv)`
-      with `hearth-jobs` writable root; canonicalize ATLAS_DATA_DIR.
-      _Verify:_ job-lane test — background job completes sandboxed (mutation: drop the
+      with `hearth-jobs` writable root; canonicalize ATLAS*DATA_DIR.
+      \_Verify:* job-lane test — background job completes sandboxed (mutation: drop the
       writable root → wedges red).
 - [ ] **4.3 Manifest field** + warden swap to cordon (delete its sandbox.rs).
       _Verify:_ manifest test; warden builds.

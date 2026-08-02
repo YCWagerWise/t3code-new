@@ -150,7 +150,7 @@ export const make = Effect.gen(function* () {
       const threadId = input.threadId ?? "";
       const command =
         input.type === "thread.turn.start"
-          ? { kind: "start" as const, text: input.message?.text ?? "", limits: null }
+          ? { kind: "start" as const, text: input.message?.text ?? "", limits: {} }
           : input.type === "thread.turn.interrupt"
             ? { kind: "cancel" as const }
             : input.type === "thread.approval.respond"
