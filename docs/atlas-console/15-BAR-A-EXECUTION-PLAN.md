@@ -25,11 +25,11 @@ ticked as we go. Branches: `feat/console-feed-exposure` (atlas-rs),
 
 ## Stage 2 — slice 3: the projection store
 
-- [ ] **2.1 Read map.** Enumerate exactly which `ProviderRuntimeIngestion` arms feed the
+- [x] **2.1 Read map.** Enumerate exactly which `ProviderRuntimeIngestion` arms feed the
       M1 event set (messages, tools, turn lifecycle, approvals, questions, usage, diffs) —
       write the arm→frame table into this doc before porting.
 - [ ] **2.2 `projection.ts`:** pure function `(state, ThreadFeedEvent) → (state,
-  OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor scheme
+OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor scheme
       (`{runId}:{seq}`, `{runId}:tool:{call_id}`).
       _Verify:_ unit tests replay the REAL 14-frame fixture → assert the exact
       OrchestrationEvent list (turn started/items/completed); unknown-frame no-op;
