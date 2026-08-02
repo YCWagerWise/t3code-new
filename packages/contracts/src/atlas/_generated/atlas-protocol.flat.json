@@ -1,0 +1,1906 @@
+{
+  "$defs": {
+    "AnswerPayload": {
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "value": {
+          "default": null
+        }
+      },
+      "required": ["request_id"],
+      "type": "object"
+    },
+    "ApprovalPayload": {
+      "properties": {
+        "args": {
+          "default": null
+        },
+        "reason": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "request_type": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "tool": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["request_id"],
+      "type": "object"
+    },
+    "ApprovePayload": {
+      "properties": {
+        "approved": {
+          "type": "boolean"
+        },
+        "request_id": {
+          "type": "string"
+        }
+      },
+      "required": ["request_id", "approved"],
+      "type": "object"
+    },
+    "AttemptIdentity": {
+      "properties": {
+        "attempt_id": {
+          "type": "string"
+        },
+        "attempt_number": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resume_of_attempt_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "resumed_from_checkpoint_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "retry_of_run_id": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["attempt_id", "attempt_number"],
+      "type": "object"
+    },
+    "CheckpointObservation": {
+      "properties": {
+        "artifact_ref": {
+          "type": "string"
+        },
+        "body_id": {
+          "type": "string"
+        },
+        "body_version": {
+          "type": "string"
+        },
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "side_effects_after_checkpoint_unknown": {
+          "default": false,
+          "type": "boolean"
+        },
+        "usage": {
+          "$ref": "#/$defs/ExecutionUsage"
+        }
+      },
+      "required": [
+        "checkpoint_id",
+        "artifact_ref",
+        "body_id",
+        "body_version",
+        "model_id",
+        "protocol_version",
+        "usage"
+      ],
+      "type": "object"
+    },
+    "ChildRunSnapshot": {
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/AttemptIdentity"
+        },
+        "child_run_id": {
+          "type": "string"
+        },
+        "deadline_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "event_head": {
+          "$ref": "#/$defs/EventCursor"
+        },
+        "last_heartbeat_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "last_progress_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "last_progress_marker": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "lease_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limits": {
+          "$ref": "#/$defs/ExecutionLimits"
+        },
+        "parent_run_id": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resumable_checkpoint_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "settlement_policy": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "state_version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "usage": {
+          "$ref": "#/$defs/ExecutionUsage"
+        }
+      },
+      "required": [
+        "child_run_id",
+        "parent_run_id",
+        "required",
+        "settlement_policy",
+        "attempt",
+        "state",
+        "state_version",
+        "lease_generation",
+        "event_head",
+        "limits",
+        "usage"
+      ],
+      "type": "object"
+    },
+    "ClientHello": {
+      "description": "The first application frame a client sends after transport upgrade.\n\nA WebSocket being open is not authentication and is not readiness.",
+      "properties": {
+        "fleet_id": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReplayRequest"
+          },
+          "type": "array"
+        },
+        "requested_scopes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "session_binding": {
+          "type": "string"
+        },
+        "subscriptions": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Subscription"
+          },
+          "type": "array"
+        }
+      },
+      "required": ["protocol_version", "fleet_id", "session_binding"],
+      "type": "object"
+    },
+    "CmdPayload": {
+      "properties": {
+        "attachments": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": ["text"],
+      "type": "object"
+    },
+    "CommandEnvelope": {
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/$defs/RunCommand"
+        },
+        "expected_lease_generation": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "fleet_id": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "request_id": {
+          "description": "Caller-generated stable idempotency key.",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "fleet_id",
+        "thread_id",
+        "run_id",
+        "request_id",
+        "actor",
+        "command"
+      ],
+      "title": "CommandEnvelope",
+      "type": "object"
+    },
+    "CtxPayload": {
+      "description": "Context pressure. Both in tokens.",
+      "properties": {
+        "used": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["used", "window"],
+      "type": "object"
+    },
+    "DenyPayload": {
+      "properties": {
+        "args": {
+          "default": null
+        },
+        "call_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": ["tool", "reason"],
+      "type": "object"
+    },
+    "DiffFile": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "default": null,
+          "description": "`A` added · `M` modified · `D` deleted · `R` renamed · `T` type-changed.",
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["path"],
+      "type": "object"
+    },
+    "DiffPayload": {
+      "description": "What the turn did to the filesystem, derived from a git checkpoint at the turn boundary\nrather than from tool calls — so it reports an edit made by `sed` inside `run_bash`, or\nby a CLI body's own shell that the tool Registry never sees.",
+      "properties": {
+        "checkpoint": {
+          "default": null,
+          "description": "The checkpoint's `seq`, not its commit hash — a monotonic number within the\nworkspace's checkpoint stack, which is what `/_vcs/restore` addresses.",
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "files": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DiffFile"
+          },
+          "type": "array"
+        },
+        "unified": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "type": "object"
+    },
+    "EdgePayload": {
+      "description": "A fleet delegation edge — one run handing work to another, possibly on another node.\n\nThere is deliberately no `from`: the edge is published on the *caller's* feed via\n`publish_current`, so the origin is the feed it arrives on. Sending it would be a second,\nforgeable copy of a fact the envelope already carries.",
+      "properties": {
+        "detail": {
+          "default": null
+        },
+        "edge": {
+          "default": null,
+          "description": "`delegate` when the caller waited, `delegate_async` when it did not.",
+          "type": ["string", "null"]
+        },
+        "ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "run_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "state": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "task": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "to": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "type": "object"
+    },
+    "ErrorClass": {
+      "oneOf": [
+        {
+          "const": "provider",
+          "description": "The body ran and failed — a failed drive, a tool that errored.",
+          "type": "string"
+        },
+        {
+          "const": "transport",
+          "description": "The connection or the node itself.",
+          "type": "string"
+        },
+        {
+          "const": "permission",
+          "description": "Refused: bad credentials, or a run this caller may not address.",
+          "type": "string"
+        },
+        {
+          "const": "validation",
+          "description": "The caller sent something malformed, or not allowed from its role.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventCursor": {
+      "properties": {
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["epoch", "seq"],
+      "type": "object"
+    },
+    "EventEnvelope": {
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/EventCursor"
+        },
+        "fleet_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "payload": true,
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recorded_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "fleet_id",
+        "run_id",
+        "cursor",
+        "recorded_at_ms",
+        "kind",
+        "payload"
+      ],
+      "title": "EventEnvelope",
+      "type": "object"
+    },
+    "ExecutionLimits": {
+      "properties": {
+        "max_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "max_tool_calls": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "max_turn_requests": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "max_wall_time_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "session_budget_id": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "type": "object"
+    },
+    "ExecutionUsage": {
+      "properties": {
+        "tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool_calls": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn_requests": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wall_time_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "FeedFrame": {
+      "description": "One durable row off a run's feed.\n\n# Handling this exhaustively\n\nA consumer wants two different behaviours that look identical if you are careless:\n\n- a kind it does not *know* (this build predates it) → ignore, silently, forever\n- a kind it knows but has not *handled* → a bug, and one a compiler can catch\n\nDecode first, then match. An unknown kind fails decoding and never reaches the match;\na known-but-unhandled kind is a non-exhaustive match. A single catch-all arm over a raw\nstring — which is what the lens does today — collapses both into silence.",
+      "oneOf": [
+        {
+          "description": "Legacy turn boundary. Four states, and an unrecognised one has historically rendered\nas success — hence [`TurnState`] being closed rather than a string.",
+          "properties": {
+            "kind": {
+              "const": "turn",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/TurnPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "description": "The supervisor's authoritative run state. Companion to [`FeedBody::Turn`], not a\nreplacement: this carries all ten [`RunState`]s, `Turn` publishes four.",
+          "properties": {
+            "kind": {
+              "const": "lifecycle",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/LifecyclePayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "user",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/TextPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "assistant",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/TextPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "thinking",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/TextPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "tool_call",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ToolCallPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "tool_result",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ToolResultPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "deny",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DenyPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "approval",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ApprovalPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "question",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/QuestionPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "description": "Non-fatal; the turn continues past it. Distinct from a transport `error`, which is\nterminal — a warning must never render as a failed turn.",
+          "properties": {
+            "kind": {
+              "const": "warning",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/WarningPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "ctx",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/CtxPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "usage",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/UsagePayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "edge",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/EdgePayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "diff",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DiffPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "cmd",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/CmdPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "interrupt",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/InterruptPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "approve",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ApprovePayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "answer",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/AnswerPayload"
+            }
+          },
+          "required": ["kind", "payload"],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "epoch": {
+          "description": "Identifies the feed incarnation. `seq` restarts at zero when the isolate is\nrecreated, so a `seq` is only meaningful paired with the epoch it was issued under.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "seq": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "ts": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "version": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": ["version", "epoch", "seq", "ts", "run_id", "role"],
+      "title": "FeedFrame",
+      "type": "object"
+    },
+    "HandshakeFrame": {
+      "oneOf": [
+        {
+          "properties": {
+            "payload": {
+              "$ref": "#/$defs/ClientHello"
+            },
+            "type": {
+              "const": "client_hello",
+              "type": "string"
+            }
+          },
+          "required": ["type", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "payload": {
+              "$ref": "#/$defs/ServerReady"
+            },
+            "type": {
+              "const": "server_ready",
+              "type": "string"
+            }
+          },
+          "required": ["type", "payload"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "payload": {
+              "$ref": "#/$defs/StructuredError"
+            },
+            "type": {
+              "const": "connection_rejected",
+              "type": "string"
+            }
+          },
+          "required": ["type", "payload"],
+          "type": "object"
+        }
+      ],
+      "title": "HandshakeFrame"
+    },
+    "InterruptPayload": {
+      "properties": {
+        "reason": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "type": "object"
+    },
+    "LifecyclePayload": {
+      "properties": {
+        "attempt_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "attempt_number": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "run_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "snapshot_version": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LifecycleTerminal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "thread_id": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["state"],
+      "type": "object"
+    },
+    "LifecycleTerminal": {
+      "properties": {
+        "detail": {
+          "default": null
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["reason"],
+      "type": "object"
+    },
+    "LimitReason": {
+      "enum": [
+        "max_turn_requests",
+        "max_tokens",
+        "session_budget_exceeded",
+        "max_tool_calls",
+        "max_wall_time"
+      ],
+      "type": "string"
+    },
+    "ObservationEnvelope": {
+      "properties": {
+        "attempt_id": {
+          "type": "string"
+        },
+        "event_id": {
+          "description": "Stable idempotency key assigned by the worker/harness.",
+          "type": "string"
+        },
+        "fleet_id": {
+          "type": "string"
+        },
+        "lease_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observation": {
+          "$ref": "#/$defs/WorkerObservation"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider_seq": {
+          "description": "Strictly increases within one attempt plus lease generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "fleet_id",
+        "thread_id",
+        "run_id",
+        "attempt_id",
+        "event_id",
+        "lease_generation",
+        "provider_seq",
+        "observation"
+      ],
+      "title": "ObservationEnvelope",
+      "type": "object"
+    },
+    "ProviderStopReason": {
+      "oneOf": [
+        {
+          "properties": {
+            "outcome": {
+              "const": "completed",
+              "type": "string"
+            },
+            "provider_code": {
+              "default": null,
+              "type": ["string", "null"]
+            }
+          },
+          "required": ["outcome"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "enforced_by": {
+              "default": null,
+              "type": ["string", "null"]
+            },
+            "limit": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "outcome": {
+              "const": "limited",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/LimitReason"
+            },
+            "unit": {
+              "type": "string"
+            }
+          },
+          "required": ["outcome", "reason", "observed", "limit", "unit"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "error_class": {
+              "default": null,
+              "description": "WHOSE failure it was — the body's (`provider_error`) or the machinery's\n(`transport_error`). Mirrors `feed::ErrorClass`.\n\nOptional and defaulted so an older worker's envelope still decodes (rule 3), but a\nworker that knows should say: \"the model errored\" and \"the run could not be\nadvanced at all\" are different things to put in front of a user, and a supervisor\nthat flattens them makes every driver fault look like a provider fault.",
+              "type": ["string", "null"]
+            },
+            "outcome": {
+              "const": "failed",
+              "type": "string"
+            },
+            "provider_code": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": ["outcome", "provider_code", "retryable"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "outcome": {
+              "const": "cancelled",
+              "type": "string"
+            },
+            "provider_code": {
+              "default": null,
+              "type": ["string", "null"]
+            }
+          },
+          "required": ["outcome"],
+          "type": "object"
+        }
+      ]
+    },
+    "QuestionPayload": {
+      "properties": {
+        "choices": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "prompt": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "request_id": {
+          "type": "string"
+        }
+      },
+      "required": ["request_id"],
+      "type": "object"
+    },
+    "ReplayBoundary": {
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "snapshot_version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "through": {
+          "$ref": "#/$defs/EventCursor"
+        }
+      },
+      "required": ["run_id", "snapshot_version", "through"],
+      "type": "object"
+    },
+    "ReplayRequest": {
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/EventCursor"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": ["run_id", "after"],
+      "type": "object"
+    },
+    "Role": {
+      "description": "Who authored a frame.\n\nNot decoration: `console` is the only role a lens may write, and it may write only the\nfour command kinds. The enforcement lives in `atlas-host` (a policy decision about who\nmay say what), not here (the vocabulary itself).",
+      "enum": ["agent", "console", "system"],
+      "type": "string"
+    },
+    "RunCommand": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "start",
+              "type": "string"
+            },
+            "limits": {
+              "$ref": "#/$defs/ExecutionLimits"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": ["kind", "text", "limits"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "cancel",
+              "type": "string"
+            }
+          },
+          "required": ["kind"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "retry",
+              "type": "string"
+            },
+            "limits": {
+              "$ref": "#/$defs/ExecutionLimits"
+            },
+            "new_attempt": {
+              "$ref": "#/$defs/AttemptIdentity"
+            },
+            "source_run_id": {
+              "type": "string"
+            }
+          },
+          "required": ["kind", "source_run_id", "new_attempt", "limits"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "acknowledge_side_effect_uncertainty": {
+              "type": "boolean"
+            },
+            "checkpoint_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "resume",
+              "type": "string"
+            },
+            "limits": {
+              "$ref": "#/$defs/ExecutionLimits"
+            },
+            "new_attempt": {
+              "$ref": "#/$defs/AttemptIdentity"
+            },
+            "source_attempt_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "source_attempt_id",
+            "checkpoint_id",
+            "new_attempt",
+            "limits",
+            "acknowledge_side_effect_uncertainty"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "answer": true,
+            "kind": {
+              "const": "resolve_input",
+              "type": "string"
+            },
+            "request_ref": {
+              "type": "string"
+            }
+          },
+          "required": ["kind", "request_ref", "answer"],
+          "type": "object"
+        }
+      ]
+    },
+    "RunSnapshot": {
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/AttemptIdentity"
+        },
+        "children": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ChildRunSnapshot"
+          },
+          "type": "array"
+        },
+        "deadline_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "event_head": {
+          "$ref": "#/$defs/EventCursor"
+        },
+        "fleet_id": {
+          "type": "string"
+        },
+        "last_heartbeat_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "last_progress_at_ms": {
+          "default": null,
+          "format": "int64",
+          "type": ["integer", "null"]
+        },
+        "last_progress_marker": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "last_provider_seq": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lease_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limits": {
+          "$ref": "#/$defs/ExecutionLimits"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resumable_checkpoint_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "snapshot_version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "state_version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminalOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/ExecutionUsage"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "snapshot_version",
+        "fleet_id",
+        "thread_id",
+        "run_id",
+        "attempt",
+        "state",
+        "state_version",
+        "lease_generation",
+        "event_head",
+        "limits",
+        "usage"
+      ],
+      "title": "RunSnapshot",
+      "type": "object"
+    },
+    "RunState": {
+      "enum": [
+        "queued",
+        "starting",
+        "running",
+        "waiting_for_input",
+        "cancelling",
+        "completed",
+        "limited",
+        "failed",
+        "stalled",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "ServerReady": {
+      "description": "The only frame that establishes authenticated control-plane readiness.",
+      "properties": {
+        "authenticated_subject": {
+          "type": "string"
+        },
+        "capabilities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "connection_id": {
+          "type": "string"
+        },
+        "fleet_id": {
+          "type": "string"
+        },
+        "granted_scopes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "heartbeat_interval_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_boundaries": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReplayBoundary"
+          },
+          "type": "array"
+        },
+        "server_time_ms": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "fleet_id",
+        "authenticated_subject",
+        "connection_id",
+        "server_time_ms",
+        "heartbeat_interval_ms"
+      ],
+      "type": "object"
+    },
+    "StructuredError": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "request_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "trace_id": {
+          "type": "string"
+        }
+      },
+      "required": ["code", "message", "retryable", "trace_id"],
+      "title": "StructuredError",
+      "type": "object"
+    },
+    "Subscription": {
+      "properties": {
+        "resource": {
+          "type": "string"
+        },
+        "resource_id": {
+          "type": "string"
+        }
+      },
+      "required": ["resource", "resource_id"],
+      "type": "object"
+    },
+    "TerminalOutcome": {
+      "properties": {
+        "detail": {
+          "default": null
+        },
+        "reason": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "terminal_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": ["state", "reason", "terminal_at_ms"],
+      "type": "object"
+    },
+    "TextPayload": {
+      "properties": {
+        "text": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ToolCallPayload": {
+      "properties": {
+        "args": {
+          "default": null
+        },
+        "call_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": ["tool"],
+      "type": "object"
+    },
+    "ToolResultPayload": {
+      "properties": {
+        "call_id": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "duration_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "summary": {
+          "default": null,
+          "description": "The tool's error message or result summary. A memoized replay reports ~0 duration,\nwhich is honest — nothing ran.",
+          "type": ["string", "null"]
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": ["tool", "ok"],
+      "type": "object"
+    },
+    "TransportFrame": {
+      "description": "Connection-scoped frames. Never stored, never replayed.",
+      "oneOf": [
+        {
+          "description": "Liveness a browser lens can observe — `ping`/`pong` never reaches JavaScript.\n\nCarries a whole cursor. It shipped with `seq` alone, which a lens cannot compare\nagainst anything, so the gap detection it exists for never fired.",
+          "properties": {
+            "epoch": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "kind": {
+              "const": "hb",
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "ts": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "version": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": ["kind", "version", "run_id", "ts", "seq", "epoch"],
+          "type": "object"
+        },
+        {
+          "description": "Terminal, and about the *connection* — a refused handshake, a lost socket. A failed\nturn is not this; that is a lifecycle terminal state.",
+          "properties": {
+            "class": {
+              "$ref": "#/$defs/ErrorClass"
+            },
+            "error": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "error",
+              "type": "string"
+            },
+            "version": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": ["kind", "version", "class", "error"],
+          "type": "object"
+        }
+      ],
+      "title": "TransportFrame"
+    },
+    "TurnPayload": {
+      "properties": {
+        "class": {
+          "default": null,
+          "description": "Whose failure it was, on an `error` boundary. Mirrors `feed::ErrorClass`.",
+          "type": ["string", "null"]
+        },
+        "plugin": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "state": {
+          "$ref": "#/$defs/TurnState"
+        },
+        "text": {
+          "default": null,
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["state"],
+      "type": "object"
+    },
+    "TurnState": {
+      "description": "The four legacy turn states.\n\n`Cancelled` is its own state rather than a flavour of `Done` or `Error`, because both\nalternatives are wrong in a way a user notices: `done` shows a green finished turn for\nwork they deliberately stopped, `error` shows a failure that never happened.",
+      "enum": ["start", "done", "error", "cancelled"],
+      "type": "string"
+    },
+    "UsagePayload": {
+      "properties": {
+        "cache_creation_input_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "cache_read_input_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "cached": {
+          "default": null,
+          "description": "Whether this reply was served from the run's idempotency cache rather than a fresh\nmodel call — a flag, not a token count. (Was mistyped `u64` until a live frame\ncarrying `false` refused to decode in the generated client, 2026-08-02.)",
+          "type": ["boolean", "null"]
+        },
+        "input_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "model": {
+          "default": null,
+          "type": ["string", "null"]
+        },
+        "output_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": ["integer", "null"]
+        },
+        "usd": {
+          "default": null,
+          "format": "double",
+          "type": ["number", "null"]
+        }
+      },
+      "type": "object"
+    },
+    "WarningPayload": {
+      "properties": {
+        "detail": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": ["message"],
+      "type": "object"
+    },
+    "WorkerObservation": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "provider_connected",
+              "type": "string"
+            }
+          },
+          "required": ["type"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "heartbeat",
+              "type": "string"
+            }
+          },
+          "required": ["type"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "expires_at_ms": {
+              "default": null,
+              "format": "int64",
+              "type": ["integer", "null"]
+            },
+            "request_ref": {
+              "type": "string"
+            },
+            "type": {
+              "const": "waiting_for_input",
+              "type": "string"
+            }
+          },
+          "required": ["type", "request_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_ref": {
+              "type": "string"
+            },
+            "type": {
+              "const": "input_resolved",
+              "type": "string"
+            }
+          },
+          "required": ["type", "request_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "evidence": true,
+            "phase": {
+              "type": "string"
+            },
+            "type": {
+              "const": "progress",
+              "type": "string"
+            }
+          },
+          "required": ["type", "phase", "evidence"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "content_ref": {
+              "type": "string"
+            },
+            "type": {
+              "const": "assistant_content_committed",
+              "type": "string"
+            }
+          },
+          "required": ["type", "content_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "tool_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_started",
+              "type": "string"
+            }
+          },
+          "required": ["type", "tool_id"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "result_ref": {
+              "type": "string"
+            },
+            "tool_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_completed",
+              "type": "string"
+            }
+          },
+          "required": ["type", "tool_id", "result_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "checkpoint": {
+              "$ref": "#/$defs/CheckpointObservation"
+            },
+            "type": {
+              "const": "checkpoint_committed",
+              "type": "string"
+            }
+          },
+          "required": ["type", "checkpoint"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child": {
+              "$ref": "#/$defs/ChildRunSnapshot"
+            },
+            "type": {
+              "const": "child_started",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child_run_id": {
+              "type": "string"
+            },
+            "evidence": true,
+            "phase": {
+              "type": "string"
+            },
+            "type": {
+              "const": "child_progress",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child_run_id", "phase", "evidence"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child_run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "child_heartbeat",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child_run_id"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child_run_id": {
+              "type": "string"
+            },
+            "expires_at_ms": {
+              "default": null,
+              "format": "int64",
+              "type": ["integer", "null"]
+            },
+            "request_ref": {
+              "type": "string"
+            },
+            "type": {
+              "const": "child_waiting_for_input",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child_run_id", "request_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child_run_id": {
+              "type": "string"
+            },
+            "request_ref": {
+              "type": "string"
+            },
+            "type": {
+              "const": "child_input_resolved",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child_run_id", "request_ref"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "child_run_id": {
+              "type": "string"
+            },
+            "stop": {
+              "$ref": "#/$defs/ProviderStopReason"
+            },
+            "type": {
+              "const": "child_stopped",
+              "type": "string"
+            }
+          },
+          "required": ["type", "child_run_id", "stop"],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "stop": {
+              "$ref": "#/$defs/ProviderStopReason"
+            },
+            "type": {
+              "const": "provider_stopped",
+              "type": "string"
+            }
+          },
+          "required": ["type", "stop"],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated from atlas-protocol for schema generators. The roots-keyed sibling artifact is the human-reviewable form. Do not edit by hand.",
+  "protocolVersion": 1,
+  "title": "Atlas wire contract (flattened)"
+}

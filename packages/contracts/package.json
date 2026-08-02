@@ -22,12 +22,15 @@
   },
   "scripts": {
     "typecheck": "tsgo --noEmit",
-    "test": "vp test run"
+    "test": "vp test run",
+    "generate:atlas": "node scripts/generate-atlas.ts"
   },
   "dependencies": {
     "effect": "catalog:"
   },
   "devDependencies": {
+    "@effect/openapi-generator": "catalog:",
+    "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
     "vite-plus": "catalog:"
   }

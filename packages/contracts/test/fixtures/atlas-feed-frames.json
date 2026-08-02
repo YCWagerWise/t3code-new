@@ -1,0 +1,138 @@
+[
+  {
+    "epoch": 1785704325750,
+    "kind": "lifecycle",
+    "payload": {
+      "attempt_id": "thr-proof:attempt:1",
+      "attempt_number": 1,
+      "run_id": "thr-proof",
+      "snapshot_version": 1,
+      "state": "starting",
+      "terminal": null,
+      "thread_id": "thr-proof"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 1,
+    "ts": 1785704325750,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "turn",
+    "payload": {
+      "state": "start"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 2,
+    "ts": 1785704325752,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "user",
+    "payload": {
+      "text": "Using run_bash, append a line saying exactly: reviewed by atlas — to the file notes.txt in your current working directory (create it if missing). Then reply with just: done"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 4,
+    "ts": 1785704325760,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "usage",
+    "payload": {
+      "cache_creation_input_tokens": 45004,
+      "cache_read_input_tokens": 0,
+      "cached": false,
+      "input_tokens": 4,
+      "model": "claude-opus-4-8",
+      "output_tokens": 6,
+      "usd": 0.00051
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 5,
+    "ts": 1785704328868,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "ctx",
+    "payload": {
+      "used": 45008,
+      "window": 200000
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 6,
+    "ts": 1785704328871,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "tool_call",
+    "payload": {
+      "args": {
+        "command": "echo \"reviewed by atlas\" >> notes.txt"
+      },
+      "call_id": "toolu_016ttNVBFhFEZZN4K5wiRvRM",
+      "tool": "run_bash"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 7,
+    "ts": 1785704328874,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "tool_result",
+    "payload": {
+      "call_id": "toolu_016ttNVBFhFEZZN4K5wiRvRM",
+      "duration_ms": 89,
+      "ok": true,
+      "summary": "{\"data\":{\"exit_code\":0,\"hidden_lines\":0,\"interrupted\":false,\"job_id\":null,\"output\":\"exit=0\\n\",\"total_bytes\":8}}",
+      "tool": "run_bash"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 8,
+    "ts": 1785704328966,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "diff",
+    "payload": {
+      "checkpoint": 1,
+      "files": [
+        {
+          "path": "notes.txt",
+          "status": "A"
+        }
+      ],
+      "unified": "diff --git a/notes.txt b/notes.txt\nnew file mode 100644\nindex 0000000..da33efa\n--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+reviewed by atlas\n"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 11,
+    "ts": 1785704331414,
+    "version": 1
+  },
+  {
+    "epoch": 1785704325750,
+    "kind": "assistant",
+    "payload": {
+      "text": "done"
+    },
+    "role": "agent",
+    "run_id": "thr-proof",
+    "seq": 12,
+    "ts": 1785704331425,
+    "version": 1
+  }
+]
