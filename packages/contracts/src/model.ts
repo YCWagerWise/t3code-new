@@ -124,6 +124,15 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
+  /**
+   * Whether this model can call tools, as reported by the provider.
+   *
+   * Deliberately three-valued: `true` / `false` / absent. Absent means the
+   * provider does not know, and a lens must not render "no tools" on a guess —
+   * a warning on a maybe trains people to ignore it. Only a provider that
+   * actually probes (Atlas does, per model, on the node) says `false`.
+   */
+  supportsTools: Schema.optional(Schema.Boolean),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
 

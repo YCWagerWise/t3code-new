@@ -13,6 +13,8 @@ drives that body without owning fleet capability.
 5. [Machine-readable classification](./03-classification.json)
 6. [Protocol binding](./04-PROTOCOL-BINDING.md)
 7. [Atlas capability gaps](./05-GAPS.md)
+8. [Agent run authority](./07-AGENT-RUN-AUTHORITY.md)
+9. [Atlas-owned backend capability implementation plan](./12-ATLAS-BACKEND-CAPABILITY-PLAN.md)
 
 ## Source hierarchy
 

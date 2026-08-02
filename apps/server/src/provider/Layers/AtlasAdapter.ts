@@ -37,6 +37,8 @@ import {
   type ProviderSession,
   type ProviderTurnStartResult,
   RuntimeItemId,
+  RuntimeRequestId,
+  RuntimeTaskId,
   type ThreadId,
   TurnId,
   type AtlasSettings,
@@ -152,12 +154,25 @@ type RuntimeErrorClassName = (typeof RUNTIME_ERROR_CLASSES)[number];
  * semantic the provider never stated. Atlas knows at the point of failure and
  * says so; anything it does not say stays honestly unknown.
  */
+const normalizeErrorClass = (declared: string | undefined): RuntimeErrorClassName =>
+  RUNTIME_ERROR_CLASSES.find((c) => c === declared) ?? "unknown";
+
 const declaredErrorClass = (frame: AtlasFrame): RuntimeErrorClassName =>
-  RUNTIME_ERROR_CLASSES.find((c) => c === frame.class) ?? "unknown";
+  normalizeErrorClass(frame.class);
 
 const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
+
+/** git's `--name-status` letters, spelled for a reader. */
+const FILE_CHANGE_DETAIL: Record<string, string> = {
+  A: "added",
+  M: "modified",
+  D: "deleted",
+  R: "renamed",
+  C: "copied",
+  T: "type changed",
+};
 
 /** WebSocket readyState values, named so the intent survives a reader. */
 const WS_CONNECTING = 0;
@@ -275,15 +290,38 @@ export const eventsForFrame = (
       if (turnState === "start") {
         return [{ type: "turn.started", ...base, payload: {}, raw }];
       }
-      if (turnState === "error") {
+      // A turn the user stopped is neither a failure nor a success. `turn.aborted` is the
+      // event T3 already has for exactly this: ingestion maps it to session status "ready"
+      // (not "error"), clears `activeTurnId` so the composer unlocks, and leaves `lastError`
+      // alone. Without this arm it falls through to `turn.completed{completed}` below and a
+      // cancelled turn renders green.
+      if (turnState === "cancelled") {
         return [
+          {
+            type: "turn.aborted",
+            ...base,
+            payload: { reason: str(payload.text) ?? "Cancelled" },
+            raw,
+          },
+        ];
+      }
+      if (turnState === "error") {
+        const message = str(payload.text) ?? "Atlas run failed";
+        return [
+          // The class Atlas declared rides on `runtime.error`, which is the only event that
+          // carries one and is already consumed. `turn.completed{failed}` still closes the
+          // lifecycle — the pair mirrors `socketLossEvents` above, which reports the same
+          // failure as an error row plus a lifecycle close.
+          {
+            type: "runtime.error",
+            ...base,
+            payload: { message, class: normalizeErrorClass(str(payload.class)) },
+            raw,
+          },
           {
             type: "turn.completed",
             ...base,
-            payload: {
-              state: "failed",
-              errorMessage: str(payload.text) ?? "Atlas run failed",
-            },
+            payload: { state: "failed", errorMessage: message },
             raw,
           },
         ];
@@ -338,7 +376,11 @@ export const eventsForFrame = (
           itemId,
           payload: {
             itemType: "dynamic_tool_call",
+            status: "inProgress" as const,
             ...(str(payload.tool) ? { title: str(payload.tool) as string } : {}),
+            // Durable record only: the client skips `tool.started` rows outright
+            // (`session-logic.ts`), so this is not a visible in-progress entry.
+            ...(payload.args !== undefined ? { data: { args: payload.args } } : {}),
           },
           raw,
         },
@@ -348,6 +390,10 @@ export const eventsForFrame = (
     case "tool_result": {
       const itemId = RuntimeItemId.make(`${ctx.runId}:tool:${str(payload.call_id) ?? frame.seq}`);
       const summaryText = str(payload.summary)?.trim();
+      // Absent `status`, the client assumes "completed" — so a failed tool call would render
+      // with a success check, which is the exact confusion GAP-002 exists to remove.
+      const ok = payload.ok !== false;
+      const durationMs = num(payload.duration_ms);
       return [
         {
           type: "item.completed",
@@ -355,7 +401,20 @@ export const eventsForFrame = (
           itemId,
           payload: {
             itemType: "dynamic_tool_call",
+            status: ok ? ("completed" as const) : ("failed" as const),
             ...(str(payload.tool) ? { title: str(payload.tool) as string } : {}),
+            // `detail` is the field that survives ingestion, renders inline, and makes the
+            // row expandable. The `tool.summary` event below reaches no consumer, so this is
+            // the only path Atlas's result text has to the screen.
+            ...(summaryText ? { detail: summaryText } : {}),
+            ...(payload.args !== undefined || durationMs !== undefined
+              ? {
+                  data: {
+                    ...(payload.args !== undefined ? { args: payload.args } : {}),
+                    ...(durationMs !== undefined ? { durationMs } : {}),
+                  },
+                }
+              : {}),
           },
           raw,
         },
@@ -373,6 +432,49 @@ export const eventsForFrame = (
       ];
     }
 
+    // What the turn did to the filesystem.
+    //
+    // Atlas derives this from a git checkpoint taken at the turn boundary, NOT from tool
+    // calls, so it reports an edit made by `sed` inside `run_bash` or by a script the agent
+    // wrote — neither of which passes through a tool a lifecycle event could observe. That is
+    // why Atlas has no `read`/`write`/`edit` tools and still feeds this surface.
+    //
+    // Two events from one frame, both derived from the same diff: the unified text for the
+    // Diff panel, and one `file_change` row per path for the work log. `file_change` is a
+    // canonical `TOOL_LIFECYCLE_ITEM_TYPES` member, so those rows render with the machinery
+    // that already exists rather than as anonymous `dynamic_tool_call` entries.
+    case "diff": {
+      const unifiedDiff = str(payload.unified)?.trim();
+      const files = Array.isArray(payload.files) ? payload.files : [];
+      if (unifiedDiff === undefined || unifiedDiff === "") return [];
+      return [
+        { type: "turn.diff.updated", ...base, payload: { unifiedDiff }, raw },
+        ...files.flatMap((entry, index) => {
+          const path = str((entry as Record<string, unknown> | null)?.path);
+          if (path === undefined || path === "") return [];
+          const status = str((entry as Record<string, unknown>).status) ?? "M";
+          const itemId = RuntimeItemId.make(`${ctx.runId}:file:${frame.seq ?? 0}:${index}`);
+          return [
+            {
+              type: "item.completed" as const,
+              ...base,
+              itemId,
+              payload: {
+                itemType: "file_change" as const,
+                status: "completed" as const,
+                title: path,
+                // `detail` is the field that survives ingestion and renders inline; the
+                // single letter is git's own classification, not a guess.
+                detail: FILE_CHANGE_DETAIL[status] ?? status,
+                data: { path, changeStatus: status },
+              },
+              raw,
+            },
+          ];
+        }),
+      ];
+    }
+
     // Atlas declares context pressure directly, so there is nothing to
     // normalize — contrast the ~150 lines Claude's adapter spends on this.
     case "ctx": {
@@ -384,6 +486,26 @@ export const eventsForFrame = (
           type: "thread.token-usage.updated",
           ...base,
           payload: { usage: { usedTokens: used, maxTokens: window } },
+          raw,
+        },
+      ];
+    }
+
+    // A notice the turn continues past — mapped to `runtime.warning`, NOT `runtime.error`,
+    // because the turn is still running and an error row would read as a failure that did not
+    // happen. Atlas raises this when it cannot honour a request as stated, e.g. driving a
+    // tool-bearing body with a model that cannot call tools.
+    case "warning": {
+      const message = str(payload.message)?.trim();
+      if (message === undefined || message === "") return [];
+      return [
+        {
+          type: "runtime.warning",
+          ...base,
+          payload: {
+            message,
+            ...(str(payload.detail) ? { detail: str(payload.detail) as string } : {}),
+          },
           raw,
         },
       ];
@@ -405,10 +527,89 @@ export const eventsForFrame = (
         : [error, { type: "turn.aborted" as const, ...base, payload: { reason: message }, raw }];
     }
 
-    // Carried by the protocol but not yet enforced on the Atlas side (GAP-006):
-    // surfacing them as runtime events would put an approval in the UI that
-    // nothing can actually resolve, which is worse than not showing it.
-    case "approval":
+    // A turn handed to another machine. Atlas's one capability no other provider has, and
+    // until now the least visible thing it did — the caller's timeline simply paused.
+    //
+    // Mapped onto `task.*` rather than a new event type: T3 already consumes that triple and
+    // already means by it "a unit of work running somewhere else, with its own lifecycle".
+    // The `taskId` is the CHILD run id, so a lens can follow the work to the other feed.
+    case "edge": {
+      const childRun = str(payload.run_id);
+      if (!childRun) return [];
+      const to = str(payload.to) ?? "another node";
+      const task = str(payload.task) ?? "delegated task";
+      const state = str(payload.state);
+      const taskId = RuntimeTaskId.make(childRun);
+      if (state === "start") {
+        return [
+          {
+            type: "task.started",
+            ...base,
+            payload: {
+              taskId,
+              description: `→ ${to}: ${task}`,
+              taskType: str(payload.edge) ?? "delegate",
+            },
+            raw,
+          },
+        ];
+      }
+      return [
+        {
+          type: "task.completed",
+          ...base,
+          payload: {
+            taskId,
+            status: state === "error" ? ("failed" as const) : ("completed" as const),
+            ...(str(payload.detail) ? { summary: str(payload.detail) as string } : {}),
+          },
+          raw,
+        },
+      ];
+    }
+
+    // Atlas refused a tool outright — its policy kernel's `Deny` verdict, which needs no
+    // human. Distinct from an approval: there is nothing to resolve, only something to show.
+    case "deny": {
+      // `toolName` is required by the contract, so a frame without one still names something
+      // rather than being dropped — a refusal the user never sees is the worst outcome here.
+      const toolName = str(payload.tool) ?? "tool";
+      return [
+        {
+          type: "tool.denied",
+          ...base,
+          payload: {
+            toolName,
+            ...(str(payload.reason) ? { reason: str(payload.reason) as string } : {}),
+          },
+          raw,
+        },
+      ];
+    }
+
+    // Atlas is HOLDING a tool call open and waiting for an answer. Only emitted now that
+    // `respondToRequest` reaches a body that acts on it — an approval the UI cannot resolve
+    // is worse than none, which is why this arm returned `[]` until the gate existed.
+    case "approval": {
+      const requestId = str(payload.request_id);
+      if (!requestId) return [];
+      return [
+        {
+          type: "request.opened",
+          ...base,
+          requestId: RuntimeRequestId.make(requestId),
+          payload: {
+            requestType: "command_execution_approval",
+            ...(str(payload.reason) ? { detail: str(payload.reason) as string } : {}),
+            args: { toolName: str(payload.tool) ?? "tool", input: payload.args },
+          },
+          raw,
+        },
+      ];
+    }
+
+    // Still carried but unenforced: Atlas has no interactive-input mechanism, so surfacing
+    // one would put a prompt on screen that nothing can answer.
     case "question":
     default:
       return [];

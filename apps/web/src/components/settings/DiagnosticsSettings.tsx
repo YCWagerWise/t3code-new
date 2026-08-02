@@ -17,6 +17,7 @@ import type {
   ServerProcessDiagnosticsEntry,
   ServerProcessResourceHistorySummary,
   ServerProcessSignal,
+  ScopedThreadRef,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
@@ -25,6 +26,12 @@ import { cn } from "../../lib/utils";
 import { resolveAndPersistPreferredEditor } from "../../editorPreferences";
 import { formatRelativeTimeLabel, getRelativeTimeState } from "../../timestampFormat";
 import { useEnvironmentQuery } from "../../state/query";
+import {
+  useThread,
+  useThreadActivities,
+  useThreadMessages,
+  useThreadShells,
+} from "../../state/entities";
 import {
   primaryServerAvailableEditorsAtom,
   primaryServerObservabilityAtom,
@@ -39,6 +46,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import { SettingsPageContainer, SettingsSection, useRelativeTimeTick } from "./settingsLayout";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { AgentDiagnosticsPanel } from "../chat/AgentDiagnosticDrawer";
 
 const NUMBER_FORMAT = new Intl.NumberFormat();
 
@@ -807,6 +815,36 @@ function DiagnosticsRefreshButton({
   );
 }
 
+function ActiveAgentDiagnostics() {
+  const threadShells = useThreadShells();
+  const activeThreadRef = useMemo<ScopedThreadRef | null>(() => {
+    const activeThread = threadShells.find((thread) => thread.session?.status === "running");
+    return activeThread
+      ? { environmentId: activeThread.environmentId, threadId: activeThread.id }
+      : null;
+  }, [threadShells]);
+  const activeThread = useThread(activeThreadRef);
+  const activities = useThreadActivities(activeThreadRef);
+  const messages = useThreadMessages(activeThreadRef);
+
+  if (!activeThread || activeThread.session?.status !== "running") {
+    return <EmptyRows label="No agent is currently working." />;
+  }
+
+  return (
+    <div className="p-4 sm:p-5">
+      <AgentDiagnosticsPanel
+        threadId={activeThread.id}
+        isWorking
+        session={activeThread.session}
+        latestTurn={activeThread.latestTurn}
+        activities={activities}
+        messages={messages}
+      />
+    </div>
+  );
+}
+
 export function DiagnosticsSettingsPanel() {
   const observability = useAtomValue(primaryServerObservabilityAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
@@ -958,6 +996,10 @@ export function DiagnosticsSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      <SettingsSection title="Active Agent">
+        <ActiveAgentDiagnostics />
+      </SettingsSection>
+
       <SettingsSection
         title="Live Processes"
         headerAction={

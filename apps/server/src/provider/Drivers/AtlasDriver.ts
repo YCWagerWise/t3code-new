@@ -4,7 +4,8 @@
  * Every other driver in this directory resolves a binary, merges a process
  * environment and stands up a spawner. Atlas has none of that: an instance is a
  * URL and a body name. Availability is a property of the node, so the snapshot
- * asks the node (`/_members`) rather than probing this machine's PATH.
+ * proves the authenticated feed handshake, then asks the node (`/_members`),
+ * rather than probing this machine's PATH.
  *
  * One instance per node turns the Providers page into a fleet console — the
  * `plugin` field is the one-lens-many-bodies selector, so the same driver is a
@@ -103,7 +104,8 @@ export const AtlasDriver: ProviderDriver<AtlasSettings, AtlasDriverEnv> = {
           // it at construction meant a node that was unreachable (or whose members
           // failed to decode) stayed `status: error` for the life of the process —
           // so the provider never became selectable again even after the cause was
-          // fixed. One GET to /_members is cheap next to being permanently wrong.
+          // fixed. One authenticated feed handshake plus one GET to /_members is
+          // cheap next to being permanently wrong.
           getSnapshot: snapshotNow,
           refresh: snapshotNow,
           // And push, so the UI recovers on its own instead of waiting for

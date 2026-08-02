@@ -9,14 +9,27 @@ import * as Schema from "effect/Schema";
 import { VcsDriverKind, type VcsDriverKind as VcsDriverKindType } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 
+/**
+ * Where an `atlas` workspace lives. Carried in the SAME file that already selects the driver
+ * kind, because the registry hands a driver nothing but a `cwd` — so the only thing that can
+ * tell a driver which node owns a path is something sitting at that path.
+ */
+const AtlasWorkspaceConfig = Schema.Struct({
+  baseUrl: Schema.String,
+  token: Schema.optional(Schema.String),
+});
+
 const ProjectVcsConfig = Schema.Struct({
   vcs: Schema.optional(
     Schema.Struct({
       kind: Schema.optional(VcsDriverKind),
+      atlas: Schema.optional(AtlasWorkspaceConfig),
     }),
   ),
   vcsKind: Schema.optional(VcsDriverKind),
 });
+
+export type AtlasWorkspaceConfig = typeof AtlasWorkspaceConfig.Type;
 const ProjectVcsConfigJson = fromLenientJson(ProjectVcsConfig);
 const decodeProjectVcsConfigJson = Schema.decodeUnknownEffect(ProjectVcsConfigJson);
 
@@ -47,6 +60,7 @@ export class VcsProjectConfig extends Context.Service<
     readonly resolveKind: (
       input: VcsProjectConfigResolveInput,
     ) => Effect.Effect<VcsDriverKindType | "auto">;
+    readonly resolveAtlas: (cwd: string) => Effect.Effect<Option.Option<AtlasWorkspaceConfig>>;
   }
 >()("t3/vcs/VcsProjectConfig") {}
 
@@ -98,7 +112,7 @@ export const make = Effect.gen(function* () {
     }
   });
 
-  const readConfiguredKind = Effect.fn("VcsProjectConfig.readConfiguredKind")(function* (
+  const readConfig = Effect.fn("VcsProjectConfig.readConfig")(function* (
     cwd: string,
     configPath: string,
   ) {
@@ -124,7 +138,7 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    return configuredKind(parsed);
+    return parsed;
   });
 
   const resolveKind: VcsProjectConfig["Service"]["resolveKind"] = Effect.fn(
@@ -138,7 +152,8 @@ export const make = Effect.gen(function* () {
       Effect.flatMap(
         Option.match({
           onNone: () => Effect.succeed("auto" as const),
-          onSome: (configPath) => readConfiguredKind(input.cwd, configPath),
+          onSome: (configPath) =>
+            readConfig(input.cwd, configPath).pipe(Effect.map(configuredKind)),
         }),
       ),
       Effect.catchTags({
@@ -148,8 +163,36 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  /**
+   * The Atlas node owning `cwd`, if the project declares one.
+   *
+   * `None` on a missing, unreadable or malformed config — the same degradation `resolveKind`
+   * uses. A driver that cannot find its node reports an unreachable workspace, which is a
+   * better failure than a server that will not start because a config file has a typo.
+   */
+  const resolveAtlas: VcsProjectConfig["Service"]["resolveAtlas"] = Effect.fn(
+    "VcsProjectConfig.resolveAtlas",
+  )(function* (cwd: string) {
+    return yield* findConfigPath(cwd).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.succeedNone,
+          onSome: (configPath) =>
+            readConfig(cwd, configPath).pipe(
+              Effect.map((config) => Option.fromNullishOr(config.vcs?.atlas)),
+            ),
+        }),
+      ),
+      Effect.catchTags({
+        VcsProjectConfigError: (error) =>
+          logVcsProjectConfigError(error).pipe(Effect.as(Option.none<AtlasWorkspaceConfig>())),
+      }),
+    );
+  });
+
   return VcsProjectConfig.of({
     resolveKind,
+    resolveAtlas,
   });
 });
 

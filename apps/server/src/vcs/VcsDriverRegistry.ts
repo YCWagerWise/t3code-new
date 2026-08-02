@@ -4,9 +4,11 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import { FetchHttpClient } from "effect/unstable/http";
 
 import type { VcsDriverKind, VcsError, VcsRepositoryIdentity } from "@t3tools/contracts";
 import { VcsUnsupportedOperationError } from "@t3tools/contracts";
+import * as AtlasVcsDriver from "./AtlasVcsDriver.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import * as VcsProjectConfig from "./VcsProjectConfig.ts";
 import * as VcsDriver from "./VcsDriver.ts";
@@ -63,8 +65,10 @@ function parseDetectionCacheKey(key: string): {
 export const make = Effect.gen(function* () {
   const projectConfig = yield* VcsProjectConfig.VcsProjectConfig;
   const git = yield* GitVcsDriver.makeVcsDriver;
+  const atlas = yield* AtlasVcsDriver.makeVcsDriver;
   const drivers: Partial<Record<VcsDriverKind, VcsDriver.VcsDriver["Service"]>> = {
     git,
+    atlas,
   };
 
   const get: VcsDriverRegistry["Service"]["get"] = (kind) => {
@@ -154,4 +158,9 @@ export const make = Effect.gen(function* () {
 
 export const layer = Layer.effect(VcsDriverRegistry, make).pipe(
   Layer.provide(VcsProjectConfig.layer),
+  // Satisfied HERE rather than left to the caller. The Atlas driver reaches its node over
+  // HTTP, so without this the registry's `HttpClient` requirement propagates into every layer
+  // composition that mounts VCS — the whole server, its CLI, and their test harnesses — and a
+  // remote-workspace detail becomes everyone's problem. The registry owns its transport.
+  Layer.provide(FetchHttpClient.layer),
 );

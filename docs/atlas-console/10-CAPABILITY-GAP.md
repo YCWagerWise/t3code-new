@@ -35,21 +35,21 @@ in `session.activeTurnId`. That is wrong — `projection_turns` is a real per-tu
 
 Measured, not assumed — from which adapters emit each event.
 
-| capability            | event                             | Codex | Claude |         Others         |     **Atlas**      |
-| --------------------- | --------------------------------- | :---: | :----: | :--------------------: | :----------------: |
-| Per-turn diff         | `turn.diff.updated`               |  ✅   |   —    |           —            |         ❌         |
-| Plan / todo list      | `turn.plan.updated`               |  ✅   |   ✅   |           —            |         ❌         |
-| Plan-mode proposal    | `turn.proposed.delta`             |  ✅   |   —    |           —            |         ❌         |
-| Subagents             | `task.started/progress/completed` |   —   |   ✅   |           —            |         ❌         |
-| Approvals             | `request.opened/resolved`         |  ✅   |   ✅   |        OpenCode        |         ❌         |
-| User questions        | `user-input.requested`            |  ✅   |   ✅   | Cursor, Grok, OpenCode |         ❌         |
-| Files written         | `files.persisted`                 |   —   |   ✅   |           —            |         ❌         |
-| Model reroute         | `model.rerouted`                  |  ✅   |   —    |           —            |         ❌         |
-| Hooks                 | `hook.started/progress/completed` |   —   |   ✅   |           —            |         ❌         |
-| Successful tool calls | `item.*` + `tool.summary`         |  ✅   |   ✅   |           ✅           | ❌ (failures only) |
+| capability            | event                             | Codex | Claude |         Others         |  **Atlas**   |
+| --------------------- | --------------------------------- | :---: | :----: | :--------------------: | :----------: |
+| Per-turn diff         | `turn.diff.updated`               |  ✅   |   —    |           —            |      ❌      |
+| Plan / todo list      | `turn.plan.updated`               |  ✅   |   ✅   |           —            |      ❌      |
+| Plan-mode proposal    | `turn.proposed.delta`             |  ✅   |   —    |           —            |      ❌      |
+| Subagents             | `task.started/progress/completed` |   —   |   ✅   |           —            |      ❌      |
+| Approvals             | `request.opened/resolved`         |  ✅   |   ✅   |        OpenCode        |      ❌      |
+| User questions        | `user-input.requested`            |  ✅   |   ✅   | Cursor, Grok, OpenCode |      ❌      |
+| Files written         | `files.persisted`                 |   —   |   ✅   |           —            |      ❌      |
+| Model reroute         | `model.rerouted`                  |  ✅   |   —    |           —            |      ❌      |
+| Hooks                 | `hook.started/progress/completed` |   —   |   ✅   |           —            |      ❌      |
+| Successful tool calls | `item.*` + `tool.summary`         |  ✅   |   ✅   |           ✅           | ✅ (GAP-002) |
 
-Atlas is the only provider emitting **none** of these. It supplies turn boundaries, assistant
-text, reasoning, context pressure, errors and liveness — the conversation, not the work.
+Atlas supplies turn boundaries, assistant text, reasoning, context pressure, errors, liveness —
+and, since GAP-002, the work itself. The rest of the table is still dark.
 
 ---
 
@@ -65,20 +65,38 @@ feed for both:  user → turn:start → assistant "DONE" → turn:done
 tool frames:    0            0
 ```
 
-**One did the work, one lied, and the feed is identical.** Nothing in Atlas or T3 can tell them
+**One did the work, one lied, and the feed is identical.** Nothing in Atlas or T3 could tell them
 apart; the only reason it was caught is that the filesystem was checked by hand.
 
 So successful tool calls are not a timeline nicety. They are the difference between a record of
-what an agent did and an unverifiable claim. This is the highest-value gap in the table, and it
-also unblocks the progress deadline in `07`, which currently has no signal to time out.
+what an agent did and an unverifiable claim.
+
+**Closed.** The SDK observer now fires at both edges of every call, carrying `call_id` and
+`args`, and atlas-host maps them to `tool_call` / `tool_result`. Measured on a live turn:
+
+```
+tool_call    {tool:"run_bash", call_id:"toolu_01HRno…", args:{command:"echo gap002-proof"}}
+tool_result  {call_id:"toolu_01HRno…", ok:true, duration_ms:98, summary:"…exit=0\ngap002-proof…"}
+```
+
+A model that answers "DONE" having run nothing now emits zero `tool_call` frames, and the two
+cases are finally distinguishable. This also gives `07`'s progress deadline the signal it needed
+to time out on.
+
+The T3 side mapped both frames already (`AtlasAdapter.ts:332-374`, keyed on `payload.call_id`) —
+but mapping is not rendering. A completed call showed as **🔨 Bash ✓** and nothing else: the
+`summary` went to a `tool.summary` event no consumer reads, `args` and `duration_ms` were never
+read, and `ok` was never mapped to `status`, so **a failed call rendered with a success check.**
+Fixed in the same pass; see `11-FRAME-CONTRACT.md` for the field-level map and for the two
+provider-agnostic ingestion bugs it exposed (`status` dropped on `item.completed`, affecting
+OpenCode too; `runtime.error` writing `message` where the client reads `detail`).
 
 ---
 
 ## 4. Build order, by what each unlocks
 
-1. **`tool_call` / `tool_result` on success** (GAP-002) — proof of work, progress signal,
-   visible timeline. Blocks the most and costs the least: the frames already exist and the
-   observer already fires, just only on `ok=false`.
+1. ~~**`tool_call` / `tool_result` on success** (GAP-002)~~ — **done.** Cost less than expected:
+   widening the observer to a `ToolEvent` and wrapping the one place a tool can run.
 2. **Approvals + questions** (GAP-006) — `approval`/`question` frames are already carried and
    dropped by the adapter; the missing half is enforcement, which is also what makes cancel work.
 3. **Per-turn checkpoints** (GAP-009) — the Diff dropdown's "Latest turn" / "Turn ▸". Needs a
@@ -92,8 +110,12 @@ also unblocks the progress deadline in `07`, which currently has no signal to ti
 
 ## 5. Two things worth stating plainly
 
-**Nothing here is a T3 change.** Every surface already renders for another provider. The work is
-entirely "Atlas publishes what it knows", which is `09`'s rule.
+**Mostly this is not a T3 change** — but "mostly" is doing work, and `10` overstated it. Every
+surface here already renders for another provider, so the capability lives in Atlas. What the
+GAP-002 pass found is that a _mapped_ frame is not a _rendered_ one: three fields Atlas sent
+reached no reader, and two of those dead ends were shared-path bugs affecting every provider,
+not Atlas gaps. `11-FRAME-CONTRACT.md` exists so the next capability cannot make that mistake —
+a field is implemented only when both its publisher and its consumer line can be cited.
 
 **`body_manifests()` under-reports.** `registry()` merges an always-on cluster fabric into every
 plugin, so `summarizer` advertises zero tools while its agent still receives `delegate` and

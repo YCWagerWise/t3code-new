@@ -39,6 +39,26 @@ describe("modelsForMember", () => {
     const bySlug = new Map(modelsForMember(member).map((m) => [m.slug, m]));
     assert.strictEqual(bySlug.get("qwen2.5-coder:14b")?.shortName, "qwen2.5-coder");
   });
+
+  it("carries the node's tool probe through to the model, not just the sort", () => {
+    const bySlug = new Map(modelsForMember(member).map((m) => [m.slug, m]));
+    // The node probes each model with `/api/show`. That answer used to be read as a
+    // sort key and dropped, leaving the picker unable to say why deepseek ranks last.
+    assert.strictEqual(bySlug.get("deepseek-coder:6.7b")?.capabilities?.supportsTools, false);
+    assert.strictEqual(bySlug.get("qwen2.5-coder:14b")?.capabilities?.supportsTools, true);
+  });
+
+  it("says nothing when the node never probed, rather than defaulting to false", () => {
+    // A node too old to report `tools` must not have its models libelled as tool-less.
+    // Absent stays absent all the way to the badge, which renders only on `=== false`.
+    const unprobed = {
+      ...member,
+      vitals: { ollama: { loaded: [], models: [{ name: "mystery:7b", family: "llama" }] } },
+    } as unknown as AtlasMember;
+    const [model] = modelsForMember(unprobed);
+    assert.strictEqual(model?.slug, "mystery:7b");
+    assert.strictEqual(model?.capabilities, null);
+  });
 });
 
 describe("modelsForMember ordering", () => {

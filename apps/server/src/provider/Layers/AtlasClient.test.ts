@@ -19,8 +19,12 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import {
   type AtlasMember,
   AtlasMembers,
+  atlasFleetHandshake,
   atlasMembers,
   atlasRun,
+  atlasRunCommand,
+  atlasRunEvents,
+  atlasRunSnapshot,
   bodiesForMember,
   defaultBodyForMember,
   modelOptionsForMember,
@@ -162,6 +166,127 @@ describe("AtlasClient", () => {
         Effect.map((members) => {
           assert.deepStrictEqual(members[0]?.tools, []);
           assert.strictEqual(members[0]?.age_ms, 0);
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+  });
+
+  describe("run authority", () => {
+    const snapshot = {
+      protocol_version: 1,
+      run_id: "thr-42",
+      thread_id: "42",
+      state: "running",
+      state_version: 2,
+      lease_generation: 1,
+      last_provider_seq: 7,
+      last_heartbeat_at: 1000,
+      last_progress_at: 900,
+      deadline_at: 61000,
+      stall_reason: null,
+      terminal_at: null,
+      children: [],
+    };
+
+    it.effect("handshakes against the authenticated fleet control boundary", () => {
+      const stub = stubHttpClient({
+        status: 200,
+        body: JSON.stringify({
+          protocol_version: 1,
+          fleet_id: "primary",
+          subject: null,
+          capabilities: ["run.commands", "run.events"],
+        }),
+      });
+      return atlasFleetHandshake({
+        baseUrl: "https://atlas.example.com",
+        token: "fleet-secret",
+      }).pipe(
+        Effect.map((handshake) => {
+          assert.strictEqual(handshake.fleet_id, "primary");
+          assert.deepStrictEqual(handshake.capabilities, ["run.commands", "run.events"]);
+          assert.strictEqual(
+            stub.captured[0]?.url,
+            "https://atlas.example.com/console/v1/handshake",
+          );
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("reads and decodes the authoritative supervisor snapshot", () => {
+      const stub = stubHttpClient({
+        status: 200,
+        body: JSON.stringify({ run: snapshot }),
+      });
+      return atlasRunSnapshot({
+        baseUrl: "http://127.0.0.1:3010/",
+        runId: "thr-42",
+        token: "fleet-secret",
+      }).pipe(
+        Effect.map((run) => {
+          assert.strictEqual(run.state, "running");
+          assert.strictEqual(run.lease_generation, 1);
+          assert.strictEqual(stub.captured[0]?.url, "http://127.0.0.1:3010/console/v1/runs/thr-42");
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("submits an idempotent command using the authority wire contract", () => {
+      const stub = stubHttpClient({
+        status: 202,
+        body: JSON.stringify({ run: { ...snapshot, state: "starting" } }),
+      });
+      return atlasRunCommand({
+        baseUrl: "http://127.0.0.1:3010",
+        runId: "thr-42",
+        token: "fleet-secret",
+        requestId: "request-1",
+        kind: "run.start",
+        threadId: "42",
+        payload: { text: "hello", plugin: "coder" },
+      }).pipe(
+        Effect.map((run) => {
+          assert.strictEqual(run.state, "starting");
+          assert.deepStrictEqual(JSON.parse(stub.captured[0]?.body ?? "{}"), {
+            request_id: "request-1",
+            kind: "run.start",
+            thread_id: "42",
+            payload: { text: "hello", plugin: "coder" },
+          });
+        }),
+        Effect.provide(stub.layer),
+      );
+    });
+
+    it.effect("replays lifecycle events after the supplied cursor", () => {
+      const stub = stubHttpClient({
+        status: 200,
+        body: JSON.stringify({
+          events: [
+            {
+              seq: 8,
+              kind: "heartbeat",
+              payload: { provider_seq: 8 },
+              recorded_at: 1200,
+            },
+          ],
+        }),
+      });
+      return atlasRunEvents({
+        baseUrl: "http://127.0.0.1:3010",
+        runId: "thr-42",
+        token: "fleet-secret",
+        after: 7,
+      }).pipe(
+        Effect.map((events) => {
+          assert.strictEqual(events[0]?.kind, "heartbeat");
+          assert.strictEqual(
+            stub.captured[0]?.url,
+            "http://127.0.0.1:3010/console/v1/runs/thr-42/events?after=7",
+          );
         }),
         Effect.provide(stub.layer),
       );

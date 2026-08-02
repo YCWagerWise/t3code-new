@@ -10,6 +10,7 @@
  * @module ProviderServiceLive
  */
 import {
+  EventId,
   ModelSelection,
   NonNegativeInt,
   ThreadId,
@@ -160,6 +161,19 @@ function readPersistedCwd(
   if (typeof rawCwd !== "string") return undefined;
   const trimmed = rawCwd.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function isFleetAuthoritativeBinding(
+  binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+): boolean {
+  const payload = binding?.runtimePayload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return false;
+  }
+  return (
+    ("lifecycleAuthority" in payload && payload.lifecycleAuthority === "atlas") ||
+    ("connectorMode" in payload && payload.connectorMode === "fleet")
+  );
 }
 
 const dieOnMissingBindingInstanceId = (

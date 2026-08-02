@@ -382,6 +382,14 @@ export function runtimeEventToActivities(
           summary: "Runtime error",
           payload: {
             message: truncateDetail(event.payload.message),
+            // The client renders `payload.detail`, not `payload.message`, so writing only
+            // the latter produced a bare "Runtime error" row with the cause invisible for
+            // EVERY provider. A structured `detail` from an adapter wins; otherwise the
+            // message is the detail.
+            detail:
+              event.payload.detail !== undefined
+                ? event.payload.detail
+                : truncateDetail(event.payload.message),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -402,6 +410,37 @@ export function runtimeEventToActivities(
             ...(event.payload.toolUseId ? { toolUseId: event.payload.toolUseId } : {}),
             ...(event.payload.reason ? { detail: truncateDetail(event.payload.reason) } : {}),
             ...(event.payload.agentId ? { agentId: event.payload.agentId } : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    // A provider answered with a model other than the one that was asked for.
+    //
+    // Dropping this is the worst kind of silent failure: nothing errors, the picker keeps
+    // displaying the model you chose, and a different one produced the answer. Codex has been
+    // emitting it faithfully and it fell to `default: break`, so every reroute it performed was
+    // invisible. The reason is carried verbatim — a reroute the user cannot explain is barely
+    // better than one they cannot see.
+    case "model.rerouted": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "model.rerouted",
+          // The label states the substitution itself, because that is the whole point of the
+          // row; a generic "Model rerouted" would hide the two facts that matter.
+          summary: truncateDetail(`${event.payload.fromModel} → ${event.payload.toModel}`, 120),
+          payload: {
+            fromModel: event.payload.fromModel,
+            toModel: event.payload.toModel,
+            reason: event.payload.reason,
+            // The client renders `detail`, not the typed fields — see `runtime.error`, which
+            // wrote only `message` and rendered as a bare label for every provider.
+            detail: truncateDetail(event.payload.reason),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -649,6 +688,11 @@ export function runtimeEventToActivities(
           summary: event.payload.title ?? "Tool",
           payload: {
             itemType: event.payload.itemType,
+            // Carried for the same reason `item.updated` carries it: the client reads
+            // `payload.status` and DEFAULTS TO "completed" when it is absent, so dropping a
+            // declared `status: "failed"` here renders a failed tool call with a success
+            // check. OpenCode has been emitting exactly that on `item.completed`.
+            ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
           },

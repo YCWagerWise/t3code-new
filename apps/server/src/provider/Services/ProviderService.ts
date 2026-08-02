@@ -106,6 +106,25 @@ export interface ProviderServiceShape {
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**
+   * Publish the canonical terminal evidence for a direct-provider turn whose
+   * owning runtime disappeared before it emitted a terminal event.
+   */
+  readonly reportSessionLoss: (input: {
+    readonly threadId: ThreadId;
+    readonly turnId: ProviderRuntimeEvent["turnId"];
+    readonly provider: ProviderRuntimeEvent["provider"];
+    readonly providerInstanceId?: ProviderInstanceId;
+    readonly reason: string;
+  }) => Effect.Effect<void>;
+
+  /**
+   * Settle active direct-provider turns, then stop all provider sessions.
+   * Idempotent so the orchestration shutdown barrier and layer finalizer can
+   * safely invoke the same operation.
+   */
+  readonly prepareShutdown: Effect.Effect<void>;
+
+  /**
    * Canonical provider runtime event stream.
    *
    * Fan-out is owned by ProviderService (not by a standalone event-bus service).

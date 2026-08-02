@@ -27,6 +27,12 @@ export type ModelEsque = {
   name: string;
   shortName?: string | undefined;
   subProvider?: string | undefined;
+  /**
+   * Provider-declared abilities. Only read for `supportsTools`, and only when it
+   * is explicitly `false` — absent means the provider never probed, and marking a
+   * model on a guess trains people to ignore the mark.
+   */
+  capabilities?: { supportsTools?: boolean | undefined } | null | undefined;
 };
 
 function escapeRegExp(value: string): string {

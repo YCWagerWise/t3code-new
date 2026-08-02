@@ -39,25 +39,158 @@ describe("eventsForFrame", () => {
   it("maps a turn boundary to the matching lifecycle event", () => {
     expect(types({ kind: "turn", payload: { state: "start" } })).toEqual(["turn.started"]);
     expect(types({ kind: "turn", payload: { state: "done" } })).toEqual(["turn.completed"]);
-    expect(types({ kind: "turn", payload: { state: "error" } })).toEqual(["turn.completed"]);
+    // An error turn now reports the CLASS Atlas declared as well as closing the lifecycle.
+    // `runtime.error` is the only event carrying a class, and it is already consumed.
+    expect(types({ kind: "turn", payload: { state: "error" } })).toEqual([
+      "runtime.error",
+      "turn.completed",
+    ]);
+  });
+
+  it("reports a cancelled turn as aborted, not as a completed one", () => {
+    // The failure this replaces: `cancelled` fell through to the `turn.completed{completed}`
+    // default, so a turn the user stopped rendered as a green successful one. `turn.aborted`
+    // is the event ingestion already maps to status "ready" with no `lastError`.
+    expect(types({ kind: "turn", payload: { state: "cancelled" } })).toEqual(["turn.aborted"]);
+    const [event] = map({ kind: "turn", payload: { state: "cancelled", text: "stopped by user" } });
+    expect(event).toMatchObject({ type: "turn.aborted", payload: { reason: "stopped by user" } });
+  });
+
+  it("gives a cancelled turn a reason even when Atlas sends none", () => {
+    const [event] = map({ kind: "turn", payload: { state: "cancelled" } });
+    expect(event).toMatchObject({ payload: { reason: "Cancelled" } });
+  });
+
+  it("surfaces a policy refusal as a denied tool", () => {
+    // `Policy::decide`'s Deny verdict. Nothing to resolve — the point is that the user sees
+    // WHY, instead of a tool that silently did nothing.
+    const [event] = map({
+      kind: "deny",
+      payload: { tool: "run_bash", reason: "catastrophic delete of filesystem root" },
+    });
+    expect(event).toMatchObject({
+      type: "tool.denied",
+      payload: { toolName: "run_bash", reason: "catastrophic delete of filesystem root" },
+    });
+  });
+
+  it("names something on a denial that arrives without a tool", () => {
+    // `toolName` is required by the contract; dropping the frame would hide the refusal.
+    const [event] = map({ kind: "deny", payload: { reason: "blocked" } });
+    expect(event).toMatchObject({ payload: { toolName: "tool" } });
+  });
+
+  it("opens a resolvable request when Atlas holds a tool call", () => {
+    const [event] = map({
+      kind: "approval",
+      payload: {
+        request_id: "thr-1:call-7",
+        tool: "run_bash",
+        args: { cmd: "git push" },
+        reason: "`git push` needs approval on this node",
+      },
+    });
+    expect(event).toMatchObject({
+      type: "request.opened",
+      requestId: "thr-1:call-7",
+      payload: {
+        requestType: "command_execution_approval",
+        detail: "`git push` needs approval on this node",
+        args: { toolName: "run_bash", input: { cmd: "git push" } },
+      },
+    });
+  });
+
+  it("ignores an approval with no request id, which nothing could resolve", () => {
+    expect(types({ kind: "approval", payload: { tool: "run_bash" } })).toEqual([]);
   });
 
   it("carries the Atlas failure reason onto a failed completed turn", () => {
     // The whole point of Atlas declaring `state:"error"` is that the reason
     // survives instead of being recovered by substring-matching an error string.
-    const [event] = map({ kind: "turn", payload: { state: "error", text: "backend down" } });
-    expect(event).toMatchObject({
+    const events = map({ kind: "turn", payload: { state: "error", text: "backend down" } });
+    expect(events[1]).toMatchObject({
       type: "turn.completed",
       payload: { state: "failed", errorMessage: "backend down" },
+    });
+    // The class rides with it, taken from Atlas rather than recovered from the message.
+    expect(events[0]).toMatchObject({
+      type: "runtime.error",
+      payload: { message: "backend down", class: "unknown" },
     });
   });
 
   it("falls back to a reason when Atlas reports an error with no text", () => {
-    const [event] = map({ kind: "turn", payload: { state: "error" } });
+    const events = map({ kind: "turn", payload: { state: "error" } });
     // TrimmedNonEmptyString would reject "", so a placeholder is required, not cosmetic.
-    expect(event).toMatchObject({
+    expect(events[1]).toMatchObject({
       payload: { state: "failed", errorMessage: "Atlas run failed" },
     });
+  });
+
+  it("carries the failure class Atlas declared instead of guessing from the message", () => {
+    // The whole reason `ErrorClass` exists: the body knows at the point of failure whether it
+    // was the provider or the transport, so no lens has to pattern-match an error string.
+    const [err] = map({
+      kind: "turn",
+      payload: { state: "error", text: "dispatch 503", class: "transport_error" },
+    });
+    expect(err).toMatchObject({ type: "runtime.error", payload: { class: "transport_error" } });
+  });
+
+  it("stays honestly unknown when Atlas declares no class", () => {
+    const [err] = map({ kind: "turn", payload: { state: "error", text: "boom" } });
+    expect(err).toMatchObject({ payload: { class: "unknown" } });
+  });
+
+  it("surfaces a delegated turn as a task running on another node", () => {
+    // Delegation is the one Atlas capability with no provider analogue, and it used to render
+    // as an unexplained pause in the caller's timeline.
+    const started = map({
+      kind: "edge",
+      payload: {
+        edge: "delegate",
+        to: "http://metatron:3010",
+        run_id: "deleg-9",
+        state: "start",
+        task: "check disk",
+      },
+    });
+    expect(started[0]).toMatchObject({
+      type: "task.started",
+      // taskId is the CHILD run, so a lens can follow the work to the other feed.
+      payload: {
+        taskId: "deleg-9",
+        description: "→ http://metatron:3010: check disk",
+        taskType: "delegate",
+      },
+    });
+
+    const done = map({
+      kind: "edge",
+      payload: { to: "http://metatron:3010", run_id: "deleg-9", state: "done", detail: "42% used" },
+    });
+    expect(done[0]).toMatchObject({
+      type: "task.completed",
+      payload: { taskId: "deleg-9", status: "completed", summary: "42% used" },
+    });
+  });
+
+  it("reports a failed delegation as a failed task, not a completed one", () => {
+    const [event] = map({
+      kind: "edge",
+      payload: {
+        to: "http://seraphim:3010",
+        run_id: "deleg-x",
+        state: "error",
+        detail: "connection refused",
+      },
+    });
+    expect(event).toMatchObject({ payload: { status: "failed", summary: "connection refused" } });
+  });
+
+  it("drops an edge with no child run, which nothing could follow", () => {
+    expect(types({ kind: "edge", payload: { to: "somewhere", state: "start" } })).toEqual([]);
   });
 
   it("expands an assistant answer into a complete item lifecycle", () => {
@@ -80,10 +213,152 @@ describe("eventsForFrame", () => {
     expect(finished[1]).toMatchObject({ payload: { summary: "exit 0" } });
   });
 
+  // A tool result must arrive as a VERDICT, not just a row. Absent `status` the client
+  // assumes "completed", so a failed call renders with a success check — the exact
+  // ambiguity GAP-002 exists to remove.
+  it("marks a failed tool call failed rather than letting it default to success", () => {
+    const [completed] = map({
+      kind: "tool_result",
+      payload: { call_id: "c3", tool: "run_bash", ok: false, summary: "no such file" },
+    });
+    expect(completed).toMatchObject({
+      payload: { itemType: "dynamic_tool_call", status: "failed", detail: "no such file" },
+    });
+  });
+
+  it("treats a result with no ok flag as successful, so an older node is unchanged", () => {
+    const [completed] = map({ kind: "tool_result", payload: { call_id: "c4", tool: "x" } });
+    expect(completed).toMatchObject({ payload: { status: "completed" } });
+  });
+
+  // `tool.summary` reaches no consumer in T3 (`runtimeEventToActivities` has no case for it),
+  // so `detail` is the only path Atlas's result text has to the screen — and it is also what
+  // makes the row expandable.
+  it("carries the result onto detail, not only onto the unconsumed summary event", () => {
+    const [completed] = map({
+      kind: "tool_result",
+      payload: { call_id: "c5", tool: "run_bash", ok: true, summary: "exit=0\nhello" },
+    });
+    expect(completed).toMatchObject({ payload: { detail: "exit=0\nhello" } });
+  });
+
+  it("carries args and duration as structured data on both edges", () => {
+    const [started] = map({
+      kind: "tool_call",
+      payload: { call_id: "c6", tool: "run_bash", args: { command: "echo hi" } },
+    });
+    const [completed] = map({
+      kind: "tool_result",
+      payload: {
+        call_id: "c6",
+        tool: "run_bash",
+        ok: true,
+        duration_ms: 65,
+        args: { command: "echo hi" },
+      },
+    });
+    expect(started).toMatchObject({
+      payload: { status: "inProgress", data: { args: { command: "echo hi" } } },
+    });
+    expect(completed).toMatchObject({ payload: { data: { durationMs: 65 } } });
+  });
+
+  it("omits data entirely when Atlas sends neither args nor duration", () => {
+    const [completed] = map({ kind: "tool_result", payload: { call_id: "c7", ok: true } });
+    expect(completed?.payload).not.toHaveProperty("data");
+  });
+
   it("omits the tool summary when Atlas reports an empty one", () => {
     // TrimmedNonEmptyString rejects "", so emitting it would produce an invalid event.
     const events = map({ kind: "tool_result", payload: { call_id: "c2", summary: "   " } });
     expect(events.map((e) => e.type)).toEqual(["item.completed"]);
+  });
+
+  // Atlas derives a diff from a git checkpoint at the turn boundary rather than from tool
+  // calls, which is why it can report a file `sed` wrote inside `run_bash` — an edit no tool
+  // lifecycle event ever saw. Each changed path becomes a `file_change` row, a canonical
+  // lifecycle item type that renders with machinery T3 already has.
+  it("expands a diff into the panel event and one file_change row per path", () => {
+    const events = map({
+      kind: "diff",
+      seq: 7,
+      payload: {
+        unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        files: [
+          { path: "src/lib.rs", status: "M" },
+          { path: "made-by-bash.txt", status: "A" },
+        ],
+        checkpoint: 3,
+      },
+    });
+    expect(events.map((e) => e.type)).toEqual([
+      "turn.diff.updated",
+      "item.completed",
+      "item.completed",
+    ]);
+    expect(events[0]).toMatchObject({
+      type: "turn.diff.updated",
+      payload: { unifiedDiff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new" },
+    });
+    expect(events[1]).toMatchObject({
+      payload: { itemType: "file_change", title: "src/lib.rs", detail: "modified" },
+    });
+    expect(events[2]).toMatchObject({
+      payload: { itemType: "file_change", title: "made-by-bash.txt", detail: "added" },
+    });
+  });
+
+  it("gives each file_change row its own item id so one does not overwrite the next", () => {
+    // Keyed on seq alone, both rows would share an id and the timeline would show one file.
+    const events = map({
+      kind: "diff",
+      seq: 7,
+      payload: {
+        unified: "diff --git a/x b/x\n",
+        files: [
+          { path: "x", status: "M" },
+          { path: "y", status: "A" },
+        ],
+      },
+    });
+    const ids = events.filter((e) => e.type === "item.completed").map((e) => e.itemId);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("says nothing when a turn changed no files", () => {
+    // Atlas does not publish an empty diff, but a frame that arrives with nothing to show
+    // must not produce a diff panel event promising content that is not there.
+    expect(types({ kind: "diff", payload: { unified: "", files: [] } })).toEqual([]);
+    expect(types({ kind: "diff", payload: {} })).toEqual([]);
+  });
+
+  it("drops a file entry with no path rather than rendering a nameless row", () => {
+    const events = map({
+      kind: "diff",
+      payload: { unified: "diff --git a/x b/x\n", files: [{ status: "M" }, { path: "x" }] },
+    });
+    expect(events.map((e) => e.type)).toEqual(["turn.diff.updated", "item.completed"]);
+    // A file entry with no status is still a real change; git's default classification is a
+    // modification, and dropping the row would lose the path.
+    expect(events[1]).toMatchObject({ payload: { title: "x", detail: "modified" } });
+  });
+
+  // A warning is not an error: the turn is still running, and an error row would report a
+  // failure that did not happen. Atlas raises this when it cannot honour a request as stated.
+  it("maps a warning to runtime.warning, never to runtime.error", () => {
+    const events = map({
+      kind: "warning",
+      payload: { message: "'deepseek-coder:6.7b' cannot call tools" },
+    });
+    expect(events.map((e) => e.type)).toEqual(["runtime.warning"]);
+    expect(events[0]).toMatchObject({
+      payload: { message: "'deepseek-coder:6.7b' cannot call tools" },
+    });
+  });
+
+  it("drops an empty warning rather than emitting an invalid event", () => {
+    // TrimmedNonEmptyString rejects "", so emitting it would produce an unparseable event.
+    expect(map({ kind: "warning", payload: { message: "   " } })).toEqual([]);
   });
 
   it("passes context pressure through without normalization", () => {
@@ -132,10 +407,12 @@ describe("eventsForFrame", () => {
     expect(bogus).toMatchObject({ payload: { class: "unknown" } });
   });
 
-  it("emits nothing for approvals and questions until Atlas can resolve them", () => {
-    // Showing an approval the user cannot answer is worse than not showing it.
-    // This test should be deleted when GAP-006 lands, and its absence is the signal.
-    expect(map({ kind: "approval", payload: { request_id: "r1" } })).toEqual([]);
+  it("emits nothing for a question, which Atlas still cannot resolve", () => {
+    // Approvals used to be listed here too, with a note saying this assertion should be
+    // deleted when Atlas could actually resolve one. It can now — the tool gate holds the
+    // call open and `respondToRequest` releases it — so `approval` moved to its own test
+    // above. `question` stays: Atlas has no interactive-input mechanism, so a prompt on
+    // screen would still be one nothing can answer.
     expect(map({ kind: "question", payload: { request_id: "r2" } })).toEqual([]);
   });
 

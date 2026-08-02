@@ -38,6 +38,10 @@ export const ModelListRow = memo(function ModelListRow(props: {
   onToggleFavorite: () => void;
 }) {
   const ProviderIcon = PROVIDER_ICON_BY_PROVIDER[props.driverKind] ?? null;
+  // Strictly `=== false`. Absent means the provider never probed, and a badge on a
+  // guess is worse than no badge — the model is still selectable either way, since a
+  // tool-less model is a fine choice for a plain prompt.
+  const lacksTools = props.model.capabilities?.supportsTools === false;
   const providerLabel = props.model.subProvider
     ? `${props.providerDisplayName} · ${props.model.subProvider}`
     : props.providerDisplayName;
@@ -73,6 +77,28 @@ export const ModelListRow = memo(function ModelListRow(props: {
             >
               New
             </span>
+          ) : null}
+          {lacksTools ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span
+                    className="shrink-0 rounded border border-muted-foreground/25 bg-muted-foreground/10 px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide text-muted-foreground"
+                    aria-label="This model cannot call tools"
+                  >
+                    No tools
+                  </span>
+                }
+              />
+              <TooltipPopup
+                side="top"
+                align="center"
+                className="max-w-64 text-balance leading-snug"
+              >
+                This model cannot call tools. It will answer, but it cannot run commands, read
+                files, or edit code — and may describe doing so instead.
+              </TooltipPopup>
+            </Tooltip>
           ) : null}
         </div>
         {props.showProvider && (

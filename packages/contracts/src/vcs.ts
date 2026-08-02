@@ -1,7 +1,13 @@
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
-export const VcsDriverKind = Schema.Literals(["git", "jj", "unknown"]);
+/**
+ * `atlas` is a *remote* git worktree: the repository lives on an Atlas node and is reached over
+ * HTTP rather than through a local process. It is a separate kind from `git` because driver
+ * selection is by kind and the two cannot be auto-detected apart — a path that is not on this
+ * machine looks identical to a path that is not a repository.
+ */
+export const VcsDriverKind = Schema.Literals(["git", "jj", "atlas", "unknown"]);
 export type VcsDriverKind = typeof VcsDriverKind.Type;
 
 export const VcsFreshnessSource = Schema.Literals([

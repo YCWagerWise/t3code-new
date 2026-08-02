@@ -1034,6 +1034,118 @@ describe("ProviderRuntimeIngestion", () => {
     expect(rawOutput?.content).toBe('import * as Effect from "effect/Effect"\n');
   });
 
+  // The client reads `payload.status` and DEFAULTS TO "completed" when it is absent, so
+  // dropping a declared failure here renders a failed tool call with a success check. The
+  // sibling `item.updated` arm has always carried it; `item.completed` did not, which is why
+  // OpenCode tool errors (`OpenCodeAdapter`, emitted as `item.completed`) looked successful.
+  it("keeps a failed status on a completed tool so it cannot read as success", async () => {
+    const harness = await createHarness();
+
+    harness.emit({
+      type: "item.completed",
+      eventId: asEventId("evt-tool-completed-failed"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-tool-failed"),
+      itemId: asItemId("item-tool-failed"),
+      payload: {
+        itemType: "dynamic_tool_call",
+        status: "failed",
+        title: "run_bash",
+        detail: "no such file or directory",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-tool-completed-failed",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-tool-completed-failed",
+    );
+    const payload =
+      activity?.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(activity?.kind).toBe("tool.completed");
+    expect(payload?.status).toBe("failed");
+    expect(payload?.detail).toBe("no such file or directory");
+  });
+
+  // The row's visible text comes from `payload.detail`; writing only `message` left every
+  // provider's failures rendering as a bare "Runtime error" with the cause invisible.
+  // A reroute nobody is told about is a silent substitution: the picker keeps showing the model
+  // that was chosen while a different one answered. Codex emits this faithfully; ingestion had
+  // no case for it, so every reroute it performed was invisible.
+  it("surfaces a model reroute instead of silently swapping the model", async () => {
+    const harness = await createHarness();
+
+    harness.emit({
+      type: "model.rerouted",
+      eventId: asEventId("evt-model-rerouted"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: {
+        fromModel: "gpt-5.6-sol",
+        toModel: "gpt-5.5",
+        reason: "requested model is at capacity",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-model-rerouted",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-model-rerouted",
+    );
+    const payload =
+      activity?.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(activity?.kind).toBe("model.rerouted");
+    // The substitution itself is the label — a generic "Model rerouted" hides both facts.
+    expect(activity?.summary).toBe("gpt-5.6-sol → gpt-5.5");
+    expect(payload?.fromModel).toBe("gpt-5.6-sol");
+    expect(payload?.toModel).toBe("gpt-5.5");
+    // `detail` is what the client actually renders — see the runtime.error case below.
+    expect(payload?.detail).toBe("requested model is at capacity");
+  });
+
+  it("makes a runtime error's message readable rather than a bare label", async () => {
+    const harness = await createHarness();
+
+    harness.emit({
+      type: "runtime.error",
+      eventId: asEventId("evt-runtime-error-detail"),
+      provider: ProviderDriverKind.make("cursor"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: { message: "atlas dispatch 500: supervisor unreachable" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-runtime-error-detail",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-runtime-error-detail",
+    );
+    const payload =
+      activity?.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(payload?.detail).toBe("atlas dispatch 500: supervisor unreachable");
+  });
+
   it("normalizes command execution activities to ran-command summaries", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

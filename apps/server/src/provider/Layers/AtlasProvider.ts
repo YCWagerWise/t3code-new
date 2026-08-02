@@ -20,7 +20,9 @@ import type { HttpClient } from "effect/unstable/http";
 
 import {
   type AtlasClientError,
+  type AtlasFeedReadinessInput,
   type AtlasMember,
+  atlasFeedReadiness,
   atlasMembers,
   type AtlasModelOption,
   modelOptionsForMember,
@@ -65,14 +67,27 @@ export const selfMember = (
   return members.find((m) => authorityOf(m.url) === want);
 };
 
+/**
+ * `supportsTools` survives the mapping.
+ *
+ * It used to be consumed as a sort key and then dropped on the floor here, which
+ * left a tool-less model indistinguishable from a tool-capable one on screen: the
+ * node knows the answer (it probes each model), the picker offered it anyway, and
+ * the user found out a turn later when the model narrated a tool call it never
+ * made. Atlas warns at drive time; carrying the flag prevents the pick instead.
+ */
 const toServerProviderModel = (option: AtlasModelOption): ServerProviderModel => ({
   slug: option.id,
   name: option.label,
   shortName: option.label.split(":")[0] ?? option.label,
   subProvider: option.source,
   isCustom: false,
-  capabilities: null,
+  capabilities: option.supportsTools === undefined ? null : { supportsTools: option.supportsTools },
 });
+
+/** Tool-capable first, unprobed next, known tool-less last. Unknown is not "no". */
+const toolRank = (supportsTools: boolean | undefined): number =>
+  supportsTools === true ? 0 : supportsTools === undefined ? 1 : 2;
 
 /**
  * Models a node can actually run, ordered so the dependable ones lead.
@@ -84,7 +99,9 @@ const toServerProviderModel = (option: AtlasModelOption): ServerProviderModel =>
 export const modelsForMember = (member: AtlasMember): ReadonlyArray<ServerProviderModel> => {
   const options = [...modelOptionsForMember(member)];
   options.sort((a, b) => {
-    if (a.supportsTools !== b.supportsTools) return a.supportsTools ? -1 : 1;
+    if (toolRank(a.supportsTools) !== toolRank(b.supportsTools)) {
+      return toolRank(a.supportsTools) - toolRank(b.supportsTools);
+    }
     const rank = { claude: 0, codex: 1, "ollama-cloud": 2, ollama: 3 } as const;
     return rank[a.source] - rank[b.source];
   });
@@ -98,6 +115,10 @@ export interface AtlasSnapshotInput {
   readonly config: AtlasSettings;
   readonly enabled: boolean;
   readonly checkedAt: string;
+  /** Test seam for the authenticated execution-boundary probe. */
+  readonly feedReadiness?: (
+    input: AtlasFeedReadinessInput,
+  ) => Effect.Effect<void, AtlasClientError>;
 }
 
 /**
@@ -109,8 +130,49 @@ export interface AtlasSnapshotInput {
  */
 export const checkAtlasProviderStatus = (
   input: AtlasSnapshotInput,
-): Effect.Effect<ServerProvider, never, HttpClient.HttpClient> =>
-  atlasMembers(input.config.baseUrl).pipe(
+): Effect.Effect<ServerProvider, never, HttpClient.HttpClient> => {
+  const base = {
+    instanceId: input.instanceId,
+    driver: ATLAS_DRIVER_KIND,
+    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
+    enabled: input.enabled,
+    version: null,
+    checkedAt: input.checkedAt,
+    slashCommands: [],
+    skills: [],
+  } as const;
+
+  // A disabled provider must be inert: do not keep probing a node the user
+  // deliberately turned off. A missing feed credential is likewise a local
+  // configuration outcome, not a misleading successful discovery request.
+  if (!input.enabled) {
+    return Effect.succeed({
+      ...base,
+      installed: false,
+      status: "disabled",
+      auth: { status: "unknown" },
+      models: [],
+    } satisfies ServerProvider);
+  }
+  if (input.config.wsToken.trim() === "") {
+    return Effect.succeed({
+      ...base,
+      installed: false,
+      status: "error",
+      auth: { status: "unauthenticated", type: "node" },
+      message: "Atlas feed token is required before this node can run turns.",
+      models: [],
+    } satisfies ServerProvider);
+  }
+
+  const readiness = input.feedReadiness ?? atlasFeedReadiness;
+  return readiness({
+    baseUrl: input.config.baseUrl,
+    plugin: input.config.plugin,
+    token: input.config.wsToken,
+  }).pipe(
+    Effect.andThen(atlasMembers(input.config.baseUrl)),
     Effect.map((members): ServerProvider => {
       // A node reports the whole ring it can see, and the FIRST entry is not
       // reliably the one we asked. Match on the URL the member advertises rather
@@ -129,42 +191,27 @@ export const checkAtlasProviderStatus = (
           ].join(" · ")
         : undefined;
       return {
-        instanceId: input.instanceId,
-        driver: ATLAS_DRIVER_KIND,
-        ...(input.displayName ? { displayName: input.displayName } : {}),
-        ...(input.accentColor ? { accentColor: input.accentColor } : {}),
-        enabled: input.enabled,
+        ...base,
         installed: reachable,
-        version: null,
-        status: input.enabled ? (reachable ? "ready" : "warning") : "disabled",
+        status: reachable ? "ready" : "warning",
         auth: {
           status: reachable ? "authenticated" : "unknown",
           type: "node",
           ...(authLabel ? { label: authLabel } : {}),
         },
-        checkedAt: input.checkedAt,
         ...(reachable ? {} : { message: `No members reported by ${input.config.baseUrl}` }),
         models: self ? modelsForMember(self) : [],
-        slashCommands: [],
-        skills: [],
       } satisfies ServerProvider;
     }),
     Effect.catch((error: AtlasClientError) =>
       Effect.succeed({
-        instanceId: input.instanceId,
-        driver: ATLAS_DRIVER_KIND,
-        ...(input.displayName ? { displayName: input.displayName } : {}),
-        ...(input.accentColor ? { accentColor: input.accentColor } : {}),
-        enabled: input.enabled,
+        ...base,
         installed: false,
-        version: null,
         status: "error",
-        auth: { status: "unknown" },
-        checkedAt: input.checkedAt,
+        auth: { status: "unauthenticated", type: "node" },
         message: error.message,
         models: [],
-        slashCommands: [],
-        skills: [],
       } satisfies ServerProvider),
     ),
   );
+};

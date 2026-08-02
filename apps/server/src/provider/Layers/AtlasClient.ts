@@ -72,7 +72,18 @@ export const AtlasOllamaModel = Schema.Struct({
   params: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   quant: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   size: Schema.Number.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
-  tools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * Three-valued on purpose: `true` / `false` / absent.
+   *
+   * The node resolves this from a real `/api/show` probe on every vitals beat, so a
+   * current node always sends it. A node too old to probe omits it, and that MUST NOT
+   * decode to `false` — the value now reaches the screen as a "No tools" badge, and a
+   * default would libel every model on an old node. Atlas keeps the same discipline
+   * body-side (`known_tool_support` returns `Option<bool>`; `build_backend_named`
+   * reroutes on a KNOWN false, never on absence), and this is where that care used to
+   * be thrown away on arrival.
+   */
+  tools: Schema.optional(Schema.Boolean),
   /**
    * Runs remotely through the node's signed-in Ollama Cloud daemon rather than
    * from local weights. Cloud models never appear in `/api/tags`, so the node
@@ -165,8 +176,8 @@ export interface AtlasModelOption {
   readonly id: string;
   readonly label: string;
   readonly source: "claude" | "codex" | "ollama" | "ollama-cloud";
-  /** False ⇒ cannot drive a tool-enabled plugin. */
-  readonly supportsTools: boolean;
+  /** `false` ⇒ cannot drive a tool-enabled plugin. `undefined` ⇒ the node never probed. */
+  readonly supportsTools: boolean | undefined;
   /**
    * Ready to answer without a cold start. Local Ollama models are resident in
    * memory; cloud models have no local load step at all.
@@ -378,3 +389,418 @@ export const atlasFeedUrl = (input: AtlasFeedUrlInput): string => {
   });
   return `${base}/_feed?${params.toString()}`;
 };
+
+/**
+ * Atlas-owned lifecycle projection for a run.
+ *
+ * This is deliberately separate from feed transport state. A connected socket
+ * can be silent, while the supervisor can authoritatively declare the run
+ * stalled (including the exact deadline and reason).
+ */
+export const AtlasRunLifecycleState = Schema.Literals([
+  "queued",
+  "starting",
+  "running",
+  "waiting_for_input",
+  "cancelling",
+  "completed",
+  "limited",
+  "failed",
+  "stalled",
+  "cancelled",
+]);
+export type AtlasRunLifecycleState = typeof AtlasRunLifecycleState.Type;
+
+export const AtlasEventCursor = Schema.Struct({
+  epoch: Schema.Number,
+  seq: Schema.Number,
+});
+
+export const AtlasAttemptIdentity = Schema.Struct({
+  attempt_id: Schema.String,
+  attempt_number: Schema.Number,
+  retry_of_run_id: Schema.NullOr(Schema.String),
+  resume_of_attempt_id: Schema.NullOr(Schema.String),
+  resumed_from_checkpoint_id: Schema.NullOr(Schema.String),
+});
+
+export const AtlasExecutionLimits = Schema.Struct({
+  max_turn_requests: Schema.NullOr(Schema.Number),
+  max_tokens: Schema.NullOr(Schema.Number),
+  session_budget_id: Schema.NullOr(Schema.String),
+  max_tool_calls: Schema.NullOr(Schema.Number),
+  max_wall_time_ms: Schema.NullOr(Schema.Number),
+});
+
+export const AtlasExecutionUsage = Schema.Struct({
+  turn_requests: Schema.Number,
+  tokens: Schema.Number,
+  tool_calls: Schema.Number,
+  wall_time_ms: Schema.Number,
+});
+
+export const AtlasTerminalOutcome = Schema.Struct({
+  state: AtlasRunLifecycleState,
+  reason: Schema.String,
+  detail: Schema.Unknown,
+  terminal_at_ms: Schema.Number,
+});
+
+export const AtlasRunChildSnapshot = Schema.Struct({
+  child_run_id: Schema.String,
+  parent_run_id: Schema.String,
+  required: Schema.Boolean,
+  settlement_policy: Schema.String,
+  attempt: AtlasAttemptIdentity,
+  state: AtlasRunLifecycleState,
+  state_version: Schema.Number,
+  lease_generation: Schema.Number,
+  event_head: AtlasEventCursor,
+  limits: AtlasExecutionLimits,
+  usage: AtlasExecutionUsage,
+  terminal: Schema.NullOr(AtlasTerminalOutcome),
+  last_heartbeat_at_ms: Schema.NullOr(Schema.Number),
+  last_progress_at_ms: Schema.NullOr(Schema.Number),
+  last_progress_marker: Schema.NullOr(Schema.String),
+  deadline_at_ms: Schema.NullOr(Schema.Number),
+  resumable_checkpoint_id: Schema.NullOr(Schema.String),
+});
+
+export const AtlasRunSnapshot = Schema.Struct({
+  protocol_version: Schema.Number,
+  snapshot_version: Schema.Number,
+  fleet_id: Schema.String,
+  run_id: Schema.String,
+  thread_id: Schema.String,
+  attempt: AtlasAttemptIdentity,
+  state: AtlasRunLifecycleState,
+  state_version: Schema.Number,
+  lease_generation: Schema.Number,
+  last_provider_seq: Schema.Number,
+  event_head: AtlasEventCursor,
+  limits: AtlasExecutionLimits,
+  usage: AtlasExecutionUsage,
+  terminal: Schema.NullOr(AtlasTerminalOutcome),
+  last_heartbeat_at_ms: Schema.NullOr(Schema.Number),
+  last_progress_at_ms: Schema.NullOr(Schema.Number),
+  last_progress_marker: Schema.NullOr(Schema.String),
+  deadline_at_ms: Schema.NullOr(Schema.Number),
+  resumable_checkpoint_id: Schema.NullOr(Schema.String),
+  children: Schema.Array(AtlasRunChildSnapshot),
+});
+export type AtlasRunSnapshot = typeof AtlasRunSnapshot.Type;
+
+const AtlasRunSnapshotResponse = Schema.Struct({ run: AtlasRunSnapshot });
+const decodeRunSnapshot = Schema.decodeUnknownEffect(AtlasRunSnapshotResponse);
+
+export const AtlasRunLifecycleEvent = Schema.Struct({
+  epoch: Schema.Number,
+  seq: Schema.Number,
+  event_id: Schema.String,
+  run_id: Schema.String,
+  attempt_id: Schema.String,
+  kind: Schema.String,
+  payload_json: Schema.String,
+  recorded_at: Schema.Number,
+});
+export type AtlasRunLifecycleEvent = typeof AtlasRunLifecycleEvent.Type;
+
+const AtlasRunEventsResponse = Schema.Struct({
+  events: Schema.Array(AtlasRunLifecycleEvent),
+});
+const decodeRunEvents = Schema.decodeUnknownEffect(AtlasRunEventsResponse);
+
+export interface AtlasRunAuthorityInput {
+  readonly baseUrl: string;
+  /** Atlas keys one durable supervisor isolate by thread id. */
+  readonly threadId: string;
+  readonly token: string;
+}
+
+export const AtlasFleetHandshake = Schema.Struct({
+  protocol_version: Schema.Number,
+  fleet_id: Schema.String,
+  authenticated_subject: Schema.String,
+  granted_scopes: Schema.Array(Schema.String),
+  capabilities: Schema.Array(Schema.String),
+  connection_id: Schema.String,
+  server_time_ms: Schema.Number,
+  heartbeat_interval_ms: Schema.Number,
+  replay_boundaries: Schema.Array(
+    Schema.Struct({
+      run_id: Schema.String,
+      snapshot_version: Schema.Number,
+      through: AtlasEventCursor,
+    }),
+  ),
+});
+export type AtlasFleetHandshake = typeof AtlasFleetHandshake.Type;
+const decodeFleetHandshake = Schema.decodeUnknownEffect(AtlasFleetHandshake);
+
+const authorityRequest = (
+  input: AtlasRunAuthorityInput,
+  operation: string,
+  request: HttpClientRequest.HttpClientRequest,
+): Effect.Effect<unknown, AtlasClientError, HttpClient.HttpClient> =>
+  Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient;
+    const response = yield* client.execute(
+      input.token === "" ? request : request.pipe(HttpClientRequest.bearerToken(input.token)),
+    );
+    const json = yield* response.json;
+    if (response.status < 200 || response.status >= 300) {
+      return yield* Effect.fail(
+        new AtlasClientError({
+          baseUrl: input.baseUrl,
+          operation,
+          detail: `control plane returned HTTP ${response.status}`,
+        }),
+      );
+    }
+    return json;
+  }).pipe(
+    Effect.mapError((cause) =>
+      cause instanceof AtlasClientError
+        ? cause
+        : new AtlasClientError({
+            baseUrl: input.baseUrl,
+            operation,
+            detail: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+    ),
+  );
+
+/** Authenticate against the same control boundary used for run commands. */
+export const atlasFleetHandshake = (
+  input: Pick<AtlasRunAuthorityInput, "baseUrl" | "token">,
+): Effect.Effect<AtlasFleetHandshake, AtlasClientError, HttpClient.HttpClient> =>
+  authorityRequest(
+    { ...input, threadId: "" },
+    "fleet handshake",
+    HttpClientRequest.get(`${normalizeBaseUrl(input.baseUrl)}/console/v1/handshake`),
+  ).pipe(
+    Effect.flatMap(decodeFleetHandshake),
+    Effect.mapError((cause) =>
+      cause instanceof AtlasClientError
+        ? cause
+        : new AtlasClientError({
+            baseUrl: input.baseUrl,
+            operation: "fleet handshake",
+            detail: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+    ),
+  );
+
+/** Read the supervisor's current authoritative state. */
+export const atlasRunSnapshot = (
+  input: AtlasRunAuthorityInput,
+): Effect.Effect<AtlasRunSnapshot, AtlasClientError, HttpClient.HttpClient> => {
+  const url = `${normalizeBaseUrl(input.baseUrl)}/console/v1/threads/${encodeURIComponent(input.threadId)}`;
+  return authorityRequest(input, "run snapshot", HttpClientRequest.get(url)).pipe(
+    Effect.flatMap(decodeRunSnapshot),
+    Effect.map((response) => response.run),
+    Effect.mapError((cause) =>
+      cause instanceof AtlasClientError
+        ? cause
+        : new AtlasClientError({
+            baseUrl: input.baseUrl,
+            operation: "run snapshot",
+            detail: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+    ),
+  );
+};
+
+/** Replay ordered authoritative lifecycle events after a supervisor cursor. */
+export const atlasRunEvents = (
+  input: AtlasRunAuthorityInput & { readonly epoch?: number; readonly after?: number },
+): Effect.Effect<
+  ReadonlyArray<AtlasRunLifecycleEvent>,
+  AtlasClientError,
+  HttpClient.HttpClient
+> => {
+  const params = new URLSearchParams();
+  if (input.epoch !== undefined) params.set("epoch", String(input.epoch));
+  if (input.after !== undefined) params.set("after", String(input.after));
+  const query = params.size === 0 ? "" : `?${params.toString()}`;
+  const url = `${normalizeBaseUrl(input.baseUrl)}/console/v1/threads/${encodeURIComponent(input.threadId)}/events${query}`;
+  return authorityRequest(input, "run events", HttpClientRequest.get(url)).pipe(
+    Effect.flatMap(decodeRunEvents),
+    Effect.map((response) => response.events),
+    Effect.mapError((cause) =>
+      cause instanceof AtlasClientError
+        ? cause
+        : new AtlasClientError({
+            baseUrl: input.baseUrl,
+            operation: "run events",
+            detail: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+    ),
+  );
+};
+
+export type AtlasRunCommand =
+  | {
+      readonly kind: "start";
+      readonly text: string;
+      readonly limits: {
+        readonly max_turn_requests?: number | null;
+        readonly max_tokens?: number | null;
+        readonly session_budget_id?: string | null;
+        readonly max_tool_calls?: number | null;
+        readonly max_wall_time_ms?: number | null;
+      };
+    }
+  | { readonly kind: "cancel" }
+  | {
+      readonly kind: "resolve_input";
+      readonly request_ref: string;
+      readonly answer: unknown;
+    };
+
+export interface AtlasRunCommandInput extends AtlasRunAuthorityInput {
+  readonly fleetId: string;
+  readonly runId: string;
+  readonly requestId: string;
+  readonly actor?: string;
+  readonly expectedLeaseGeneration?: number | null;
+  readonly command: AtlasRunCommand;
+}
+
+/** Durably propose an idempotent command to the Atlas supervisor. */
+export const atlasRunCommand = (
+  input: AtlasRunCommandInput,
+): Effect.Effect<AtlasRunSnapshot, AtlasClientError, HttpClient.HttpClient> => {
+  const url = `${normalizeBaseUrl(input.baseUrl)}/console/v1/threads/${encodeURIComponent(input.threadId)}/commands`;
+  const request = HttpClientRequest.post(url, {
+    body: HttpBody.jsonUnsafe({
+      protocol_version: 1,
+      fleet_id: input.fleetId,
+      thread_id: input.threadId,
+      run_id: input.runId,
+      request_id: input.requestId,
+      actor: input.actor ?? "t3-code",
+      expected_lease_generation: input.expectedLeaseGeneration ?? null,
+      command: input.command,
+    }),
+  });
+  return authorityRequest(input, "run command", request).pipe(
+    Effect.flatMap(decodeRunSnapshot),
+    Effect.map((response) => response.run),
+    Effect.mapError((cause) =>
+      cause instanceof AtlasClientError
+        ? cause
+        : new AtlasClientError({
+            baseUrl: input.baseUrl,
+            operation: "run command",
+            detail: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+    ),
+  );
+};
+
+/** A feed connection is the authenticated execution boundary, unlike `/_members`. */
+export interface AtlasFeedReadinessInput {
+  readonly baseUrl: string;
+  readonly plugin: string;
+  readonly token: string;
+}
+
+const FEED_READINESS_RUN_ID = "t3-readiness";
+const FEED_READINESS_TIMEOUT_MS = 5_000;
+
+const feedErrorDetail = (data: unknown): string | undefined => {
+  if (typeof data !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(data) as { readonly class?: unknown; readonly error?: unknown };
+    const error = typeof parsed.error === "string" ? parsed.error.trim() : "";
+    const errorClass = typeof parsed.class === "string" ? parsed.class.trim() : "";
+    if (error === "") return undefined;
+    return errorClass === "" ? error : `${errorClass}: ${error}`;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Prove that the credential can establish the same authenticated feed required
+ * to execute a turn. A successful `/_members` response is discovery only.
+ *
+ * The feed is read-only until a console command is sent, so opening and
+ * immediately closing this synthetic run subscription has no execution side
+ * effects and does not create an Atlas run.
+ */
+export const atlasFeedReadiness = (
+  input: AtlasFeedReadinessInput,
+): Effect.Effect<void, AtlasClientError> =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let socket: WebSocket | undefined;
+        const finish = (outcome: "ready" | "error", detail?: string) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          if (outcome === "ready") {
+            // Do not leave an idle readiness subscriber attached to a durable run.
+            socket?.close();
+            resolve();
+          } else {
+            reject(new Error(detail ?? "feed did not complete its authenticated handshake"));
+          }
+        };
+        const timeout = setTimeout(
+          () => finish("error", `feed handshake timed out after ${FEED_READINESS_TIMEOUT_MS}ms`),
+          FEED_READINESS_TIMEOUT_MS,
+        );
+
+        try {
+          socket = new WebSocket(
+            atlasFeedUrl({
+              baseUrl: input.baseUrl,
+              runId: FEED_READINESS_RUN_ID,
+              plugin: input.plugin,
+              token: input.token,
+            }),
+          );
+          // TCP/WebSocket open only proves reachability. Atlas authenticates inside
+          // the upgraded connection and may reject it with an error frame
+          // immediately afterwards. The first authenticated heartbeat is the
+          // readiness acknowledgement.
+          socket.onopen = () => {};
+          socket.onmessage = (event) => {
+            const detail = feedErrorDetail(event.data);
+            if (detail !== undefined) {
+              finish("error", detail);
+              return;
+            }
+            if (typeof event.data !== "string") return;
+            try {
+              const frame = JSON.parse(event.data) as { readonly kind?: unknown };
+              if (frame.kind === "hb") finish("ready");
+            } catch {
+              // Ignore unrelated/non-JSON frames until authenticated readiness or
+              // the bounded timeout. A readiness probe never sends a command.
+            }
+          };
+          socket.onerror = () => finish("error", "feed handshake failed");
+          socket.onclose = (event) =>
+            finish("error", event.reason || `feed closed with code ${event.code}`);
+        } catch (cause) {
+          finish("error", cause instanceof Error ? cause.message : String(cause));
+        }
+      }),
+    catch: (cause) =>
+      new AtlasClientError({
+        baseUrl: input.baseUrl,
+        operation: "feed readiness",
+        detail: cause instanceof Error ? cause.message : String(cause),
+        cause,
+      }),
+  });

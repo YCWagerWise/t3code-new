@@ -380,8 +380,8 @@ export const AtlasSettings = makeProviderSettingsSchema(
       }),
     ),
     // The node's `ATLAS_WS_TOKEN`. The live event feed is gated by a shared bearer
-    // token and fails CLOSED, so an instance without this gets provider health and
-    // models (plain HTTP) but no streaming turns.
+    // token and fails CLOSED. An absent credential is setup-required; discovery
+    // alone must never make the provider look ready to run turns.
     wsToken: Schema.String.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
