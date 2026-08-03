@@ -22,6 +22,7 @@ import {
   Wakeups,
 } from "@t3tools/client-runtime/connection";
 import { bootstrapRemoteBearerSession } from "@t3tools/client-runtime/authorization";
+import { atlasDevToken, atlasTransportEnabled } from "@t3tools/client-runtime/rpc";
 import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/environment";
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
@@ -207,14 +208,20 @@ const capabilitiesLayer = Layer.effectContext(
       deviceId: Effect.succeed(Option.none()),
     });
     const primaryAuth = PrimaryEnvironmentAuth.of({
-      bearerToken: Effect.tryPromise({
-        try: readDesktopPrimaryBearerToken,
-        catch: (cause) =>
-          new ConnectionTransientError({
-            reason: "remote-unavailable",
-            detail: `Could not load the desktop primary credential: ${String(cause)}`,
-          }),
-      }).pipe(Effect.map(Option.fromNullishOr)),
+      // An Atlas primary environment carries its own credential: the desktop bridge that
+      // normally supplies this does not exist in a browser, so without it the node refuses
+      // every call. Same flag as the transport choice — they cannot disagree.
+      bearerToken:
+        atlasTransportEnabled() && atlasDevToken() !== null
+          ? Effect.succeed(Option.fromNullishOr(atlasDevToken()))
+          : Effect.tryPromise({
+              try: readDesktopPrimaryBearerToken,
+              catch: (cause) =>
+                new ConnectionTransientError({
+                  reason: "remote-unavailable",
+                  detail: `Could not load the desktop primary credential: ${String(cause)}`,
+                }),
+            }).pipe(Effect.map(Option.fromNullishOr)),
     });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {

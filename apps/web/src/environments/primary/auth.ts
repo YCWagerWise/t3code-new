@@ -7,6 +7,7 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
+import { atlasDevToken, atlasTransportEnabled } from "@t3tools/client-runtime/rpc";
 import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -186,7 +187,33 @@ function getDesktopBootstrapCredential(): string | null {
     : null;
 }
 
+/**
+ * An Atlas primary environment answers its own auth question (doc 15 §3.2).
+ *
+ * T3's browser bootstrap fetches `/api/auth/session` to learn the server's auth posture
+ * before any transport exists. Atlas does not serve that path (404) and does not need to:
+ * its posture is fixed — a bearer credential carried on HTTP and on the feed query, with
+ * the real authorization decided by the node on `/console/v1/handshake`. Asking a T3
+ * question of a non-T3 backend and calling the 404 a failure is the shim; stating the
+ * known posture is the substrate.
+ */
+function atlasSessionState(): AuthSessionState {
+  return {
+    authenticated: atlasDevToken() !== null,
+    auth: {
+      policy: "remote-reachable",
+      bootstrapMethods: [],
+      sessionMethods: ["bearer-access-token"],
+      sessionCookieName: "atlas-session",
+    },
+    sessionMethod: "bearer-access-token",
+  } as unknown as AuthSessionState;
+}
+
 export async function fetchSessionState(): Promise<AuthSessionState> {
+  if (atlasTransportEnabled()) {
+    return atlasSessionState();
+  }
   return retryTransientBootstrap(async () => {
     try {
       return await runPrimaryHttp(
