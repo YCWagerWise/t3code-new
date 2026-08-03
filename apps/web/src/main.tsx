@@ -11,6 +11,11 @@ import "@fontsource/jetbrains-mono/500.css";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 
+// The bundle stamp (see vite.config.ts): stale tabs must be diagnosable in one glance.
+// eslint-disable-next-line no-console
+console.info(`[t3] bundle built ${__BUILD_STAMP__}`);
+document.documentElement.dataset.buildStamp = __BUILD_STAMP__;
+
 import { isElectron } from "./env";
 import { ManagedRelayAuthProvider } from "./cloud/managedAuth";
 import { hasCloudPublicConfig } from "./cloud/publicConfig";

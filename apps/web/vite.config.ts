@@ -90,6 +90,13 @@ const devProxyTarget = resolveDevProxyTarget(configuredWsUrl);
 
 export default defineConfig(() => {
   return {
+    // The bundle stamp: three stale-tab incidents in one live session (2026-08-03) were
+    // each mistaken for code bugs because nothing distinguishes an old bundle from a new
+    // one. Stamped at config-load, surfaced at boot (main.tsx) — "is this tab current"
+    // becomes one glance at the console or `document.documentElement.dataset.buildStamp`.
+    define: {
+      __BUILD_STAMP__: JSON.stringify(new Date().toISOString()),
+    },
     plugins: [
       tanstackRouter(),
       react(),

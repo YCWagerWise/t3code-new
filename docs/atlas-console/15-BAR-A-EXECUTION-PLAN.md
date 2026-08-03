@@ -113,6 +113,15 @@ every one a T3-server assumption in the boot path, or an Atlas surface a browser
 6. `/_members` on a solo node (12b item 2, both halves) — mount + derive self_url
 7. `providers: []` — the picker reads the node manifest
 
+**Ledger status (2026-08-03, second pass — "fix it all"):** duplication/pending-send
+correlation FIXED (601fd57f, mutation-pinned) · bootstrap→workspace binding FIXED
+(64f7418 + client, flow 12 proves the file lands in the project) · refusal reasons SPLIT
+node-side with probe-safety asymmetry (f08e5e3/e4c7a83) and relayed verbatim by the lens
+(a0f5f107) · silent provider-unavailable send now toasts (7e264f47, B1b) ·
+ATLAS_BROWSE_SCOPE=all for whole-machine browsing · bundle stamp at boot (stale tabs
+diagnosable). REMAINING before G1 declared: B1c Playwright boundary spec (the five
+first-send cases) + the in-UI walkthrough of flows 3/5/6.
+
 **Open gap recorded, not shimmed:** `RunCommand::Start` carries no `model` field, so a
 per-thread model choice has no wire home. `thread.meta.update` is accepted lens-locally
 (title + model preference are presentation state Atlas does not own yet); the node runs its

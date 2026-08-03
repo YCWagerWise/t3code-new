@@ -26,3 +26,6 @@ declare global {
     desktopBridge?: DesktopBridge;
   }
 }
+
+/** Injected by vite.config.ts `define` — the bundle's build time, for stale-tab diagnosis. */
+declare const __BUILD_STAMP__: string;
