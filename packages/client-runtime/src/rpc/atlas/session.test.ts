@@ -93,12 +93,24 @@ it.effect("dispatchCommand refuses non-M1 command types typed — without any ne
       const dispatch = client[ORCHESTRATION_WS_METHODS.dispatchCommand] as (
         input: unknown,
       ) => Effect.Effect<never, EnvironmentRpcUnavailableError>;
-      // thread.create is projection/catalog territory (slice 3+); the refusal must come
-      // before any handshake or socket — the throwing constructor above enforces that.
+      // Checkpoint revert asks the node to mutate a worktree — genuinely unsupported in
+      // M1; the refusal must come before any handshake or socket (the throwing
+      // constructor above enforces that).
       const failure = yield* Effect.orDie(
-        Effect.flip(dispatch({ type: "thread.create", commandId: "cmd-1", threadId: "t-1" })),
+        Effect.flip(
+          dispatch({ type: "thread.checkpoint.revert", commandId: "cmd-1", threadId: "t-1" }),
+        ),
       );
       assert.instanceOf(failure, EnvironmentRpcUnavailableError);
+      // thread.create succeeds LOCALLY — an Atlas thread is its feed, created lazily on
+      // first subscribe, so create asks nothing of the node and needs no network either.
+      const created = yield* Effect.orDie(
+        dispatch({ type: "thread.create", commandId: "cmd-2", threadId: "t-2" }) as Effect.Effect<
+          { sequence: number },
+          never
+        >,
+      );
+      assert.isAtLeast(created.sequence, 1);
     }),
   ),
 );

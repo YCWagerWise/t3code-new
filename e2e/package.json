@@ -1,0 +1,14 @@
+{
+  "name": "@t3tools/e2e",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "e2e": "playwright test",
+    "e2e:boundary": "playwright test tests/boundary.spec.ts",
+    "e2e:conversation": "playwright test tests/conversation.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.59.0"
+  }
+}

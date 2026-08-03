@@ -41,6 +41,17 @@ import {
 import { RpcSessionFactory, type RpcSession } from "../session.ts";
 import type { WsRpcProtocolClient } from "../protocol.ts";
 
+const LENS_LOCAL_COMMANDS: ReadonlySet<string> = new Set([
+  "thread.create",
+  "thread.meta.update",
+  "thread.archive",
+  "thread.unarchive",
+  "thread.settle",
+  "thread.unsettle",
+  "thread.snooze",
+  "thread.unsnooze",
+]);
+
 const READINESS_RUN_ID = "t3-readiness";
 const READINESS_TIMEOUT_MILLIS = 5_000;
 
@@ -161,7 +172,13 @@ export const make = Effect.gen(function* () {
       // not papered over — the node runs its manifest default until Start grows one).
       // Accepting it lens-locally is not an empty-success shim: nothing was asked of the
       // node, so nothing is being falsely reported as done.
-      if (input.type === "thread.meta.update") {
+      // Presentation-state commands (archive/settle/snooze/meta) never reach the node —
+      // nothing is asked of it, so a local receipt reports nothing falsely. And
+      // `thread.create` is TRUE by construction, not a shim: an Atlas thread is its feed,
+      // and the feed isolate is created lazily on first subscribe — the first Start makes
+      // it real, the catalog poll picks it up after its first turn. Refusing create was
+      // the actual lie: it told the user Atlas cannot do something it does implicitly.
+      if (LENS_LOCAL_COMMANDS.has(input.type)) {
         localSequence += 1;
         return { sequence: localSequence };
       }
