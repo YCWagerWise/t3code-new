@@ -8,6 +8,7 @@
  */
 import { expect, test } from "@playwright/test";
 import { DEV_TOKEN, NODE_BASE, WEB_BASE } from "../rig/rig.ts";
+import { openConnectedApp } from "../rig/ui.ts";
 
 test.describe("CORS — blocker 5", () => {
   test("preflight from the lens origin is answered 204 and echoes the asked-for headers", async ({
@@ -65,5 +66,41 @@ test.describe("solo node self-description — blockers 4, 6, 7", () => {
     // The picker reads execution.default_model from this manifest (blocker 7):
     // an empty manifest means "No provider available" in the composer.
     expect(self).toContain("default_model");
+  });
+});
+
+test.describe("auth posture in the browser — blockers 1, 2, 3", () => {
+  test("no token: the app answers setup-required as the pairing gate", async ({ page }) => {
+    // No __ATLAS_TOKEN__ injected and the rig's Vite bakes none in.
+    await page.goto("/");
+    await expect(page).toHaveURL(/\/pair$/, { timeout: 20_000 });
+    await expect(page.getByRole("heading", { name: "Pair with this environment" })).toBeVisible();
+  });
+
+  test("wrong token: the node refuses and the lens reports it honestly", async ({ page }) => {
+    // A non-empty token passes the local gate (the credential IS the
+    // authorization — blocker 1); the refusal must come from the NODE.
+    await page.addInitScript(() => {
+      (globalThis as { __ATLAS_TOKEN__?: string }).__ATLAS_TOKEN__ = "wrong-token";
+    });
+    await page.goto("/");
+    await expect(page.getByRole("button", { name: "Environment disconnected" })).toBeVisible({
+      timeout: 45_000,
+    });
+  });
+
+  test("dev token: connected — composer ready, no provider gap", async ({ page }) => {
+    await openConnectedApp(page);
+    await expect(page.locator('[data-chat-provider-unavailable="true"]')).toHaveCount(0);
+  });
+});
+
+test.describe("model picker reads the node manifest — blocker 7", () => {
+  test("the picker offers exactly the node's advertised model", async ({ page }) => {
+    await openConnectedApp(page);
+    await page.locator('[data-chat-provider-model-picker="true"]').click();
+    await expect(page.locator('[data-model-picker-content="true"]')).toBeVisible();
+    // The rig node advertises ATLAS_MODEL=claude-opus-4-8 via /_members.
+    await expect(page.getByRole("option", { name: /claude-opus-4-8/ }).first()).toBeVisible();
   });
 });

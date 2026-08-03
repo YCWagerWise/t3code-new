@@ -81,6 +81,29 @@ export default async function globalSetup(): Promise<void> {
     30_000,
   );
 
+  // The lens's project list is the node's /_workspaces catalog; a fresh node
+  // has none and the app would sit on the no-projects hero. Seed one repo.
+  const repoDir = path.join(workspaceRoot, "repo");
+  fs.mkdirSync(repoDir, { recursive: true });
+  fs.writeFileSync(path.join(repoDir, "README.md"), "# e2e rig\n");
+  const git = (...args: string[]) =>
+    execFileSync(
+      "git",
+      ["-C", repoDir, "-c", "user.name=e2e-rig", "-c", "user.email=e2e@rig.local", ...args],
+      { stdio: "pipe" },
+    );
+  git("init", "-b", "main");
+  git("add", ".");
+  git("commit", "-m", "rig seed", "--no-gpg-sign");
+  const registered = await fetch(`${NODE_BASE}/_workspaces`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${DEV_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: repoDir }),
+  });
+  if (!registered.ok) {
+    throw new Error(`workspace registration failed: ${registered.status}`);
+  }
+
   const viteLog = openLog("vite.log");
   const vite = spawn("npx", ["vite", "--port", String(WEB_PORT), "--strictPort"], {
     cwd: WEB_APP_DIR,

@@ -63,7 +63,7 @@
         {
           "title": "CORS — blocker 5",
           "file": "boundary.spec.ts",
-          "line": 12,
+          "line": 13,
           "column": 6,
           "specs": [
             {
@@ -87,7 +87,7 @@
                       "stdout": [],
                       "stderr": [],
                       "retry": 0,
-                      "startTime": "2026-08-03T13:49:10.431Z",
+                      "startTime": "2026-08-03T13:55:10.386Z",
                       "annotations": [],
                       "attachments": []
                     }
@@ -97,7 +97,7 @@
               ],
               "id": "27c88724c5d7e5a2516e-f9126212462a5503bc05",
               "file": "boundary.spec.ts",
-              "line": 13,
+              "line": 14,
               "column": 3
             },
             {
@@ -116,12 +116,12 @@
                       "workerIndex": 0,
                       "parallelIndex": 0,
                       "status": "passed",
-                      "duration": 4,
+                      "duration": 5,
                       "errors": [],
                       "stdout": [],
                       "stderr": [],
                       "retry": 0,
-                      "startTime": "2026-08-03T13:49:10.464Z",
+                      "startTime": "2026-08-03T13:55:10.419Z",
                       "annotations": [],
                       "attachments": []
                     }
@@ -131,7 +131,7 @@
               ],
               "id": "27c88724c5d7e5a2516e-9f0fcdd1f4fafead0f74",
               "file": "boundary.spec.ts",
-              "line": 33,
+              "line": 34,
               "column": 3
             },
             {
@@ -155,7 +155,7 @@
                       "stdout": [],
                       "stderr": [],
                       "retry": 0,
-                      "startTime": "2026-08-03T13:49:10.473Z",
+                      "startTime": "2026-08-03T13:55:10.430Z",
                       "annotations": [],
                       "attachments": []
                     }
@@ -165,7 +165,7 @@
               ],
               "id": "27c88724c5d7e5a2516e-c78e4c035ef9357ba3f6",
               "file": "boundary.spec.ts",
-              "line": 45,
+              "line": 46,
               "column": 3
             }
           ]
@@ -173,7 +173,7 @@
         {
           "title": "solo node self-description — blockers 4, 6, 7",
           "file": "boundary.spec.ts",
-          "line": 53,
+          "line": 54,
           "column": 6,
           "specs": [
             {
@@ -192,12 +192,12 @@
                       "workerIndex": 0,
                       "parallelIndex": 0,
                       "status": "passed",
-                      "duration": 6,
+                      "duration": 7,
                       "errors": [],
                       "stdout": [],
                       "stderr": [],
                       "retry": 0,
-                      "startTime": "2026-08-03T13:49:10.481Z",
+                      "startTime": "2026-08-03T13:55:10.438Z",
                       "annotations": [],
                       "attachments": []
                     }
@@ -207,7 +207,197 @@
               ],
               "id": "27c88724c5d7e5a2516e-d8013b4a4fc988636f08",
               "file": "boundary.spec.ts",
-              "line": 54,
+              "line": 55,
+              "column": 3
+            }
+          ]
+        },
+        {
+          "title": "auth posture in the browser — blockers 1, 2, 3",
+          "file": "boundary.spec.ts",
+          "line": 72,
+          "column": 6,
+          "specs": [
+            {
+              "title": "no token: the app answers setup-required as the pairing gate",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 180000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "",
+                  "projectName": "",
+                  "results": [
+                    {
+                      "workerIndex": 0,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 6972,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-08-03T13:55:10.449Z",
+                      "annotations": [],
+                      "attachments": []
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "27c88724c5d7e5a2516e-0af4eccc98e246f2c18d",
+              "file": "boundary.spec.ts",
+              "line": 73,
+              "column": 3
+            },
+            {
+              "title": "wrong token: the node refuses and the lens reports it honestly",
+              "ok": false,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 180000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "",
+                  "projectName": "",
+                  "results": [
+                    {
+                      "workerIndex": 0,
+                      "parallelIndex": 0,
+                      "status": "failed",
+                      "duration": 46041,
+                      "error": {
+                        "message": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('button', { name: 'Environment disconnected' })\nExpected: visible\nTimeout: 45000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 45000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('button', { name: 'Environment disconnected' })\u001b[22m\n",
+                        "stack": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('button', { name: 'Environment disconnected' })\nExpected: visible\nTimeout: 45000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 45000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('button', { name: 'Environment disconnected' })\u001b[22m\n\n    at /Users/sopuluaninweze/atlas/git-forks/t3code/e2e/tests/boundary.spec.ts:89:82",
+                        "location": {
+                          "file": "/Users/sopuluaninweze/atlas/git-forks/t3code/e2e/tests/boundary.spec.ts",
+                          "column": 82,
+                          "line": 89
+                        },
+                        "snippet": "  87 |     });\n  88 |     await page.goto(\"/\");\n> 89 |     await expect(page.getByRole(\"button\", { name: \"Environment disconnected\" })).toBeVisible({\n     |                                                                                  ^\n  90 |       timeout: 45_000,\n  91 |     });\n  92 |   });"
+                      },
+                      "errors": [
+                        {
+                          "location": {
+                            "file": "/Users/sopuluaninweze/atlas/git-forks/t3code/e2e/tests/boundary.spec.ts",
+                            "column": 82,
+                            "line": 89
+                          },
+                          "message": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mlocator\u001b[39m\u001b[2m).\u001b[22mtoBeVisible\u001b[2m(\u001b[22m\u001b[2m)\u001b[22m failed\n\nLocator: getByRole('button', { name: 'Environment disconnected' })\nExpected: visible\nTimeout: 45000ms\nError: element(s) not found\n\nCall log:\n\u001b[2m  - Expect \"toBeVisible\" with timeout 45000ms\u001b[22m\n\u001b[2m  - waiting for getByRole('button', { name: 'Environment disconnected' })\u001b[22m\n\n\n  87 |     });\n  88 |     await page.goto(\"/\");\n> 89 |     await expect(page.getByRole(\"button\", { name: \"Environment disconnected\" })).toBeVisible({\n     |                                                                                  ^\n  90 |       timeout: 45_000,\n  91 |     });\n  92 |   });\n    at /Users/sopuluaninweze/atlas/git-forks/t3code/e2e/tests/boundary.spec.ts:89:82"
+                        },
+                        {
+                          "message": "\u001b[31mTest timeout of 180000ms exceeded.\u001b[39m"
+                        }
+                      ],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-08-03T13:55:20.697Z",
+                      "annotations": [],
+                      "attachments": [
+                        {
+                          "name": "screenshot",
+                          "contentType": "image/png",
+                          "path": "/Users/sopuluaninweze/atlas/git-forks/t3code/e2e/test-results/boundary-auth-posture-in-t-be609-he-lens-reports-it-honestly/test-failed-1.png"
+                        },
+                        {
+                          "name": "error-context",
+                          "contentType": "text/markdown",
+                          "path": "/Users/sopuluaninweze/atlas/git-forks/t3code/e2e/test-results/boundary-auth-posture-in-t-be609-he-lens-reports-it-honestly/error-context.md"
+                        }
+                      ],
+                      "errorLocation": {
+                        "file": "/Users/sopuluaninweze/atlas/git-forks/t3code/e2e/tests/boundary.spec.ts",
+                        "column": 82,
+                        "line": 89
+                      }
+                    }
+                  ],
+                  "status": "unexpected"
+                }
+              ],
+              "id": "27c88724c5d7e5a2516e-4a65276109deb45bf5cd",
+              "file": "boundary.spec.ts",
+              "line": 82,
+              "column": 3
+            },
+            {
+              "title": "dev token: connected — composer ready, no provider gap",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 180000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "",
+                  "projectName": "",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 1687,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-08-03T13:59:07.085Z",
+                      "annotations": [],
+                      "attachments": []
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "27c88724c5d7e5a2516e-8e83f33b2aa4711e79c0",
+              "file": "boundary.spec.ts",
+              "line": 94,
+              "column": 3
+            }
+          ]
+        },
+        {
+          "title": "model picker reads the node manifest — blocker 7",
+          "file": "boundary.spec.ts",
+          "line": 100,
+          "column": 6,
+          "specs": [
+            {
+              "title": "the picker offers exactly the node's advertised model",
+              "ok": true,
+              "tags": [],
+              "tests": [
+                {
+                  "timeout": 180000,
+                  "annotations": [],
+                  "expectedStatus": "passed",
+                  "projectId": "",
+                  "projectName": "",
+                  "results": [
+                    {
+                      "workerIndex": 1,
+                      "parallelIndex": 0,
+                      "status": "passed",
+                      "duration": 1702,
+                      "errors": [],
+                      "stdout": [],
+                      "stderr": [],
+                      "retry": 0,
+                      "startTime": "2026-08-03T13:59:09.014Z",
+                      "annotations": [],
+                      "attachments": []
+                    }
+                  ],
+                  "status": "expected"
+                }
+              ],
+              "id": "27c88724c5d7e5a2516e-71745901a420ab0c7e9f",
+              "file": "boundary.spec.ts",
+              "line": 101,
               "column": 3
             }
           ]
@@ -217,11 +407,11 @@
   ],
   "errors": [],
   "stats": {
-    "startTime": "2026-08-03T13:49:07.846Z",
-    "duration": 3660.478,
-    "expected": 4,
+    "startTime": "2026-08-03T13:55:07.587Z",
+    "duration": 244189.125,
+    "expected": 7,
     "skipped": 0,
-    "unexpected": 0,
+    "unexpected": 1,
     "flaky": 0
   }
 }

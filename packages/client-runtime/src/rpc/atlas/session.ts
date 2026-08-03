@@ -189,7 +189,20 @@ export const make = Effect.gen(function* () {
       // ws-* id — the node, not the lens, is the authority on project identity.
       if (input.type === "project.create") {
         const root = (input as { workspaceRoot?: string }).workspaceRoot ?? "";
-        yield* atlasHttp.registerWorkspace(target, root).pipe(Effect.provide(httpLayer));
+        yield* atlasHttp.registerWorkspace(target, root).pipe(
+          Effect.provide(httpLayer),
+          // The node's 403 is deliberately undifferentiated (path-probing learns
+          // nothing), but the LENS knows what a 403 on this route means and owes the
+          // user the reason — "HTTP 403" cost real debugging time on 2026-08-03.
+          Effect.mapError((error) =>
+            error.status === 403
+              ? new EnvironmentRpcUnavailableError({
+                  environmentId: connection.environmentId,
+                  message: `"${root}" is outside this node's allowed workspace roots — projects must live under a directory the node was configured to serve.`,
+                })
+              : error,
+          ),
+        );
         localSequence += 1;
         return { sequence: localSequence };
       }
