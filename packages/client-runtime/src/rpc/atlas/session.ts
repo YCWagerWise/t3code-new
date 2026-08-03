@@ -20,6 +20,7 @@ import {
   WS_METHODS,
 } from "@t3tools/contracts";
 import type { CommandEnvelope } from "@t3tools/contracts/atlas";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -28,6 +29,7 @@ import { FetchHttpClient } from "effect/unstable/http";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import * as atlasHttp from "./http.ts";
+import { mapCatalog, openShellStream } from "./shellStream.ts";
 import { openThreadStream } from "./threadStream.ts";
 import { openThreadFeed, ThreadFeedAuthError } from "./threadFeed.ts";
 import { EnvironmentRpcUnavailableError } from "../client.ts";
@@ -223,6 +225,21 @@ export const make = Effect.gen(function* () {
           threadId: input.threadId,
           runId: runIdForThread(input.threadId),
         }).pipe(Stream.provide(socketLayer)),
+      // Honest poll until Atlas grows a catalog stream — the fetch is the injected
+      // substrate, so only it changes when that lands.
+      [ORCHESTRATION_WS_METHODS.subscribeShell]: () =>
+        openShellStream({
+          fetchCatalog: Effect.zip(
+            atlasHttp.listWorkspaces(target),
+            atlasHttp.listThreads(target),
+          ).pipe(
+            Effect.map(([workspaces, threads]) => mapCatalog(workspaces, threads)),
+            Effect.orElseSucceed(() => ({ projects: [], threads: [] })),
+            Effect.provide(httpLayer),
+          ),
+          intervalMillis: 15_000,
+          nowMillis: Clock.currentTimeMillis,
+        }),
       [ORCHESTRATION_WS_METHODS.dispatchCommand]: dispatch,
       [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: fullThreadDiff,
     };

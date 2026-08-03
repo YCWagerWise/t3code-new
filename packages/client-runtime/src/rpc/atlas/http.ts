@@ -247,3 +247,15 @@ export const postCommand = Effect.fn("atlasHttp.postCommand")(function* (
 export const members = Effect.fn("atlasHttp.members")(function* (target: AtlasHttpTarget) {
   return yield* request(target, "members", "/_members");
 });
+
+/** `GET /_workspaces` — the node's project catalog (raw rows; shellStream maps them). */
+export const listWorkspaces = Effect.fn("atlasHttp.listWorkspaces")(function* (
+  target: AtlasHttpTarget,
+) {
+  return yield* request(target, "listWorkspaces", "/_workspaces");
+});
+
+/** `GET /_threads` — the node's thread index (raw rows; shellStream maps them). */
+export const listThreads = Effect.fn("atlasHttp.listThreads")(function* (target: AtlasHttpTarget) {
+  return yield* request(target, "listThreads", "/_threads");
+});

@@ -39,7 +39,7 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
       reload-resume.
       _Verify:_ unit — fake socket: subscribe → snapshot+events match fixture; reconnect
       mid-stream → no duplicate sequence.
-- [ ] **2.4 Un-gate `subscribeShell`:** poll `/_runs` + `/_workspaces` (15s + wakeup),
+- [x] **2.4 Un-gate `subscribeShell`:** poll `/_runs` + `/_workspaces` (15s + wakeup),
       diff successive polls into upsert/remove events.
       _Verify:_ unit with stubbed HTTP: first poll → snapshot; changed poll → upserts.
 - [ ] **2.5 Un-gate `getTurnDiff` + `replayEvents`:** turn→checkpoint join from projection
