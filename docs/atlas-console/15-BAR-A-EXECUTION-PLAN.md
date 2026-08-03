@@ -119,6 +119,11 @@ per-thread model choice has no wire home. `thread.meta.update` is accepted lens-
 manifest default. Closing this means adding an optional `model` to Start — additive, small,
 and it belongs with the thread-catalog work (M2), not M1.
 
+**2026-08-03 browser bug hunt:** six confirmed bugs (draft send dead in the browser;
+failed threads wedge forever with the lens showing stale success; CORS layer misses
+unmatched routes; leaked T3-native RPCs; silent input drops) — evidence and repro in
+doc 17. The e2e conversation suite stays red on the draft-send regression by design.
+
 **Open gap (found by the e2e suite, 2026-08-03):** a WRONG token is invisible in the UI.
 The transport is honest — 401/403 maps to `ConnectionBlockedError(permission)` — but the
 index route renders a refused catalog as the "No projects yet" hero, indistinguishable

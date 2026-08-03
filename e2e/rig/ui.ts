@@ -20,12 +20,21 @@ export const openConnectedApp = async (page: Page, token: string = DEV_TOKEN): P
   await expect(page.getByTestId("composer-editor")).toBeVisible({ timeout: 30_000 });
 };
 
-/** Lexical contenteditable composer; plain Enter submits on desktop. */
+/**
+ * Lexical contenteditable composer; plain Enter submits on desktop.
+ *
+ * Enter is a silent no-op until the session is ready (the send button gates on
+ * isConnecting/isSendBusy and nothing is queued — found live 2026-08-03), so
+ * sending waits for the button to be enabled and verifies the composer drained.
+ */
 export const sendPrompt = async (page: Page, text: string): Promise<void> => {
   const composer = page.getByTestId("composer-editor");
   await composer.click();
   await composer.fill(text);
+  const send = page.getByRole("button", { name: "Send message" });
+  await expect(send).toBeEnabled({ timeout: 30_000 });
   await composer.press("Enter");
+  await expect.poll(async () => (await composer.innerText()).trim(), { timeout: 10_000 }).toBe("");
 };
 
 /** Rendered only while session.status === "running" — the streaming signal. */
