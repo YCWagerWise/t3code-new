@@ -57,7 +57,7 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
 
 ## Stage 3 — app wiring + Gate G1
 
-- [ ] **3.1 Layer swap:** provide `atlas/session.layer` in apps/web's environment wiring
+- [x] **3.1 Layer swap:** provide `atlas/session.layer` in apps/web's environment wiring
       (flag-gated: env var or settings toggle so the old path stays one flip away).
       _Verify:_ typecheck + app boots against a dead node → honest `setup-required`.
 - [ ] **3.2 G1 demo (the gate):** dev node + `pnpm dev:web`; in ChatView: prompt → ack →
