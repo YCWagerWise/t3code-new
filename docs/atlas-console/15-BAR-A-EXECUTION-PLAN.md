@@ -99,6 +99,26 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
 - [ ] **5.5 Bar A declared:** conversation + files + terminal live on Atlas only; update
       docs 12/14/15 statuses; push all branches.
 
+## Gaps found by the G1 live run (2026-08-03)
+
+Seven browser-boundary blockers, none visible to unit or node-side integration tests —
+every one a T3-server assumption in the boot path, or an Atlas surface a browser needs:
+
+1. ticket exchange (`/api/auth/websocket-ticket`) — the credential IS the authorization
+2. no browser credential — desktop bridge absent on web → `atlasDevToken()`
+3. `/api/auth/session` 404 — Atlas's posture is known, not fetched
+4. `/api/environment` 404 — the node describes itself
+5. **CORS** — no headers at all, preflight 405; then a fixed header allow-list refused
+   Effect's `traceparent` while letting curl through
+6. `/_members` on a solo node (12b item 2, both halves) — mount + derive self_url
+7. `providers: []` — the picker reads the node manifest
+
+**Open gap recorded, not shimmed:** `RunCommand::Start` carries no `model` field, so a
+per-thread model choice has no wire home. `thread.meta.update` is accepted lens-locally
+(title + model preference are presentation state Atlas does not own yet); the node runs its
+manifest default. Closing this means adding an optional `model` to Start — additive, small,
+and it belongs with the thread-catalog work (M2), not M1.
+
 ## Standing rules
 
 Every step: commit before mutation-testing; live-drive before "done"; fix stale docs

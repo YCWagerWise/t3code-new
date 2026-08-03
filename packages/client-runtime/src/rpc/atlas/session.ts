@@ -141,6 +141,10 @@ export const make = Effect.gen(function* () {
       }),
     );
 
+    // Lens-local commands get their own receipt counter: they never reach the node, so
+    // they cannot borrow a node sequence.
+    let localSequence = 0;
+
     const dispatch = Effect.fnUntraced(function* (input: {
       readonly type: string;
       readonly commandId: string;
@@ -151,6 +155,16 @@ export const make = Effect.gen(function* () {
       readonly answers?: unknown;
     }) {
       const threadId = input.threadId ?? "";
+      // Thread META — title and model preference — is PRESENTATION state that Atlas does
+      // not own yet: it has no thread catalog with titles, and `RunCommand::Start` carries
+      // no model field, so a per-thread model choice has no wire home (recorded as a gap,
+      // not papered over — the node runs its manifest default until Start grows one).
+      // Accepting it lens-locally is not an empty-success shim: nothing was asked of the
+      // node, so nothing is being falsely reported as done.
+      if (input.type === "thread.meta.update") {
+        localSequence += 1;
+        return { sequence: localSequence };
+      }
       const command =
         input.type === "thread.turn.start"
           ? { kind: "start" as const, text: input.message?.text ?? "", limits: {} }
