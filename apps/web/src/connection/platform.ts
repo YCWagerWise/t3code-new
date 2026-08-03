@@ -293,6 +293,20 @@ const capabilitiesLayer = Layer.effectContext(
 const loadPrimaryConnectionRegistration = Effect.fn(
   "web.connectionPlatform.loadPrimaryConnectionRegistration",
 )(function* (resolved: PrimaryEnvironmentTarget) {
+  // An Atlas node describes itself through its own handshake, not T3's
+  // `/api/environment` descriptor (404 there). Registering it from what we already
+  // know keeps the node the authority on its identity — the label a user sees is
+  // refined by `serverGetConfig`, which reads the real manifest.
+  if (atlasTransportEnabled()) {
+    return new PrimaryConnectionRegistration({
+      target: new PrimaryConnectionTarget({
+        environmentId: "atlas-primary" as never,
+        label: "Atlas",
+        httpBaseUrl: resolved.target.httpBaseUrl,
+        wsBaseUrl: resolved.target.wsBaseUrl,
+      }),
+    });
+  }
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: resolved.target.httpBaseUrl,
   }).pipe(Effect.provide(primaryEnvironmentHttpLayer), Effect.mapError(mapRemoteEnvironmentError));
