@@ -28,6 +28,7 @@ import { FetchHttpClient } from "effect/unstable/http";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import * as atlasHttp from "./http.ts";
+import { openThreadStream } from "./threadStream.ts";
 import { openThreadFeed, ThreadFeedAuthError } from "./threadFeed.ts";
 import { EnvironmentRpcUnavailableError } from "../client.ts";
 import type { PreparedConnection } from "../../connection/model.ts";
@@ -213,6 +214,15 @@ export const make = Effect.gen(function* () {
       });
     const bound: Record<string, unknown> = {
       [WS_METHODS.serverGetConfig]: () => initialConfig,
+      // ThreadFeed → projection → stream items; threadReducer folds downstream. The
+      // socket layer rides the stream so subscribers need no extra context.
+      [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: { threadId: string }) =>
+        openThreadStream({
+          socketBaseUrl: connection.httpBaseUrl,
+          accessToken: bearerToken ?? "",
+          threadId: input.threadId,
+          runId: runIdForThread(input.threadId),
+        }).pipe(Stream.provide(socketLayer)),
       [ORCHESTRATION_WS_METHODS.dispatchCommand]: dispatch,
       [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: fullThreadDiff,
     };

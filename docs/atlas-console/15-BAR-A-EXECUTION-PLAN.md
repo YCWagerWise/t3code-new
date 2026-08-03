@@ -34,7 +34,7 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
       _Verify:_ unit tests replay the REAL 14-frame fixture → assert the exact
       OrchestrationEvent list (turn started/items/completed); unknown-frame no-op;
       reset → fresh-snapshot marker. Mutation-test the turn-close and tool-pairing arms.
-- [ ] **2.3 Un-gate `subscribeThread`:** ThreadFeed → projection → `OrchestrationThreadStreamItem`
+- [x] **2.3 Un-gate `subscribeThread`:** ThreadFeed → projection → `OrchestrationThreadStreamItem`
       (snapshot → events → synchronized on replay-complete). Epoch rides the snapshot for
       reload-resume.
       _Verify:_ unit — fake socket: subscribe → snapshot+events match fixture; reconnect

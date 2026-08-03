@@ -64,7 +64,7 @@ it.effect("a gated stream tag fails AS A STREAM with the same typed error", () =
     Effect.gen(function* () {
       // A Stream-shaped tag refusing via Effect.fail would defect the caller's pipeline;
       // the refusal must ride the stream's error channel.
-      const method = client[ORCHESTRATION_WS_METHODS.subscribeThread] as () => Stream.Stream<
+      const method = client[WS_METHODS.subscribeTerminalEvents] as () => Stream.Stream<
         never,
         EnvironmentRpcUnavailableError
       >;
