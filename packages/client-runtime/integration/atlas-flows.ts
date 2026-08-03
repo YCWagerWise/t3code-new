@@ -154,6 +154,61 @@ const main = async () => {
       await new Promise((r) => setTimeout(r, 3000));
     }
   });
+  await flow("BOOTSTRAP first-send binds the workspace — file lands IN the project", async () => {
+    const fs = await import("node:fs");
+    const ws = (await fetch("http://127.0.0.1:3199/_workspaces?access_token=dev").then((r) =>
+      r.json(),
+    )) as { workspaces: Array<{ workspace_id: string; root: string; name: string }> };
+    const repo = ws.workspaces.find((w) => w.name === "repo");
+    if (!repo) throw new Error("rig repo workspace missing");
+    const marker = `bootstrap-${Math.floor(Math.random() * 1e6)}.txt`;
+    const bt = `bt-${Math.floor(Math.random() * 1e6)}`;
+    await run(
+      c[ORCHESTRATION_WS_METHODS.dispatchCommand]!({
+        type: "thread.turn.start",
+        commandId: `bs-${Math.random()}`,
+        threadId: bt,
+        message: {
+          messageId: "m1",
+          role: "user",
+          text: `Using run_bash, create a file called ${marker} containing exactly: bound — reply with just: done`,
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: new Date().toISOString(),
+        bootstrap: {
+          createThread: {
+            projectId: repo.workspace_id,
+            title: "t",
+            modelSelection: { instanceId: "atlas", model: "atlas" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: new Date().toISOString(),
+          },
+        },
+      }),
+    );
+    const deadline = Date.now() + 90000;
+    for (;;) {
+      if (fs.existsSync(`${repo.root}/${marker}`)) break;
+      const res = await fetch(
+        `http://127.0.0.1:3199/console/v1/threads/thr-${bt}/feed?after=0&access_token=dev`,
+      );
+      const j = (await res.json()) as {
+        frames: Array<{ kind: string; payload: { state?: string } }>;
+      };
+      const closed = j.frames.some(
+        (f) => f.kind === "turn" && f.payload.state && f.payload.state !== "start",
+      );
+      if (closed && !fs.existsSync(`${repo.root}/${marker}`))
+        throw new Error("turn closed but file NOT in project root");
+      if (Date.now() > deadline) throw new Error("timed out — file never appeared in project");
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  });
   await flow("turn.interrupt on idle thread is a safe no-op or typed", () =>
     run(
       c[ORCHESTRATION_WS_METHODS.dispatchCommand]!({

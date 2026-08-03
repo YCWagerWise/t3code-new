@@ -161,6 +161,7 @@ export const make = Effect.gen(function* () {
       readonly commandId: string;
       readonly threadId?: string;
       readonly message?: { readonly text: string };
+      readonly bootstrap?: { readonly createThread?: { readonly projectId?: string } };
       readonly requestId?: string;
       readonly decision?: unknown;
       readonly answers?: unknown;
@@ -206,9 +207,22 @@ export const make = Effect.gen(function* () {
         localSequence += 1;
         return { sequence: localSequence };
       }
+      // The first send carries its project via bootstrap.createThread; for catalog
+      // projects the lens projectId IS the node's workspace id (ws-*), so the binding
+      // crosses the wire as-is and the node's allow-list has the final word. A non-catalog
+      // id (a draft against a project the node never registered) simply fails to resolve
+      // and the turn REFUSES — wrong-tree-quietly is the outcome this exists to prevent.
+      const workspaceId = input.bootstrap?.createThread?.projectId;
       const command =
         input.type === "thread.turn.start"
-          ? { kind: "start" as const, text: input.message?.text ?? "", limits: {} }
+          ? {
+              kind: "start" as const,
+              text: input.message?.text ?? "",
+              limits: {},
+              ...(typeof workspaceId === "string" && workspaceId.startsWith("ws-")
+                ? { workspace_id: workspaceId }
+                : {}),
+            }
           : input.type === "thread.turn.interrupt"
             ? { kind: "cancel" as const }
             : input.type === "thread.approval.respond"

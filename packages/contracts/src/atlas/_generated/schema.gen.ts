@@ -451,7 +451,12 @@ export type ReplayRequest = { readonly after: EventCursor; readonly run_id: stri
 export const ReplayRequest = Schema.Struct({ after: EventCursor, run_id: Schema.String });
 
 export type RunCommand =
-  | { readonly kind: "start"; readonly limits: ExecutionLimits; readonly text: string }
+  | {
+      readonly kind: "start";
+      readonly limits: ExecutionLimits;
+      readonly text: string;
+      readonly workspace_id?: string | null;
+    }
   | { readonly kind: "cancel" }
   | {
       readonly kind: "retry";
@@ -470,7 +475,20 @@ export type RunCommand =
   | { readonly answer: unknown; readonly kind: "resolve_input"; readonly request_ref: string };
 export const RunCommand = Schema.Union(
   [
-    Schema.Struct({ kind: Schema.Literal("start"), limits: ExecutionLimits, text: Schema.String }),
+    Schema.Struct({
+      kind: Schema.Literal("start"),
+      limits: ExecutionLimits,
+      text: Schema.String,
+      workspace_id: Schema.optionalKey(
+        Schema.Union([
+          Schema.String.annotate({
+            description:
+              "The workspace this turn's shells and checkpoints are rooted in — the catalog id\n(`ws-*`), never a raw path: the node resolves it through its allow-list and a\nnamed workspace that does not resolve REFUSES the turn (`requested_dir`).\nAbsent ⇒ the node default, which is where every pre-existing caller lands.\nAdded 2026-08-03: a lens's first send (T3 `bootstrap.createThread`) carries the\nproject, and without this field that binding had no wire home — turns ran in\nthe node's HOME and their files landed outside every project.",
+          }),
+          Schema.Null,
+        ]),
+      ),
+    }),
     Schema.Struct({ kind: Schema.Literal("cancel") }),
     Schema.Struct({
       kind: Schema.Literal("retry"),
