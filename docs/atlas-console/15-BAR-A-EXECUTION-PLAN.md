@@ -49,11 +49,11 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
       the node's AUTOINCREMENT seq IS the turn count. turn→checkpoint join from projection
       state (diff frames carry `checkpoint`); replayEvents pages `/feed` → projected events.
       _Verify:_ unit on fixture; getTurnDiff maps to `from/to` seqs correctly.
-- [ ] **2.6 Live check:** rig script subscribes via the full client (`session.client[subscribeThread]`)
+- [x] **2.6 Live check:** rig script subscribes via the full client (`session.client[subscribeThread]`)
       against :3199, drives a turn.
       _Verify:_ stream items arrive live; reload-equivalent (new subscribe with
       afterSequence+epoch) skips replayed items.
-- [ ] **2.7 Commit** per sub-step (2.2, 2.3, 2.4, 2.5 separately).
+- [x] **2.7 Commit** per sub-step (2.2, 2.3, 2.4, 2.5 separately).
 
 ## Stage 3 — app wiring + Gate G1
 
