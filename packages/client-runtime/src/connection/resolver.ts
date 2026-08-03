@@ -7,6 +7,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
+import { atlasTransportEnabled } from "../rpc/atlas/flag.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
@@ -73,17 +74,48 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
       } satisfies PreparedConnection;
     }
 
-    const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
-      httpBaseUrl: target.httpBaseUrl,
-      wsBaseUrl: target.wsBaseUrl,
-      bearerToken: bearerToken.value,
-    });
+    const authorized = atlasTransportEnabled()
+      ? atlasAuthorization({
+          environmentId: target.environmentId,
+          label: target.label,
+          httpBaseUrl: target.httpBaseUrl,
+          bearerToken: bearerToken.value,
+        })
+      : yield* remote.authorizeBearer({
+          expectedEnvironmentId: target.environmentId,
+          httpBaseUrl: target.httpBaseUrl,
+          wsBaseUrl: target.wsBaseUrl,
+          bearerToken: bearerToken.value,
+        });
     return {
       ...authorized,
       target,
     } satisfies PreparedConnection;
   });
+});
+
+/**
+ * Atlas needs no ticket exchange (doc 15 §3.2). T3's bearer flow mints a short-lived
+ * `wsTicket` because T3's socket cannot read the bearer header; Atlas takes the same token
+ * as `access_token` on the feed query and as `Authorization` on HTTP — the session factory
+ * already carries both. Minting a ticket against `/api/auth/websocket-ticket`, which Atlas
+ * does not serve, would fail every Atlas environment before the transport is ever reached.
+ *
+ * Substrate over shims: this is not a stub for a missing endpoint — it is the honest
+ * statement that the credential IS the authorization for this backend.
+ */
+const atlasAuthorization = (input: {
+  readonly environmentId: string;
+  readonly label: string;
+  readonly httpBaseUrl: string;
+  readonly bearerToken: string;
+}): RemoteEnvironmentAuthorization.AuthorizedRemoteEnvironment => ({
+  environmentId: input.environmentId as never,
+  label: input.label,
+  httpBaseUrl: input.httpBaseUrl,
+  // The feed URL is derived per-run by the transport; this is the base it derives from.
+  socketUrl: input.httpBaseUrl.replace(/^http/, "ws"),
+  httpAuthorization: { _tag: "Bearer", token: input.bearerToken },
 });
 
 const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")(function* () {
@@ -121,12 +153,19 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     if (!isBearerCredential(credential)) {
       return yield* credentialMissingError(target.connectionId);
     }
-    const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
-      httpBaseUrl: profile.httpBaseUrl,
-      wsBaseUrl: profile.wsBaseUrl,
-      bearerToken: credential.token,
-    });
+    const authorized = atlasTransportEnabled()
+      ? atlasAuthorization({
+          environmentId: target.environmentId,
+          label: target.label,
+          httpBaseUrl: profile.httpBaseUrl,
+          bearerToken: credential.token,
+        })
+      : yield* remote.authorizeBearer({
+          expectedEnvironmentId: target.environmentId,
+          httpBaseUrl: profile.httpBaseUrl,
+          wsBaseUrl: profile.wsBaseUrl,
+          bearerToken: credential.token,
+        });
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
