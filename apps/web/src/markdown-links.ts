@@ -211,3 +211,12 @@ export function resolveMarkdownFileLinkMeta(
     ...(columnNumber !== undefined ? { column: columnNumber } : {}),
   };
 }
+
+export function resolveMarkdownInlineCodeFileLinkMeta(
+  value: string,
+  cwd?: string,
+): MarkdownFileLinkMeta | null {
+  const candidate = value.trim();
+  if (candidate.length === 0 || candidate.includes("\n")) return null;
+  return resolveMarkdownFileLinkMeta(candidate, cwd);
+}

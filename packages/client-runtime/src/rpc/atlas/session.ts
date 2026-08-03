@@ -201,11 +201,29 @@ export const make = Effect.gen(function* () {
       return { sequence: Number(snapshot.event_head?.seq ?? 0) };
     });
 
-    const fullThreadDiff = Effect.fnUntraced(function* (input: { readonly threadId: string }) {
+    const turnDiff = Effect.fnUntraced(function* (input: {
+      readonly threadId: string;
+      readonly fromTurnCount?: number;
+      readonly toTurnCount?: number;
+    }) {
+      // checkpointTurnCount ≡ the node's checkpoint seq (projection adopts it), so the
+      // range maps straight onto the diff route — no join table, no second authority.
+      const options: { from?: number; to?: number } = {};
+      if (input.fromTurnCount !== undefined && input.fromTurnCount > 0) {
+        options.from = input.fromTurnCount;
+      }
+      if (input.toTurnCount !== undefined && input.toTurnCount > 0) {
+        options.to = input.toTurnCount;
+      }
       const diff = yield* atlasHttp
-        .threadDiff(target, runIdForThread(input.threadId))
+        .threadDiff(target, runIdForThread(input.threadId), options)
         .pipe(Effect.provide(httpLayer));
-      return { unifiedDiff: diff.unified };
+      return {
+        threadId: input.threadId,
+        diff: diff.unified,
+        fromTurnCount: input.fromTurnCount ?? 0,
+        toTurnCount: input.toTurnCount ?? Math.max(input.fromTurnCount ?? 0, 0),
+      };
     });
 
     // ── the 70-tag client: every tag has an explicit fate ──
@@ -241,7 +259,8 @@ export const make = Effect.gen(function* () {
           nowMillis: Clock.currentTimeMillis,
         }),
       [ORCHESTRATION_WS_METHODS.dispatchCommand]: dispatch,
-      [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: fullThreadDiff,
+      [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: turnDiff,
+      [ORCHESTRATION_WS_METHODS.getTurnDiff]: turnDiff,
     };
     const client: Record<string, unknown> = {};
     for (const tag of ALL_TAGS) {

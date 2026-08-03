@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   resolveMarkdownFileLinkMeta,
+  resolveMarkdownInlineCodeFileLinkMeta,
   resolveMarkdownFileLinkTarget,
   rewriteMarkdownFileUriHref,
 } from "./markdown-links";
@@ -31,6 +32,22 @@ describe("rewriteMarkdownFileUriHref", () => {
     expect(
       rewriteMarkdownFileUriHref(" <file:///D:/Programme/t3code/apps/web/src/markdown-links.ts> "),
     ).toBe("D:/Programme/t3code/apps/web/src/markdown-links.ts");
+  });
+});
+
+describe("resolveMarkdownInlineCodeFileLinkMeta", () => {
+  it("turns a bare inline-code filename into a workspace file target", () => {
+    expect(
+      resolveMarkdownInlineCodeFileLinkMeta("00-ARCHITECTURE.md", "/Users/me/atlas"),
+    ).toMatchObject({
+      basename: "00-ARCHITECTURE.md",
+      targetPath: "/Users/me/atlas/00-ARCHITECTURE.md",
+      workspaceRelativePath: "00-ARCHITECTURE.md",
+    });
+  });
+
+  it("leaves ordinary inline code alone", () => {
+    expect(resolveMarkdownInlineCodeFileLinkMeta("npm run test", "/Users/me/atlas")).toBeNull();
   });
 });
 

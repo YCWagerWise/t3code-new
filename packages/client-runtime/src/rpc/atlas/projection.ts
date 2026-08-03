@@ -291,14 +291,18 @@ export const applyFeedEvent = (
       const files = Array.isArray(payload.files)
         ? (payload.files as Array<Record<string, unknown>>)
         : [];
-      const next = { ...state, checkpointCount: state.checkpointCount + 1 };
+      // The node's checkpoint seq IS the turn count (AUTOINCREMENT from 1) — adopting it
+      // makes TurnCountRange map 1:1 onto the diff route with no client-side join table.
+      const nodeSeq =
+        typeof payload.checkpoint === "number" ? payload.checkpoint : state.checkpointCount + 1;
+      const next = { ...state, checkpointCount: nodeSeq };
       return mkEvents(next, frame, [
         {
           type: "thread.turn-diff-completed",
           payload: {
             threadId: state.threadId,
             turnId: state.activeTurnId,
-            checkpointTurnCount: next.checkpointCount,
+            checkpointTurnCount: nodeSeq,
             checkpointRef: `atlas:${payload.checkpoint ?? frame.seq}`,
             status: "ready",
             files: files.map((f) => ({

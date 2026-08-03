@@ -68,6 +68,7 @@ import { remarkNormalizeListItemIndentation } from "../markdown-list-indentation
 import {
   normalizeMarkdownLinkDestination,
   resolveMarkdownFileLinkMeta,
+  resolveMarkdownInlineCodeFileLinkMeta,
   rewriteMarkdownFileUriHref,
 } from "../markdown-links";
 import { readLocalApi } from "../localApi";
@@ -1524,8 +1525,43 @@ function ChatMarkdown({
           </MarkdownCodeBlock>
         );
       },
+      code({ node, className, children, ...props }) {
+        const value = Children.toArray(children).join("").trim();
+        const isInline = node?.position?.start.line === node?.position?.end.line;
+        const fileLinkMeta =
+          isInline && !className ? resolveMarkdownInlineCodeFileLinkMeta(value, cwd) : null;
+        if (!fileLinkMeta) {
+          return (
+            <code {...props} className={className}>
+              {children}
+            </code>
+          );
+        }
+
+        const labelParts = [fileLinkMeta.basename];
+        if (fileLinkMeta.line) {
+          labelParts.push(
+            `L${fileLinkMeta.line}${fileLinkMeta.column ? `:C${fileLinkMeta.column}` : ""}`,
+          );
+        }
+        return (
+          <MarkdownFileLink
+            href={fileLinkMeta.targetPath}
+            targetPath={fileLinkMeta.targetPath}
+            iconPath={fileLinkMeta.filePath}
+            displayPath={fileLinkMeta.displayPath}
+            workspaceRelativePath={fileLinkMeta.workspaceRelativePath}
+            line={fileLinkMeta.line}
+            label={labelParts.join(" · ")}
+            copyMarkdown={`\`${value}\``}
+            theme={resolvedTheme}
+            onOpen={openInPreferredEditor}
+          />
+        );
+      },
     }),
     [
+      cwd,
       diffThemeName,
       fileLinkParentSuffixByPath,
       isStreaming,

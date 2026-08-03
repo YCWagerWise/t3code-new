@@ -42,7 +42,7 @@ OrchestrationEvent[])` + snapshot builder. Port arm-by-arm; item ids per donor s
 - [x] **2.4 Un-gate `subscribeShell`:** poll `/_runs` + `/_workspaces` (15s + wakeup),
       diff successive polls into upsert/remove events.
       _Verify:_ unit with stubbed HTTP: first poll → snapshot; changed poll → upserts.
-- [ ] **2.5 Un-gate `getTurnDiff` + `replayEvents`:** DESIGN NOTE (2026-08-02): align
+- [x] **2.5** DESIGN NOTE (2026-08-02): align
       `checkpointTurnCount` with the NODE's checkpoint seq (projection currently mints its
       own counter — switch it to `payload.checkpoint`). Then `TurnCountRange` maps 1:1 to
       the diff route's `from`/`to` with no client-side join table. Substrate over shims:
