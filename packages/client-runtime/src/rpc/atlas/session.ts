@@ -289,6 +289,10 @@ export const make = Effect.gen(function* () {
       });
     const bound: Record<string, unknown> = {
       [WS_METHODS.serverGetConfig]: () => initialConfig,
+      // The add-project picker's suggestions. The node owns the semantics AND the scope
+      // (allow-list); the lens just carries the partial path across.
+      [WS_METHODS.filesystemBrowse]: (input: { partialPath: string }) =>
+        atlasHttp.fsBrowse(target, input.partialPath).pipe(Effect.provide(httpLayer)),
       // ThreadFeed → projection → stream items; threadReducer folds downstream. The
       // socket layer rides the stream so subscribers need no extra context.
       [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: { threadId: string }) =>

@@ -9,7 +9,7 @@
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { replayFeed } from "../rig/feed.ts";
+import { replayFeed, runIdForThread } from "../rig/feed.ts";
 import { readRigState, waitFor } from "../rig/rig.ts";
 import {
   interruptTurn,
@@ -35,7 +35,7 @@ test.describe("G1: real conversation through the browser", () => {
 
     // Wire truth: the node's feed saw the same turn.
     const threadId = await threadIdFromPage(page);
-    const frames = await replayFeed(threadId);
+    const frames = await replayFeed(runIdForThread(threadId));
     const kinds = frames.map((f) => f.kind);
     expect(kinds).toContain("user");
     expect(kinds).toContain("assistant");
@@ -66,7 +66,7 @@ test.describe("G1: real conversation through the browser", () => {
 
     // Wire truth: a run_bash tool_call frame exists and mentions the file.
     const threadId = await threadIdFromPage(page);
-    const frames = await replayFeed(threadId);
+    const frames = await replayFeed(runIdForThread(threadId));
     const toolCalls = frames.filter((f) => f.kind === "tool_call");
     const bash = toolCalls.find(
       (f) =>
@@ -103,7 +103,7 @@ test.describe("G1: real conversation through the browser", () => {
     await waitFor(
       "terminal turn frame after interrupt",
       async () => {
-        const frames = await replayFeed(threadId);
+        const frames = await replayFeed(runIdForThread(threadId));
         const turns = frames.filter((f) => f.kind === "turn" || f.kind === "lifecycle");
         return JSON.stringify(turns).match(/cancel|interrupt|stopped/i) !== null;
       },

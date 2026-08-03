@@ -119,6 +119,12 @@ per-thread model choice has no wire home. `thread.meta.update` is accepted lens-
 manifest default. Closing this means adding an optional `model` to Start — additive, small,
 and it belongs with the thread-catalog work (M2), not M1.
 
+**Open gap (found by the e2e suite, 2026-08-03):** a WRONG token is invisible in the UI.
+The transport is honest — 401/403 maps to `ConnectionBlockedError(permission)` — but the
+index route renders a refused catalog as the "No projects yet" hero, indistinguishable
+from a fresh node. `e2e/tests/boundary.spec.ts` carries the desired assertion under
+`test.fail()`: fixing the lens flips it red and forces the assertion to become real.
+
 ## Standing rules
 
 Every step: commit before mutation-testing; live-drive before "done"; fix stale docs

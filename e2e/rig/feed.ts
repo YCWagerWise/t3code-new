@@ -11,6 +11,9 @@ export interface FeedFrame {
   payload?: Record<string, unknown>;
 }
 
+/** The console routes key a UI thread's feed by `thr-<threadId>` (session.ts). */
+export const runIdForThread = (threadId: string): string => `thr-${threadId}`;
+
 /** Full frame replay for a thread — `GET /console/v1/threads/{id}/feed?after=0`. */
 export const replayFeed = async (threadId: string): Promise<FeedFrame[]> => {
   const frames: FeedFrame[] = [];

@@ -89,7 +89,7 @@ const main = async () => {
           commandId: `pc-${Math.random()}`,
           projectId: "p",
           title: "x",
-          workspaceRoot: "~/workspace",
+          workspaceRoot: "/opt/homebrew",
           createdAt: new Date().toISOString(),
         }),
       ),

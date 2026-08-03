@@ -272,3 +272,13 @@ export const registerWorkspace = Effect.fn("atlasHttp.registerWorkspace")(functi
     body: { path },
   });
 });
+
+/** `GET /console/v1/fs/browse` — directory completion, T3 semantics, allow-list scoped. */
+export const fsBrowse = Effect.fn("atlasHttp.fsBrowse")(function* (
+  target: AtlasHttpTarget,
+  partialPath: string,
+) {
+  const params = new URLSearchParams();
+  params.set("path", partialPath);
+  return yield* request(target, "fsBrowse", `/console/v1/fs/browse?${params.toString()}`);
+});
