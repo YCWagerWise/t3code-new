@@ -105,12 +105,9 @@ it.effect("dispatchCommand refuses non-M1 command types typed — without any ne
       // thread.create succeeds LOCALLY — an Atlas thread is its feed, created lazily on
       // first subscribe, so create asks nothing of the node and needs no network either.
       const created = yield* Effect.orDie(
-        dispatch({ type: "thread.create", commandId: "cmd-2", threadId: "t-2" }) as Effect.Effect<
-          { sequence: number },
-          never
-        >,
+        dispatch({ type: "thread.create", commandId: "cmd-2", threadId: "t-2" }),
       );
-      assert.isAtLeast(created.sequence, 1);
+      assert.isAtLeast((created as { sequence: number }).sequence, 1);
     }),
   ),
 );
