@@ -330,7 +330,12 @@ const synthesizeConfig = (
     keybindingsConfigPath: "atlas://keybindings",
     keybindings: [],
     issues: [],
-    providers: [],
+    // Atlas advertises what it can run through the node manifest — bodies (personas)
+    // and `execution.default_model`. The lens must not synthesize a model list of its
+    // own (doc 11 records exactly that bug: a hardcoded "claude" slug reaching the CLI
+    // as `claude --model claude`), so an empty manifest yields an empty picker rather
+    // than an invented one.
+    providers: atlasProviders(manifest),
     availableEditors: [],
     observability: {
       logsDirectoryPath: "atlas://logs",
@@ -344,10 +349,43 @@ const synthesizeConfig = (
   };
 };
 
+/** One provider instance: the node itself, offering the models it says it can run. */
+const atlasProviders = (manifest: MemberManifest | undefined) => {
+  const model = manifest?.execution?.default_model?.trim();
+  if (model === undefined || model === "") {
+    return [];
+  }
+  return [
+    {
+      instanceId: "atlas",
+      driver: "atlas",
+      displayName: "Atlas",
+      enabled: true,
+      installed: true,
+      version: null,
+      status: "ready",
+      auth: { state: "authenticated" },
+      checkedAt: "1970-01-01T00:00:00.000Z",
+      models: [
+        {
+          slug: model,
+          name: model,
+          isCustom: false,
+          isDefault: true,
+          // `null` means "this provider exposes no option controls" — not "no tools".
+          capabilities: null,
+        },
+      ],
+      slashCommands: [],
+      skills: [],
+    },
+  ] as unknown as ServerConfig["providers"];
+};
+
 interface MemberManifest {
   readonly machine?: { readonly os?: string; readonly arch?: string };
   readonly runtime?: { readonly version?: string };
-  readonly execution?: { readonly workspace?: string };
+  readonly execution?: { readonly workspace?: string; readonly default_model?: string };
 }
 
 const firstManifest = (membersJson: unknown): MemberManifest | undefined => {
