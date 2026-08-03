@@ -19,6 +19,7 @@
     "tc": "vp run -r --concurrency-limit 2 typecheck",
     "lint": "vp lint --report-unused-disable-directives",
     "test": "vp run -r test",
+    "e2e": "pnpm --filter @t3tools/e2e e2e",
     "test:desktop-smoke": "vp run --filter @t3tools/desktop smoke-test",
     "fmt": "vp fmt",
     "fmt:check": "vp fmt --check",

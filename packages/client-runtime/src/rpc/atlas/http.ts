@@ -259,3 +259,16 @@ export const listWorkspaces = Effect.fn("atlasHttp.listWorkspaces")(function* (
 export const listThreads = Effect.fn("atlasHttp.listThreads")(function* (target: AtlasHttpTarget) {
   return yield* request(target, "listThreads", "/_threads");
 });
+
+/** `POST /_workspaces` — register a path in the node's workspace catalog. The node
+ * canonicalises to the repo toplevel and re-checks its allow-list; a refused path is a
+ * refused project, exactly as it should be. */
+export const registerWorkspace = Effect.fn("atlasHttp.registerWorkspace")(function* (
+  target: AtlasHttpTarget,
+  path: string,
+) {
+  return yield* request(target, "registerWorkspace", "/_workspaces", {
+    method: "POST",
+    body: { path },
+  });
+});

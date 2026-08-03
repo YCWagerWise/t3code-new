@@ -182,6 +182,17 @@ export const make = Effect.gen(function* () {
         localSequence += 1;
         return { sequence: localSequence };
       }
+      // A T3 "project" IS an Atlas workspace, and the catalog has a real registration
+      // route (allow-list gated, canonicalised to the repo toplevel). This is a true
+      // binding, not a local receipt: the node decides, and a refused path is a refused
+      // project. The sidebar reflects it on the next catalog poll under the node's own
+      // ws-* id — the node, not the lens, is the authority on project identity.
+      if (input.type === "project.create") {
+        const root = (input as { workspaceRoot?: string }).workspaceRoot ?? "";
+        yield* atlasHttp.registerWorkspace(target, root).pipe(Effect.provide(httpLayer));
+        localSequence += 1;
+        return { sequence: localSequence };
+      }
       const command =
         input.type === "thread.turn.start"
           ? { kind: "start" as const, text: input.message?.text ?? "", limits: {} }

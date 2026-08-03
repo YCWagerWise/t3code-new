@@ -1,0 +1,5 @@
+.logs/
+.results/
+.rig-state.json
+node_modules/
+test-results/
