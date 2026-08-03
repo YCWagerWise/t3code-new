@@ -1,5 +1,9 @@
 import { cn } from "~/lib/utils";
-import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
+import {
+  type ContextWindowSnapshot,
+  formatContextWindowTokens,
+  type SubscriptionUsageSnapshot,
+} from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 
 function formatPercentage(value: number | null): string | null {
@@ -14,9 +18,10 @@ function formatPercentage(value: number | null): string | null {
 
 export function ContextWindowMeter(props: {
   usage: ContextWindowSnapshot;
+  subscriptionUsage?: SubscriptionUsageSnapshot | null;
   providerDisplayName?: string | null;
 }) {
-  const { usage, providerDisplayName } = props;
+  const { usage, subscriptionUsage, providerDisplayName } = props;
   const usedPercentage = formatPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const radius = 9.75;
@@ -125,6 +130,42 @@ export function ContextWindowMeter(props: {
               <span className="font-medium tabular-nums text-muted-foreground/80">
                 {formatContextWindowTokens(totalProcessedTokens)}
               </span>
+            </div>
+          ) : null}
+          {subscriptionUsage ? (
+            <div className="mt-1 border-border/50 border-t pt-2">
+              <div className="flex items-center justify-between gap-3 text-[11px]">
+                <span className="font-medium text-muted-foreground">{subscriptionUsage.label}</span>
+                <span className="tabular-nums text-muted-foreground/70">
+                  {formatPercentage(subscriptionUsage.usedPercentage)} used
+                </span>
+              </div>
+              <div
+                className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted/60"
+                role="progressbar"
+                aria-label={`${subscriptionUsage.label} for ${providerDisplayName ?? "provider"}`}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(subscriptionUsage.usedPercentage)}
+              >
+                <div
+                  className="h-full rounded-full bg-primary transition-[width] duration-500 motion-reduce:transition-none"
+                  style={{ width: `${subscriptionUsage.usedPercentage}%` }}
+                />
+              </div>
+              <div className="mt-1.5 flex items-center justify-between gap-3 text-[10px] text-muted-foreground/60">
+                <span>{Math.round(subscriptionUsage.remainingPercentage)}% remaining</span>
+                {subscriptionUsage.resetsAt ? (
+                  <span>
+                    Resets{" "}
+                    {new Intl.DateTimeFormat(undefined, {
+                      weekday: "short",
+                      hour: "numeric",
+                      minute: "2-digit",
+                    }).format(new Date(subscriptionUsage.resetsAt))}
+                  </span>
+                ) : null}
+              </div>
             </div>
           ) : null}
           {usage.compactsAutomatically ? (

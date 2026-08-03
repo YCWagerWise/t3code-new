@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import { EventId, type OrchestrationThreadActivity, TurnId } from "@t3tools/contracts";
 
-import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "./contextWindow";
+import {
+  deriveLatestContextWindowSnapshot,
+  deriveLatestSubscriptionUsageSnapshot,
+  formatContextWindowTokens,
+} from "./contextWindow";
 
 function makeActivity(id: string, kind: string, payload: unknown): OrchestrationThreadActivity {
   return {
@@ -80,5 +84,23 @@ describe("contextWindow", () => {
 
     expect(snapshot?.usedTokens).toBe(81_659);
     expect(snapshot?.totalProcessedTokens).toBe(748_126);
+  });
+
+  it("derives the longest provider-reported subscription window", () => {
+    const snapshot = deriveLatestSubscriptionUsageSnapshot([
+      makeActivity("activity-1", "subscription-usage.updated", {
+        rateLimits: {
+          primary: { usedPercent: 18, windowDurationMins: 300 },
+          secondary: { usedPercent: 63, windowDurationMins: 10_080, resetsAt: 1_780_000_000 },
+        },
+      }),
+    ]);
+
+    expect(snapshot).toMatchObject({
+      label: "Weekly usage",
+      usedPercentage: 63,
+      remainingPercentage: 37,
+      windowDurationMinutes: 10_080,
+    });
   });
 });

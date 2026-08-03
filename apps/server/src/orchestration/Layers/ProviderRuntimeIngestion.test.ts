@@ -3056,6 +3056,37 @@ describe("ProviderRuntimeIngestion", () => {
     });
   });
 
+  it("projects provider subscription usage into thread activities", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "account.rate-limits.updated",
+      eventId: asEventId("evt-account-rate-limits-updated"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      payload: {
+        rateLimits: {
+          primary: { usedPercent: 12, windowDurationMins: 300 },
+          secondary: { usedPercent: 64, windowDurationMins: 10_080 },
+        },
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.kind === "subscription-usage.updated",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.kind === "subscription-usage.updated",
+    );
+    expect(activity?.payload).toMatchObject({
+      secondary: { usedPercent: 64, windowDurationMins: 10_080 },
+    });
+  });
+
   it("projects Codex camelCase token usage payloads into normalized thread activities", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

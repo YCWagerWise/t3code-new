@@ -25,6 +25,64 @@ export type ContextWindowSnapshot = NullableContextWindowUsage & {
   readonly updatedAt: string;
 };
 
+export type SubscriptionUsageSnapshot = {
+  readonly usedPercentage: number;
+  readonly remainingPercentage: number;
+  readonly resetsAt: string | null;
+  readonly windowDurationMinutes: number | null;
+  readonly label: string;
+  readonly updatedAt: string;
+};
+
+function findRateLimitSnapshot(value: unknown): Record<string, unknown> | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  if (asRecord(record.primary) || asRecord(record.secondary)) return record;
+  return findRateLimitSnapshot(record.rateLimits);
+}
+
+/** Return the longest provider-reported window, which is normally the weekly allowance. */
+export function deriveLatestSubscriptionUsageSnapshot(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+): SubscriptionUsageSnapshot | null {
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    const activity = activities[index];
+    if (!activity || activity.kind !== "subscription-usage.updated") continue;
+
+    const snapshot = findRateLimitSnapshot(activity.payload);
+    if (!snapshot) continue;
+    const candidates = [asRecord(snapshot.primary), asRecord(snapshot.secondary)].filter(
+      (entry): entry is Record<string, unknown> => entry !== null,
+    );
+    const window = candidates
+      .map((entry) => ({
+        entry,
+        duration: asFiniteNumber(entry.windowDurationMins),
+      }))
+      .filter(({ entry }) => asFiniteNumber(entry.usedPercent) !== null)
+      .sort((left, right) => (right.duration ?? 0) - (left.duration ?? 0))[0];
+    if (!window) continue;
+
+    const used = Math.max(0, Math.min(100, asFiniteNumber(window.entry.usedPercent) ?? 0));
+    const resetSeconds = asFiniteNumber(window.entry.resetsAt);
+    const label =
+      typeof snapshot.limitName === "string" && snapshot.limitName.trim().length > 0
+        ? snapshot.limitName.trim()
+        : window.duration !== null && window.duration >= 6 * 24 * 60
+          ? "Weekly usage"
+          : "Subscription usage";
+    return {
+      usedPercentage: used,
+      remainingPercentage: Math.max(0, 100 - used),
+      resetsAt: resetSeconds !== null ? new Date(resetSeconds * 1000).toISOString() : null,
+      windowDurationMinutes: window.duration,
+      label,
+      updatedAt: activity.createdAt,
+    };
+  }
+  return null;
+}
+
 /** Map a provider driver kind to a user-facing display name. */
 export function formatProviderDisplayName(provider: string | null | undefined): string {
   if (!provider) return "This agent";
