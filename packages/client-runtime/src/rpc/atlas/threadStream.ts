@@ -57,6 +57,11 @@ export interface ThreadStreamOptions {
   readonly threadId: string;
   readonly runId: string;
   readonly plugin?: string | undefined;
+  /** The pending-send correlation (doc 16's `getPendingTurnStartByThreadId`, fused): the
+   * node's `user` echo must reach the lens carrying THE COMMAND'S messageId, or the
+   * optimistic bubble (reconciled strictly by id, ChatView:2253) is never absorbed —
+   * a permanent duplicate and a spinner that cannot end. Consumed once per send. */
+  readonly takePendingUserMessageId?: ((threadId: string) => string | null) | undefined;
 }
 
 export const openThreadStream = (
@@ -80,6 +85,22 @@ export const openThreadStream = (
           items.push({ kind: "snapshot", snapshot: snapshotAt(r.state) });
         }
         for (const event of r.events) {
+          // Pending-send correlation: rewrite the node's user echo to carry the command's
+          // messageId (see ThreadStreamOptions.takePendingUserMessageId).
+          const e = event as {
+            type: string;
+            payload: { role?: string; messageId?: string };
+          };
+          if (e.type === "thread.message-sent" && e.payload.role === "user") {
+            const pending = options.takePendingUserMessageId?.(options.threadId) ?? null;
+            if (pending !== null) {
+              items.push({
+                kind: "event",
+                event: { ...e, payload: { ...e.payload, messageId: pending } },
+              });
+              continue;
+            }
+          }
           items.push({ kind: "event", event });
         }
         if (feedEvent.kind === "replay-complete") {

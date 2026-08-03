@@ -155,6 +155,11 @@ export const make = Effect.gen(function* () {
     // Lens-local commands get their own receipt counter: they never reach the node, so
     // they cannot borrow a node sequence.
     let localSequence = 0;
+    // Pending sends, keyed by thread: the command's messageId, consumed when the node's
+    // user frame comes back so the echo carries the id the optimistic bubble reconciles
+    // by. One entry per thread — a second send before the first echo overwrites, which is
+    // also what the donor's pending-turn repository does.
+    const pendingUserMessageIds = new Map<string, string>();
 
     const dispatch = Effect.fnUntraced(function* (input: {
       readonly type: string;
@@ -213,6 +218,10 @@ export const make = Effect.gen(function* () {
       // id (a draft against a project the node never registered) simply fails to resolve
       // and the turn REFUSES — wrong-tree-quietly is the outcome this exists to prevent.
       const workspaceId = input.bootstrap?.createThread?.projectId;
+      const messageId = (input as { message?: { messageId?: string } }).message?.messageId;
+      if (input.type === "thread.turn.start" && typeof messageId === "string" && threadId !== "") {
+        pendingUserMessageIds.set(threadId, messageId);
+      }
       const command =
         input.type === "thread.turn.start"
           ? {
@@ -315,6 +324,11 @@ export const make = Effect.gen(function* () {
           accessToken: bearerToken ?? "",
           threadId: input.threadId,
           runId: runIdForThread(input.threadId),
+          takePendingUserMessageId: (threadId) => {
+            const pending = pendingUserMessageIds.get(threadId) ?? null;
+            pendingUserMessageIds.delete(threadId);
+            return pending;
+          },
         }).pipe(Stream.provide(socketLayer)),
       // Honest poll until Atlas grows a catalog stream — the fetch is the injected
       // substrate, so only it changes when that lands.
