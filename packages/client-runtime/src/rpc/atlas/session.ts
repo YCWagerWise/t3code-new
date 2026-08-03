@@ -305,7 +305,14 @@ const synthesizeConfig = (
         os: os === "macos" ? "darwin" : os === "windows" ? "windows" : "linux",
         arch: arch === "aarch64" || arch === "arm64" ? "arm64" : "x64",
       },
-      serverVersion: manifest?.runtime?.version ?? "atlas",
+      // Deliberately absent. T3's client and T3's server ship as a matched pair, so a
+      // skew banner tells you to relaunch the server "to sync them" — an instruction
+      // with no meaning here: Atlas versions independently and no command could ever
+      // make the two strings match. `resolveVersionMismatch` already treats an unknown
+      // server version as "nothing to compare", which is precisely the truth for a
+      // non-T3 backend. The node's real version belongs in a fleet/node view, not in
+      // T3's release-skew check.
+      serverVersion: "",
       // A capability not synthesized is false — and must agree with the gate: the config
       // may never advertise what the client object refuses.
       capabilities: {
