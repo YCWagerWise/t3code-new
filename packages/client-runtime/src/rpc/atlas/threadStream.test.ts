@@ -48,6 +48,11 @@ class TestWebSocket {
 }
 
 const EPOCH = 1785704325750;
+const encodeWire = Schema.encodeSync(Schema.UnknownFromJsonString);
+const WIRE_FIXTURES = (fixtures as ReadonlyArray<unknown>).map((f) => encodeWire(f));
+const USER_FIXTURE = (fixtures as ReadonlyArray<{ kind: string }>).find((f) => f.kind === "user")!;
+const WIRE_USER = encodeWire(USER_FIXTURE);
+const WIRE_USER_NEW_EPOCH = encodeWire({ ...(USER_FIXTURE as object), seq: 1, epoch: EPOCH + 1 });
 const heartbeat = `{"version":1,"kind":"hb","run_id":"thr-proof","ts":1785704326000,"seq":14,"epoch":${EPOCH}}`;
 
 it.effect("snapshot first, schema-legal events, synchronized at the boundary", () =>
@@ -75,8 +80,8 @@ it.effect("snapshot first, schema-legal events, synchronized at the boundary", (
     }
     const ws = sockets[0]!;
     ws.open();
-    for (const frame of fixtures) {
-      ws.serverMessage(Schema.encodeSync(Schema.UnknownFromJsonString)(frame));
+    for (const wire of WIRE_FIXTURES) {
+      ws.serverMessage(wire);
     }
     ws.serverMessage(heartbeat);
     for (let i = 0; i < 30; i += 1) {
@@ -127,17 +132,10 @@ it.effect("a feed reset re-bases the client with a fresh snapshot before new eve
     }
     const ws = sockets[0]!;
     ws.open();
-    const user = fixtures.find((f) => (f as { kind: string }).kind === "user")!;
-    ws.serverMessage(Schema.encodeSync(Schema.UnknownFromJsonString)(user));
+    ws.serverMessage(WIRE_USER);
     // Epoch changes: the feed was recreated. The stream must emit a fresh snapshot
     // BEFORE the replayed-from-zero event, or the client folds new facts onto stale ones.
-    ws.serverMessage(
-      Schema.encodeSync(Schema.UnknownFromJsonString)({
-        ...(user as object),
-        seq: 1,
-        epoch: EPOCH + 1,
-      }),
-    );
+    ws.serverMessage(WIRE_USER_NEW_EPOCH);
     for (let i = 0; i < 30; i += 1) {
       yield* Effect.yieldNow;
     }
