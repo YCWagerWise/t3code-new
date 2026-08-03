@@ -200,11 +200,14 @@ export const make = Effect.gen(function* () {
           // The node's 403 is deliberately undifferentiated (path-probing learns
           // nothing), but the LENS knows what a 403 on this route means and owes the
           // user the reason — "HTTP 403" cost real debugging time on 2026-08-03.
+          // Relay the node's reason verbatim — it now distinguishes a typo under an
+          // allowed root ("no such directory: …") from a path outside them. A lens
+          // paraphrase here already lied once: it blamed the allow-list for a typo.
           Effect.mapError((error) =>
             error.status === 403
               ? new EnvironmentRpcUnavailableError({
                   environmentId: connection.environmentId,
-                  message: `"${root}" is outside this node's allowed workspace roots — projects must live under a directory the node was configured to serve.`,
+                  message: `Cannot add "${root}": ${error.message}`,
                 })
               : error,
           ),

@@ -94,13 +94,23 @@ const request = Effect.fn("atlasHttp.request")(function* (
       json === undefined
         ? undefined
         : yield* decodeStructuredError(json).pipe(Effect.orElseSucceed(() => undefined));
+    // Some routes (the workspace catalog) answer refusals as `{error: string}` rather
+    // than a StructuredError. Either way the NODE's words are the message — the lens
+    // never paraphrases a refusal (Wall Protocol; a paraphrase lied about a typo on
+    // 2026-08-03 and cost a live round).
+    const plainError =
+      typeof (json as { error?: unknown } | undefined)?.error === "string"
+        ? (json as { error: string }).error
+        : undefined;
     return yield* Effect.fail(
       new AtlasHttpError({
         operation,
         status: response.status,
         structured,
         message:
-          structured?.message ?? `the node returned HTTP ${response.status} for ${operation}`,
+          structured?.message ??
+          plainError ??
+          `the node returned HTTP ${response.status} for ${operation}`,
       }),
     );
   }
