@@ -4449,7 +4449,20 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
-    if (!sendCtx?.providerAvailable) return;
+    if (!sendCtx?.providerAvailable) {
+      // Never a silent no-op: this exit fires with the Send control looking enabled
+      // (its disabled predicate is not the full submit guard), and a click that does
+      // nothing with no explanation reads as a broken app rather than a missing model.
+      toastManager.add(
+        stackedThreadToast({
+          type: "warning",
+          title: "No model available",
+          description:
+            "The connected environment offers no usable model, so this message cannot be sent.",
+        }),
+      );
+      return;
+    }
     const {
       images: composerImages,
       terminalContexts: composerTerminalContexts,
