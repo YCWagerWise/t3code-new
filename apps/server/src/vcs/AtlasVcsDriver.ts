@@ -13,15 +13,32 @@
  * panel, ingestion, and the projection are untouched: `VcsDriverRegistry` already selects a
  * driver by kind, so this is a registration rather than a new data path.
  *
- * ## What it deliberately does not do
+ * ## The whole driver
  *
- * Only `checkpoints` and repository detection are implemented. `execute` (raw process),
- * `initRepository`, `listWorkspaceFiles`, `listRemotes` and `filterIgnoredPaths` all refuse
- * with `VcsUnsupportedOperationError`. Those surfaces mean "run a command in the user's
- * working copy" and are used by panels — source control, file pickers — that have no remote
- * story yet. Refusing is the honest answer: implementing them as empty successes would render
- * a source-control panel that silently shows an empty repository, which reads as "no changes"
- * rather than "not supported here".
+ * This used to implement `checkpoints` and detection only, and refuse `execute`,
+ * `initRepository`, `listWorkspaceFiles`, `listRemotes` and `filterIgnoredPaths` with
+ * `VcsUnsupportedOperationError`. Refusing was the honest answer while the node served five
+ * routes — implementing them as empty successes would have rendered a source-control panel
+ * that silently showed an empty repository, which reads as "no changes" rather than "not
+ * supported here".
+ *
+ * The node serves all of them now, so the refusals are gone. A remote workspace is a workspace:
+ * the file picker lists it, the source-control panel sees its remotes, and `execute` runs git
+ * in it. What that unlocks beyond the Diff panel is branch work — `git checkout -b`, `commit`,
+ * `push` — against a repository on a machine the console has never had a path to.
+ *
+ * ## What still does not cross the wire
+ *
+ * `execute` accepts a `VcsProcessInput` shaped for a local spawn, and two of its fields cannot
+ * mean the same thing remotely:
+ *
+ * - `spawnCwd` is where the *local* process would be spawned. The node spawns in the workspace
+ *   root it resolved, so this is dropped rather than forwarded.
+ * - `env` is filtered to commit identity (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`) before it is sent.
+ *   Callers build it by spreading `process.env`, so forwarding it whole would ship this
+ *   server's entire environment — tokens included — to another machine. The node refuses
+ *   anything outside that allow-list anyway; filtering here means a caller gets a working
+ *   commit attribution instead of a rejection.
  */
 
 import * as DateTime from "effect/DateTime";
@@ -29,10 +46,11 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { HttpBody, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
+  VcsProcessExitError,
   VcsRepositoryDetectionError,
-  VcsUnsupportedOperationError,
   type VcsRepositoryIdentity,
 } from "@t3tools/contracts";
 
@@ -45,16 +63,57 @@ const DetectResponse = Schema.Struct({ root: Schema.String });
 const ExistsResponse = Schema.Struct({ exists: Schema.Boolean });
 const RestoredResponse = Schema.Struct({ restored: Schema.Boolean });
 const DiffResponse = Schema.Struct({ unifiedDiff: Schema.String });
+const ExecResponse = Schema.Struct({
+  exitCode: Schema.Number,
+  stdout: Schema.String,
+  stderr: Schema.String,
+  stdoutTruncated: Schema.Boolean,
+  stderrTruncated: Schema.Boolean,
+});
+const FilesResponse = Schema.Struct({
+  paths: Schema.Array(Schema.String),
+  truncated: Schema.Boolean,
+});
+const RemotesResponse = Schema.Struct({
+  remotes: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      url: Schema.String,
+      pushUrl: Schema.NullOr(Schema.String),
+      isPrimary: Schema.Boolean,
+    }),
+  ),
+});
+const IgnoredResponse = Schema.Struct({ ignored: Schema.Array(Schema.String) });
 
 const decodeDetect = Schema.decodeUnknownEffect(DetectResponse);
 const decodeExists = Schema.decodeUnknownEffect(ExistsResponse);
 const decodeRestored = Schema.decodeUnknownEffect(RestoredResponse);
 const decodeDiff = Schema.decodeUnknownEffect(DiffResponse);
+const decodeExec = Schema.decodeUnknownEffect(ExecResponse);
+const decodeFiles = Schema.decodeUnknownEffect(FilesResponse);
+const decodeRemotes = Schema.decodeUnknownEffect(RemotesResponse);
+const decodeIgnored = Schema.decodeUnknownEffect(IgnoredResponse);
 
 const normalizeBaseUrl = (baseUrl: string): string => baseUrl.trim().replace(/\/+$/, "");
 
-const unsupported = (operation: string, detail: string) =>
-  Effect.fail(new VcsUnsupportedOperationError({ operation, kind: KIND, detail }));
+/** Matches the node's own env allow-list — see the module note on why this is filtered here. */
+const COMMIT_IDENTITY_ENV = /^GIT_(AUTHOR|COMMITTER)_/;
+
+const commitIdentityEnv = (env: NodeJS.ProcessEnv | undefined): Record<string, string> => {
+  if (env === undefined) return {};
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined && COMMIT_IDENTITY_ENV.test(key)) filtered[key] = value;
+  }
+  return filtered;
+};
+
+/** The marker `VcsProcess` appends locally, kept identical so a caller cannot tell them apart. */
+const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
+
+const withMarker = (text: string, truncated: boolean, append: boolean | undefined): string =>
+  truncated && append === true ? `${text}${OUTPUT_TRUNCATED_MARKER}` : text;
 
 export const makeVcsDriverShape = Effect.fn("makeAtlasVcsDriverShape")(function* () {
   const client = yield* HttpClient.HttpClient;
@@ -67,7 +126,10 @@ export const makeVcsDriverShape = Effect.fn("makeAtlasVcsDriverShape")(function*
     // The node captures through a throwaway index rather than locking the worktree, so a
     // snapshot is not atomic with respect to a concurrently running turn.
     supportsAtomicSnapshot: false,
-    supportsPushDefaultRemote: false,
+    // True now that the node serves `remotes` and `exec`: pushing to the default remote is git
+    // on the node, which is exactly what the co-located driver does. It was false while those
+    // were refusals, and leaving it false would advertise a limit that no longer exists.
+    supportsPushDefaultRemote: true,
     ignoreClassifier: "native" as const,
   };
 
@@ -238,34 +300,132 @@ export const makeVcsDriverShape = Effect.fn("makeAtlasVcsDriverShape")(function*
     }),
   };
 
+  /** The node answered, so the reading is off another machine — never `live-local`. */
+  const remoteFreshness = Effect.gen(function* () {
+    const observedAt = yield* DateTime.now;
+    return { source: "explicit-remote" as const, observedAt, expiresAt: Option.none() };
+  });
+
+  const execute: VcsDriver.VcsDriver["Service"]["execute"] = Effect.fn("AtlasVcsDriver.execute")(
+    function* (input) {
+      const result = yield* call(
+        "AtlasVcsDriver.execute",
+        input.cwd,
+        "/_vcs/exec",
+        {
+          command: "git",
+          args: [...input.args],
+          ...(input.stdin === undefined ? {} : { stdin: input.stdin }),
+          env: commitIdentityEnv(input.env),
+          ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+          ...(input.maxOutputBytes === undefined ? {} : { maxOutputBytes: input.maxOutputBytes }),
+        },
+        decodeExec,
+      );
+
+      // A non-zero exit is data the node reports in a 200, so the decision about whether it is
+      // an *error* belongs here, exactly where the local driver makes it. `check-ignore`
+      // returning 1 and `git push` returning 1 are the same HTTP status and different events.
+      if (result.exitCode !== 0 && input.allowNonZeroExit !== true) {
+        return yield* new VcsProcessExitError({
+          operation: input.operation,
+          command: "git",
+          cwd: input.cwd,
+          argumentCount: input.args.length,
+          exitCode: result.exitCode,
+          detail: result.stderr.trim() || `git exited ${result.exitCode}`,
+          stderrLength: result.stderr.length,
+          stderrTruncated: result.stderrTruncated,
+        });
+      }
+
+      return {
+        // The wire carries a plain number; `ExitCode` is the branded form the local spawner
+        // hands back, and a caller must not be able to tell which driver produced it.
+        exitCode: ChildProcessSpawner.ExitCode(result.exitCode),
+        stdout: withMarker(result.stdout, result.stdoutTruncated, input.appendTruncationMarker),
+        stderr: withMarker(result.stderr, result.stderrTruncated, input.appendTruncationMarker),
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
+      };
+    },
+  );
+
+  const listWorkspaceFiles: VcsDriver.VcsDriver["Service"]["listWorkspaceFiles"] = Effect.fn(
+    "AtlasVcsDriver.listWorkspaceFiles",
+  )(function* (cwd: string) {
+    const result = yield* call(
+      "AtlasVcsDriver.listWorkspaceFiles",
+      cwd,
+      "/_vcs/files",
+      {},
+      decodeFiles,
+    );
+    // `truncated` is carried through rather than dropped: a picker showing a prefix without
+    // saying so reads as a complete repository.
+    return {
+      paths: result.paths,
+      truncated: result.truncated,
+      freshness: yield* remoteFreshness,
+    };
+  });
+
+  const listRemotes: VcsDriver.VcsDriver["Service"]["listRemotes"] = Effect.fn(
+    "AtlasVcsDriver.listRemotes",
+  )(function* (cwd: string) {
+    const result = yield* call(
+      "AtlasVcsDriver.listRemotes",
+      cwd,
+      "/_vcs/remotes",
+      {},
+      decodeRemotes,
+    );
+    return {
+      remotes: result.remotes.map((remote) => ({
+        name: remote.name,
+        url: remote.url,
+        pushUrl: remote.pushUrl === null ? Option.none() : Option.some(remote.pushUrl),
+        isPrimary: remote.isPrimary,
+      })),
+      freshness: yield* remoteFreshness,
+    };
+  });
+
+  const filterIgnoredPaths: VcsDriver.VcsDriver["Service"]["filterIgnoredPaths"] = Effect.fn(
+    "AtlasVcsDriver.filterIgnoredPaths",
+  )(function* (cwd: string, relativePaths: ReadonlyArray<string>) {
+    if (relativePaths.length === 0) return relativePaths;
+    // The node answers with the *ignored* subset — the primitive — and the complement is this
+    // function's own contract. One round trip either way; the node keeps the reusable half.
+    const result = yield* call(
+      "AtlasVcsDriver.filterIgnoredPaths",
+      cwd,
+      "/_vcs/ignored",
+      { paths: [...relativePaths] },
+      decodeIgnored,
+    );
+    if (result.ignored.length === 0) return relativePaths;
+    const ignored = new Set(result.ignored);
+    return relativePaths.filter((relativePath) => !ignored.has(relativePath));
+  });
+
+  const initRepository: VcsDriver.VcsDriver["Service"]["initRepository"] = Effect.fn(
+    "AtlasVcsDriver.initRepository",
+  )(function* (input) {
+    yield* call("AtlasVcsDriver.initRepository", input.cwd, "/_vcs/init", {}, Effect.succeed);
+  });
+
   return {
     capabilities,
-    execute: () =>
-      unsupported(
-        "AtlasVcsDriver.execute",
-        "raw VCS processes do not run against a remote Atlas workspace",
-      ),
+    execute,
     checkpoints,
     detectRepository,
     isInsideWorkTree: (cwd: string) =>
       detectRepository(cwd).pipe(Effect.map((repository) => repository !== null)),
-    listWorkspaceFiles: () =>
-      unsupported(
-        "AtlasVcsDriver.listWorkspaceFiles",
-        "listing a remote Atlas workspace is not implemented",
-      ),
-    listRemotes: () =>
-      unsupported("AtlasVcsDriver.listRemotes", "remotes are not exposed by an Atlas node"),
-    filterIgnoredPaths: () =>
-      unsupported(
-        "AtlasVcsDriver.filterIgnoredPaths",
-        "ignore classification for a remote Atlas workspace is not implemented",
-      ),
-    initRepository: () =>
-      unsupported(
-        "AtlasVcsDriver.initRepository",
-        "an Atlas workspace is created on the node, not from the console",
-      ),
+    listWorkspaceFiles,
+    listRemotes,
+    filterIgnoredPaths,
+    initRepository,
   } satisfies VcsDriver.VcsDriver["Service"];
 });
 

@@ -120,4 +120,90 @@ describe.skipIf(NODE_URL === undefined || CWD === undefined)("AtlasVcsDriver ↔
       }),
     ),
   );
+
+  it.effect("lists the node's workspace files and marks the reading as remote", () =>
+    driver((d) =>
+      Effect.gen(function* () {
+        const result = yield* d.listWorkspaceFiles(CWD!);
+        assert.isAbove(result.paths.length, 0);
+        // The config file naming the node is itself in the workspace, so it is the one path
+        // that is guaranteed present without the testbed having to promise a fixture.
+        assert.include(result.paths, ".t3code/vcs.json");
+        // Not `live-local` — the answer came off another machine, and a consumer treating it
+        // as a local filesystem read is the bug this field exists to prevent.
+        assert.strictEqual(result.freshness.source, "explicit-remote");
+      }),
+    ),
+  );
+
+  it.effect("reads the node's remotes", () =>
+    driver((d) =>
+      Effect.gen(function* () {
+        const result = yield* d.listRemotes(CWD!);
+        assert.strictEqual(result.freshness.source, "explicit-remote");
+        // A testbed need not have a remote configured, so the shape is what is asserted:
+        // `remote -v` prints a fetch and a push line and they must fold into one record.
+        const names = result.remotes.map((remote) => remote.name);
+        assert.strictEqual(new Set(names).size, names.length, "fetch and push are one remote");
+        for (const remote of result.remotes) {
+          assert.isAbove(remote.url.length, 0);
+        }
+      }),
+    ),
+  );
+
+  it.effect("classifies ignored paths on the node and returns the survivors", () =>
+    driver((d) =>
+      Effect.gen(function* () {
+        // The node answers with the ignored subset; this function's contract is the complement,
+        // and a driver that returned the wrong half would silently invert every file filter.
+        const kept = yield* d.filterIgnoredPaths(CWD!, [".t3code/vcs.json"]);
+        assert.deepStrictEqual([...kept], [".t3code/vcs.json"]);
+
+        // An empty input must not become a round trip that fails on an empty body.
+        const none = yield* d.filterIgnoredPaths(CWD!, []);
+        assert.strictEqual(none.length, 0);
+      }),
+    ),
+  );
+
+  it.effect("runs git on the node", () =>
+    driver((d) =>
+      Effect.gen(function* () {
+        const result = yield* d.execute({
+          operation: "seam-test.execute",
+          cwd: CWD!,
+          args: ["rev-parse", "--is-inside-work-tree"],
+        });
+        assert.strictEqual(result.exitCode, 0);
+        assert.strictEqual(result.stdout.trim(), "true");
+      }),
+    ),
+  );
+
+  it.effect("a non-zero exit is an error unless the caller allowed it", () =>
+    driver((d) =>
+      Effect.gen(function* () {
+        const args = ["rev-parse", "--verify", "refs/heads/definitely-not-a-branch"];
+
+        // The node answers 200 with a non-zero `exitCode`, so it is the driver that has to
+        // decide this is a failure. Getting that wrong turns every broken git call into a
+        // success carrying an empty stdout.
+        const failed = yield* d
+          .execute({ operation: "seam-test.execute-fails", cwd: CWD!, args })
+          .pipe(Effect.flip);
+        assert.strictEqual(failed._tag, "VcsProcessExitError");
+
+        // And the same call is a result when the caller says a non-zero exit is expected —
+        // `check-ignore` and `gh pr view` both depend on this.
+        const allowed = yield* d.execute({
+          operation: "seam-test.execute-allowed",
+          cwd: CWD!,
+          args,
+          allowNonZeroExit: true,
+        });
+        assert.notStrictEqual(allowed.exitCode, 0);
+      }),
+    ),
+  );
 });
