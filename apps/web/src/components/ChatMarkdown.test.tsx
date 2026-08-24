@@ -105,6 +105,24 @@ describe("ChatMarkdown Windows file links", () => {
     },
   );
 
+  it.each([true, false])(
+    "does not disambiguate the same file in links and inline code with parseRawHtml=%s",
+    (parseRawHtml) => {
+      const path = String.raw`C:\Users\shawn\project\src\main.ts`;
+      const html = renderToStaticMarkup(
+        <ChatMarkdown
+          cwd="C:/Users/shawn/project"
+          text={`[Source](${path}) and \`${path}\``}
+          lineBreaks={!parseRawHtml}
+          parseRawHtml={parseRawHtml}
+        />,
+      );
+
+      expect(html.match(/chat-markdown-file-link/g)).toHaveLength(2);
+      expect(html).not.toContain("main.ts ·");
+    },
+  );
+
   it.each([true, false])("preserves reference links with parseRawHtml=%s", (parseRawHtml) => {
     const html = renderToStaticMarkup(
       <ChatMarkdown
