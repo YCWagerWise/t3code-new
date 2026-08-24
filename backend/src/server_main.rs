@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use agent_sdk_shell::{
     emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, SessionBinding,
-    Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
+    Projector, Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
 };
 
 use tokio::sync::RwLock;
@@ -923,7 +923,7 @@ async fn publish_approval_resolved(
     request_id: &str,
     decision: &str,
     allowed: bool,
-) {
+) -> Result<(), String> {
     let decision =
         if decision.is_empty() { if allowed { "accept" } else { "decline" } } else { decision };
     // `thread.approval-resolved` was invented — not in `OrchestrationEventType`,
@@ -936,23 +936,14 @@ async fn publish_approval_resolved(
     // entry keyed by that id). The activity `id` is the SAME stable id the
     // request used, so the reducer replaces that row instead of appending a
     // second one beneath it.
-    let _ = emit_thread_event(
-        &state.rt,
-        thread_id,
-        "thread.activity-appended",
-        json!({
-            "threadId": thread_id,
-            "activity": {
-                "id": format!("approval:{request_id}"),
-                "tone": "approval",
-                "kind": "approval.resolved",
-                "summary": format!("Approval {decision}"),
-                "payload": { "requestId": request_id, "decision": decision },
-                "createdAt": now_iso(),
-            },
-        }),
-    )
-    .await;
+    event_adapter::t3_projector(state.rt.clone())
+        .project(Lifecycle::ApprovalResolved {
+            thread_id: thread_id.to_string(),
+            request_id: request_id.to_string(),
+            decision: decision.to_string(),
+            allowed,
+        })
+        .await
 }
 
 /// Tell every thread subscriber the agent's question is answered.
@@ -962,24 +953,17 @@ async fn publish_approval_resolved(
 /// activity with `kind: "user-input.resolved"` carrying the request id, so after
 /// submitting an answer the user is left with a blocked composer and no way to
 /// tell that their answer landed.
-async fn publish_user_input_resolved(state: &AppState, thread_id: &str, session_id: &str) {
-    let _ = emit_thread_event(
-        &state.rt,
-        thread_id,
-        "thread.activity-appended",
-        json!({
-            "threadId": thread_id,
-            "activity": {
-                "id": format!("user-input:{session_id}"),
-                "tone": "approval",
-                "kind": "user-input.resolved",
-                "summary": "Answer sent",
-                "payload": { "requestId": session_id },
-                "createdAt": now_iso(),
-            },
-        }),
-    )
-    .await;
+async fn publish_user_input_resolved(
+    state: &AppState,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    event_adapter::t3_projector(state.rt.clone())
+        .project(Lifecycle::UserInputResolved {
+            thread_id: thread_id.to_string(),
+            session_id: session_id.to_string(),
+        })
+        .await
 }
 
 /// The parked wait FAILED to settle (packet M).
@@ -998,24 +982,14 @@ async fn publish_approval_failed(
     thread_id: &str,
     request_id: &str,
     detail: &str,
-) {
-    let _ = emit_thread_event(
-        &state.rt,
-        thread_id,
-        "thread.activity-appended",
-        json!({
-            "threadId": thread_id,
-            "activity": {
-                "id": format!("approval:{request_id}"),
-                "tone": "error",
-                "kind": "approval.requested",
-                "summary": detail,
-                "payload": { "requestId": request_id, "error": detail },
-                "createdAt": now_iso(),
-            },
-        }),
-    )
-    .await;
+) -> Result<(), String> {
+    event_adapter::t3_projector(state.rt.clone())
+        .project(Lifecycle::ApprovalFailed {
+            thread_id: thread_id.to_string(),
+            request_id: request_id.to_string(),
+            detail: detail.to_string(),
+        })
+        .await
 }
 
 /// The mirror for an answer to the agent's question that could not be
@@ -1027,24 +1001,14 @@ async fn publish_user_input_failed(
     thread_id: &str,
     session_id: &str,
     detail: &str,
-) {
-    let _ = emit_thread_event(
-        &state.rt,
-        thread_id,
-        "thread.activity-appended",
-        json!({
-            "threadId": thread_id,
-            "activity": {
-                "id": format!("user-input:{session_id}"),
-                "tone": "error",
-                "kind": "user-input.requested",
-                "summary": detail,
-                "payload": { "requestId": session_id, "error": detail },
-                "createdAt": now_iso(),
-            },
-        }),
-    )
-    .await;
+) -> Result<(), String> {
+    event_adapter::t3_projector(state.rt.clone())
+        .project(Lifecycle::UserInputFailed {
+            thread_id: thread_id.to_string(),
+            session_id: session_id.to_string(),
+            detail: detail.to_string(),
+        })
+        .await
 }
 
 /// Recompute source-control status for `cwd` and push it to every subscriber
@@ -3722,21 +3686,32 @@ async fn handle_request(
                     match routed {
                         None => {
                             tracing::error!(%request_id, "malformed approval requestId — refusing to route");
-                            publish_approval_failed(
-                                &state, &thread_id_of(&command), &request_id,
-                                "this approval could not be routed (malformed request id)",
+                            let detail =
+                                "this approval could not be routed (malformed request id)";
+                            if let Err(e) = publish_approval_failed(
+                                &state, &thread_id_of(&command), &request_id, detail,
                             )
-                            .await;
+                            .await
+                            {
+                                exit_failure(tx, &id, &format!("approval failure projection failed: {e}"));
+                                return;
+                            }
+                            exit_failure(tx, &id, detail);
+                            return;
                         }
                         Some((session, turn, call_id)) => {
                             match state.rt.respond_to_approval(&session, turn, &call_id, allow).await {
                                 Ok(_) => {
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
-                                    publish_approval_resolved(
+                                    if let Err(e) = publish_approval_resolved(
                                         &state, &thread_id_of(&command), &request_id, &decision, allow,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        exit_failure(tx, &id, &format!("approval settlement projection failed: {e}"));
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     // The answer did not land. Saying nothing
@@ -3744,11 +3719,18 @@ async fn handle_request(
                                     // ignored; clearing it would be worse. The
                                     // request stays pending and carries why.
                                     tracing::error!(%request_id, %e, "approval response failed");
-                                    publish_approval_failed(
+                                    let detail = format!("the approval could not be delivered: {e}");
+                                    if let Err(projection) = publish_approval_failed(
                                         &state, &thread_id_of(&command), &request_id,
-                                        &format!("the approval could not be delivered: {e}"),
+                                        &detail,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        return;
+                                    }
+                                    exit_failure(tx, &id, &detail);
+                                    return;
                                 }
                             }
                         }
@@ -3786,8 +3768,13 @@ async fn handle_request(
                             // success: telling the client the question is
                             // answered when the answer never reached the agent
                             // would unblock the composer over a lost answer.
-                            publish_user_input_resolved(&state, &thread_id_of(&command), &session)
-                                .await;
+                            if let Err(e) =
+                                publish_user_input_resolved(&state, &thread_id_of(&command), &session)
+                                    .await
+                            {
+                                exit_failure(tx, &id, &format!("user-input settlement projection failed: {e}"));
+                                return;
+                            }
                         }
                         Err(e) => {
                             // Same rule as an approval that could not be
@@ -3795,11 +3782,18 @@ async fn handle_request(
                             // visible reason, rather than being unblocked over
                             // an answer the agent never received.
                             tracing::error!(%request_id, %e, "user-input response failed");
-                            publish_user_input_failed(
+                            let detail = format!("your answer could not be delivered: {e}");
+                            if let Err(projection) = publish_user_input_failed(
                                 &state, &thread_id_of(&command), &session,
-                                &format!("your answer could not be delivered: {e}"),
+                                &detail,
                             )
-                            .await;
+                            .await
+                            {
+                                exit_failure(tx, &id, &format!("user-input failure projection failed: {projection}"));
+                                return;
+                            }
+                            exit_failure(tx, &id, &detail);
+                            return;
                         }
                     }
                 }
