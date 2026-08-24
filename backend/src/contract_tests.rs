@@ -178,6 +178,18 @@ fn every_projected_event_type_is_in_the_contract() {
             thread_id: v("t"), turn_id: v("u"), session_id: v("s"),
             prompt: v("which one?"), questions: None,
         },
+        Lifecycle::ApprovalResolved {
+            thread_id: v("t"), request_id: v("s|1|c"), decision: v("accept"), allowed: true,
+        },
+        Lifecycle::ApprovalFailed {
+            thread_id: v("t"), request_id: v("s|1|c"), detail: v("approval failed"),
+        },
+        Lifecycle::UserInputResolved {
+            thread_id: v("t"), session_id: v("s"),
+        },
+        Lifecycle::UserInputFailed {
+            thread_id: v("t"), session_id: v("s"), detail: v("answer failed"),
+        },
         Lifecycle::ToolStarted {
             thread_id: v("t"), turn_id: v("u"), call_id: v("c"),
             tool: v("run_bash"), args: json!({"command": "ls"}),
@@ -219,6 +231,20 @@ fn every_projected_event_type_is_in_the_contract() {
     let (_, ask) = project_items(&events[4], "2026-01-01T00:00:00.000Z");
     assert_eq!(ask[0].0, "thread.activity-appended");
     assert_eq!(ask[0].1["activity"]["kind"], "user-input.requested");
+    let (_, approval_resolved) = project_items(&events[5], "2026-01-01T00:00:00.000Z");
+    assert_eq!(approval_resolved[0].0, "thread.activity-appended");
+    assert_eq!(approval_resolved[0].1["activity"]["kind"], "approval.resolved");
+    let (_, approval_failed) = project_items(&events[6], "2026-01-01T00:00:00.000Z");
+    assert_eq!(approval_failed[0].0, "thread.activity-appended");
+    assert_eq!(approval_failed[0].1["activity"]["kind"], "approval.requested");
+    assert_eq!(approval_failed[0].1["activity"]["tone"], "error");
+    let (_, input_resolved) = project_items(&events[7], "2026-01-01T00:00:00.000Z");
+    assert_eq!(input_resolved[0].0, "thread.activity-appended");
+    assert_eq!(input_resolved[0].1["activity"]["kind"], "user-input.resolved");
+    let (_, input_failed) = project_items(&events[8], "2026-01-01T00:00:00.000Z");
+    assert_eq!(input_failed[0].0, "thread.activity-appended");
+    assert_eq!(input_failed[0].1["activity"]["kind"], "user-input.requested");
+    assert_eq!(input_failed[0].1["activity"]["tone"], "error");
 }
 
 /// Build a backend over an EXISTING workspace/data directory — i.e. what a
@@ -5133,7 +5159,9 @@ async fn a_settled_approval_is_a_replayable_resolved_activity() {
     state.rt.save_thread(&thread).await.unwrap();
     let before = state.rt.current_sequence().await.unwrap();
 
-    publish_approval_resolved(&state, "t-appr", "sess|0|call-1", "accept", true).await;
+    publish_approval_resolved(&state, "t-appr", "sess|0|call-1", "accept", true)
+        .await
+        .unwrap();
 
     let replayed = state.rt.events_after("t-appr", before, 100).await.unwrap();
     let ev = replayed
@@ -5176,7 +5204,7 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
     state.rt.save_thread(&thread).await.unwrap();
     let before = state.rt.current_sequence().await.unwrap();
 
-    publish_user_input_resolved(&state, "t-ui", "sess-9").await;
+    publish_user_input_resolved(&state, "t-ui", "sess-9").await.unwrap();
 
     let replayed = state.rt.events_after("t-ui", before, 100).await.unwrap();
     let ev = replayed
@@ -5192,6 +5220,48 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
     assert_eq!(
         activity["id"], "user-input:sess-9",
         "same row id as the request activity: {activity}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Settlement projection is durable lifecycle, not an RPC side effect hidden
+/// behind `let _ = emit_thread_event(...)`. If the replay log cannot accept the
+/// activity, every helper must return an error so the command handler can keep
+/// the request visibly pending or failed instead of acknowledging success.
+#[tokio::test]
+async fn settlement_projection_failures_are_reported() {
+    let (state, dir) = test_state().await;
+    let thread = json!({
+        "id": "t-settle-fails", "projectId": "p-workspace", "title": "settle",
+        "createdAt": now_iso(), "updatedAt": now_iso(),
+    });
+    state.rt.save_thread(&thread).await.unwrap();
+    let db = state.rt.store().db().clone();
+    db.execute("DROP TABLE thread_event", vec![]).await.unwrap();
+
+    assert!(
+        publish_approval_resolved(&state, "t-settle-fails", "sess|0|call-1", "accept", true)
+            .await
+            .is_err(),
+        "approval resolution must fail when the durable event log write fails"
+    );
+    assert!(
+        publish_approval_failed(&state, "t-settle-fails", "sess|0|call-1", "failed")
+            .await
+            .is_err(),
+        "approval failure mirror must fail when the durable event log write fails"
+    );
+    assert!(
+        publish_user_input_resolved(&state, "t-settle-fails", "sess-9")
+            .await
+            .is_err(),
+        "user-input resolution must fail when the durable event log write fails"
+    );
+    assert!(
+        publish_user_input_failed(&state, "t-settle-fails", "sess-9", "failed")
+            .await
+            .is_err(),
+        "user-input failure mirror must fail when the durable event log write fails"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
