@@ -25,6 +25,12 @@ async fn test_state() -> (AppState, std::path::PathBuf) {
     (state, dir)
 }
 
+async fn drop_runtime_kv(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE kv", vec![]).await.unwrap();
+}
+
 /// PROOF (#320 anti-regression, packet AE): the product backend must not
 /// re-grow authority the SDK/do-rs now owns. Each symbol below was
 /// previously a live product-owned hidden authority and its deletion is
@@ -316,6 +322,11 @@ fn checkpoint_thread(id: &str) -> Value {
         "projectId": "p-workspace",
         "title": id,
         "runtimeMode": "full-access",
+        // The thread decoder refuses to INVENT these two, so a fixture that
+        // omits them is not a valid durable thread row. `null` is a recorded
+        // "no selection", which is what this fixture means.
+        "modelSelection": Value::Null,
+        "interactionMode": "default",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     })
@@ -2335,7 +2346,7 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
 
     // and it SURVIVES a reload: a fresh catalog built from the store still has it.
     let reloaded =
-        settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+        settings::load_instances(state.rt.store(), providers::configured_instances()).await.unwrap();
     assert!(
         reloaded.iter().any(|c| c.instance_id == "ollama_local"),
         "ollama persisted across reload"
@@ -2354,7 +2365,7 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
             .is_none(),
         "ollama removed from settings"
     );
-    let gone = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+    let gone = settings::load_instances(state.rt.store(), providers::configured_instances()).await.unwrap();
     assert!(
         !gone.iter().any(|c| c.instance_id == "ollama_local"),
         "ollama gone from durable store"
@@ -2997,6 +3008,42 @@ async fn asset_urls_are_minted_signed_and_confined() {
     );
 }
 
+#[tokio::test]
+async fn unreadable_kv_does_not_rotate_the_asset_signing_key() {
+    let (state, _dir) = test_state().await;
+    drop_runtime_kv(&state).await;
+
+    let err = assets::signing_key(state.rt.store())
+        .await
+        .expect_err("unreadable signing-key storage must not mint a replacement key");
+    assert!(
+        err.contains("assets:signing_key") || err.contains("kv value"),
+        "the error should name durable key authority: {err}"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_kv_fails_settings_and_keybinding_reads() {
+    let (state, _dir) = test_state().await;
+    drop_runtime_kv(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "server.getSettings", json!({})).await;
+    let settings = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("settings exits");
+    assert_eq!(
+        settings["exit"]["_tag"], "Failure",
+        "settings must not fall back to defaults over unreadable kv: {settings}"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "server.getConfig", json!({})).await;
+    let config = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("config exits");
+    assert_eq!(
+        config["exit"]["_tag"], "Failure",
+        "keybindings/config must not fall back to defaults over unreadable kv: {config}"
+    );
+}
+
 /// The client pings this on a timer; failing it made every connected client
 /// log an error every few seconds. It is an ACK, not an unsupported method.
 #[tokio::test]
@@ -3374,6 +3421,68 @@ async fn stop_command_fails_when_terminal_interrupt_fails() {
     assert!(
         exits[0].to_string().contains("terminal interrupt failed"),
         "failure must name Hearth/terminal interrupt: {exits:?}"
+    );
+}
+
+#[tokio::test]
+async fn stop_command_fails_when_hearth_interrupt_fails() {
+    let (state, _d) = test_state().await;
+    let _ = state.terminal.shutdown().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.turn.interrupt", "threadId": "t-stop-fail",
+    }})).await;
+
+    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "one request must produce exactly one terminal frame: {exits:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "a failed Hearth foreground interrupt must not be acknowledged as success: {exits:?}"
+    );
+    let defect = exits[0]["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("terminal interrupt failed"),
+        "the failure should name the failed stop leg: {exits:?}"
+    );
+}
+
+#[tokio::test]
+async fn stop_command_fails_when_sdk_cancel_fails() {
+    let (state, _d) = test_state().await;
+    let binding = SessionBinding {
+        thread_id: "t-sdk-stop-fail".into(),
+        provider_instance_id: "claude_resume:test".into(),
+        model_key: "k".into(),
+    };
+    let def = AgentDefinition {
+        name: "t3code".into(),
+        instructions: String::new(),
+        model: ModelRef::ClaudeResume { model: "test".into() },
+        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
+        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+    };
+    let sid = state.rt.session_for(&binding, def).await.unwrap();
+
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data"));
+    let db = pool.object_db("ShellSession", &sid).await.unwrap();
+    db.execute("DROP TABLE agent_control", vec![]).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.session.stop", "threadId": "t-sdk-stop-fail",
+    }})).await;
+
+    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "one request must produce exactly one terminal frame: {exits:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "a failed SDK durable cancel must not be acknowledged as success: {exits:?}"
+    );
+    let defect = exits[0]["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("thread.session.stop failed") && defect.contains("agent_control"),
+        "the failure should name the SDK stop leg and durable control table: {exits:?}"
     );
 }
 
@@ -5347,6 +5456,11 @@ async fn stacked_action_progress_is_readable_while_the_action_is_still_running()
 async fn vcs_status_is_a_live_subscription_not_a_one_shot() {
     let (state, dir) = test_state().await;
     cairn::init_repository(&dir).await.unwrap();
+    // The runtime's own data dir lives INSIDE this fixture repo, and the engine
+    // keeps sidecars next to its database (`-wal`, `-tshm`, `-xproc`). Those are
+    // not user work: without this the post-commit status reports a dirty tree
+    // for files the agent wrote about itself.
+    std::fs::write(dir.join(".gitignore"), "data/\n").unwrap();
     std::fs::write(dir.join("a.txt"), "one\n").unwrap();
     let cwd = dir.to_string_lossy().into_owned();
 
@@ -5566,6 +5680,56 @@ async fn subscribe_thread_snapshot_reads_durable_messages() {
     );
 }
 
+/// #96: accepting a websocket frame is not enough; the durable ack still has
+/// to land. If ack fails after delivery, the subscription must report the
+/// stream error and run cleanup instead of continuing as synchronized.
+#[tokio::test]
+async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
+    let (state, dir) = test_state().await;
+    let thread_id = "t-tail-ack";
+    let (_mark, tail) = state.rt.snapshot_tail(thread_id).await.unwrap();
+    emit_thread_event(
+        &state.rt,
+        thread_id,
+        "thread.message.assistant.delta",
+        json!({ "text": "hello" }),
+    ).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    spawn_thread_tail_with_cleanup(tail, tx, json!(7), thread_id.to_string(), async move {
+        let _ = closed_tx.send(());
+    });
+
+    let (frame, done) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await.expect("tail delivered a frame")
+        .expect("tail channel stayed open");
+    let delivered: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        delivered["values"][0]["event"]["payload"]["text"], "hello",
+        "the test must fail ack after a real accepted delivery: {delivered}"
+    );
+
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE inbox", vec![]).await.unwrap();
+    done.expect("tail frames carry delivery confirmation").send(true)
+        .expect("confirm delivery before ack fails");
+
+    let (error_frame, _) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await.expect("ack failure is surfaced")
+        .expect("error frame is sent before close");
+    let error: Value = serde_json::from_str(&error_frame).unwrap();
+    let msg = error["values"][0]["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("thread subscription failed"),
+        "ack failure must be a visible stream error, not a hidden log: {error}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), closed_rx)
+        .await.expect("ack failure closes and runs cleanup")
+        .expect("cleanup sender fires");
+}
+
 /// PROOF (#299): the wire sequence does not REWIND across a restart.
 ///
 /// It used to be a per-process `Store::seq`, initialised to 1 at boot and
@@ -5669,7 +5833,8 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         state
             .rt
             .save_thread(&json!({ "runtimeMode": "full-access","id": "t-reconnect", "title": "before the restart",
-                "projectId": "p-workspace", "createdAt": now_iso(), "updatedAt": now_iso()}))
+                "projectId": "p-workspace", "modelSelection": null, "interactionMode": "default",
+                "createdAt": now_iso(), "updatedAt": now_iso()}))
             .await
             .unwrap();
         for (id, role, text) in [("m1", "user", "hi"), ("m2", "assistant", "hello there")] {
@@ -7873,6 +8038,7 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-durable-only", "projectId": "p-workspace", "title": "written durably",
+            "modelSelection": null, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -8065,7 +8231,14 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
     let (state, _d) = test_state().await;
     state
         .rt
-        .save_thread(&json!({ "runtimeMode": "full-access", "id": "t-big", "title": "big" }))
+        .save_thread(&json!({
+            "runtimeMode": "full-access", "id": "t-big", "title": "big",
+            // subscribeThread PROJECTS this row, and the projection refuses to
+            // invent metadata — so a durable thread row has to carry it.
+            "projectId": "p-workspace", "modelSelection": Value::Null,
+            "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
         .await
         .unwrap();
     seed_prompt(&state, "t-big", "u1", "hello").await;
@@ -8671,6 +8844,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 fn thread_row_ck(id: &str) -> Value {
     json!({
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
+        "modelSelection": null, "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
 }
@@ -8893,7 +9067,9 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
     // The thread is dispatched into the WORKTREE.
     let thread = json!({
         "id": "t-wt", "projectId": "p-workspace", "title": "wt-thread",
+        "modelSelection": null,
         "runtimeMode": "full-access",
+        "interactionMode": "default",
         "worktreePath": worktree.to_string_lossy(),
         "createdAt": now_iso(), "updatedAt": now_iso(),
     });
@@ -9122,6 +9298,7 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-archived", "projectId": "p-workspace", "title": "old",
+            "modelSelection": null, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(), "archivedAt": now_iso(),
         }))
         .await
@@ -9266,6 +9443,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-live", "projectId": "p-workspace", "title": "int",
+            "modelSelection": null, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9560,6 +9738,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-neg", "projectId": "p-workspace", "title": "int-neg",
+            "modelSelection": null, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9655,6 +9834,7 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     // (interrupt on an unknown thread is a no-op, not an error).
     state.rt.save_thread(&json!({ "runtimeMode": "full-access",
         "id": "t-int", "projectId": "p-workspace", "title": "int",
+        "modelSelection": null, "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })).await.unwrap();
     let ready = state.terminal.run("echo ready", false, Some(10), false).await;

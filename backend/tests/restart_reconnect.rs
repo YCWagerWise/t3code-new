@@ -105,7 +105,16 @@ fn projector(rt: &ThreadRuntime) -> BusProjector {
 }
 
 fn thread_row(id: &str) -> Value {
-    json!({ "id": id, "projectId": "p-workspace", "title": "restart", "createdAt": "now" })
+    json!({
+        "id": id,
+        "projectId": "p-workspace",
+        "title": "restart",
+        "modelSelection": null,
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+    })
 }
 
 /// Emit one numbered thread event the way the product's projector does:

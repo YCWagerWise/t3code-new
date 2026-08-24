@@ -47,6 +47,39 @@ use t3code_agent::{
 /// This is what lets the tail ack the bus AFTER delivery, not after enqueue.
 type OutFrame = (String, Option<tokio::sync::oneshot::Sender<bool>>);
 
+struct WsThreadSink {
+    tx: mpsc::UnboundedSender<OutFrame>,
+    req: Value,
+}
+
+#[async_trait::async_trait]
+impl agent_sdk_shell::ThreadSink for WsThreadSink {
+    async fn deliver(&self, item: Value) -> Result<(), String> {
+        let frame = json!({ "_tag": "Chunk", "clientId": 0, "requestId": self.req.clone(), "values": [item] }).to_string();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send((frame, Some(done_tx)))
+            .map_err(|_| "websocket channel closed before thread event delivery".to_string())?;
+        match done_rx.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("websocket sink rejected thread event".to_string()),
+            Err(_) => Err("websocket delivery confirmation dropped".to_string()),
+        }
+    }
+}
+
+async fn interrupt_foreground_terminal(runner: &terminal::Terminal) -> Result<String, String> {
+    // hearth reports a PTY it could not write to as an Err; the legacy
+    // "ERROR:"-prefixed string is still checked because the shim shapes some
+    // failures that way.
+    let out = runner.interrupt().await.map_err(|e| e.to_string())?;
+    if let Some(err) = out.strip_prefix("ERROR:") {
+        Err(err.trim().to_string())
+    } else {
+        Ok(out)
+    }
+}
+
 /// Shared server state. The turn engine, thread↔session binding, stream cursor,
 /// history and lifecycle projection all live in the SDK's [`ThreadRuntime`] —
 /// the backend delegates to it and owns only the socket wiring.
@@ -442,7 +475,9 @@ async fn main() {
     // settings survives restart instead of falling back to the skinny boot env
     // catalog (#47). The picker renders its snapshots and every turn resolves
     // against it; settings writes reconcile it in place.
-    let instances = settings::load_instances(rt.store(), providers::configured_instances()).await;
+    let instances = settings::load_instances(rt.store(), providers::configured_instances())
+        .await
+        .expect("server settings unreadable at boot");
     // Ask every configured OpenAI-compatible endpoint what it serves before the
     // first picker render: an install pointed at a running Ollama should show
     // its models without the user hand-typing slugs (#180). Unreachable
@@ -1455,7 +1490,7 @@ fn spawn_thread_tail_with_cleanup<F>(
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let _ = &thread_id;
+        let sink = WsThreadSink { tx: tx.clone(), req: req.clone() };
         loop {
             match tail.next(std::time::Duration::from_secs(25)).await {
                 Ok(items) => {
@@ -1478,7 +1513,24 @@ fn spawn_thread_tail_with_cleanup<F>(
                         }
                     }
                     if hi >= 0 {
-                        let _ = tail.ack(hi).await;
+                        // A DROPPED ACK IS A SILENT REPLAY (#96). The socket
+                        // took the frames, the durable cursor did not move, and
+                        // the next reconnect re-delivers everything already
+                        // shown. Surface it and close, rather than continuing to
+                        // stream against a cursor that is no longer advancing.
+                        if let Err(e) = tail.ack(hi).await {
+                            let frame = json!({
+                                "_tag": "Chunk", "clientId": 0, "requestId": req,
+                                "values": [{ "error": {
+                                    "message": format!("thread subscription failed: {e}")
+                                }}],
+                            })
+                            .to_string();
+                            let _ = tx.send((frame, None));
+                            tail.close().await;
+                            on_close.await;
+                            return;
+                        }
                     }
                 }
                 Err(_) => {
@@ -1677,18 +1729,36 @@ async fn stop_thread_checked(
     thread_id: &str,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    // hearth's foreground interrupt is fallible; a PTY it could not write to
-    // means the command is still running, which must not settle the stop.
-    let shell_out = terminal::interrupt(&state.terminal)
+    // A stop has TWO legs — hearth's foreground interrupt and the SDK's durable
+    // cancel — and they fail independently. Short-circuiting on the first one
+    // let a dead PTY mask an unwritten durable cancel: the user saw "stop
+    // failed" for the shell while the turn kept running with nothing recorded.
+    // So attempt both, and report every leg that failed.
+    let shell = terminal::interrupt(&state.terminal)
         .await
-        .map_err(|e| format!("hearth foreground interrupt failed: {e}"))?;
-    let sessions = if kind == "thread.session.stop" {
+        .map_err(|e| format!("terminal interrupt failed: {e}"));
+    let runtime = if kind == "thread.session.stop" {
         state.rt.stop(thread_id).await
     } else {
         state.rt.interrupt(thread_id).await
-    }?;
+    }
+    .map_err(|e| format!("runtime cancel failed: {e}"));
+
+    let (shell_out, sessions) = match (shell, runtime) {
+        (Ok(out), Ok(sessions)) => (out, sessions),
+        (shell, runtime) => {
+            let mut legs = Vec::new();
+            if let Err(e) = shell {
+                legs.push(e);
+            }
+            if let Err(e) = runtime {
+                legs.push(e);
+            }
+            return Err(legs.join("; "));
+        }
+    };
     if shell_out.starts_with("ERROR:") {
-        return Err(format!("hearth foreground interrupt failed: {shell_out}"));
+        return Err(format!("terminal interrupt failed: {shell_out}"));
     }
     Ok(sessions)
 }
@@ -2125,7 +2195,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Read the stored rules BEFORE taking the catalog lock: the config
             // body needs both, and holding the lock across an await would let a
             // concurrent settings write stall every boot handshake.
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             let cat = state.catalog.read().await;
             exit_success(tx, &id, server_config(&cat, &custom));
         }
@@ -2259,7 +2332,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // and a partial answer would blank every other binding.
         "server.upsertKeybinding" | "server.removeKeybinding" => {
             let input = keybindings::input_of(&payload);
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             let next = if method == "server.upsertKeybinding" {
                 keybindings::upsert(&custom, &input)
             } else {
@@ -2289,9 +2365,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // runtime routes. Each write persists to the do-rs store and reconciles
         // the SAME live catalog, then answers with the shape the UI decodes.
         "server.getSettings" => {
-            let instances =
-                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
-            let other = settings::load_other(state.rt.store()).await;
+            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(instances) => instances,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             exit_success(tx, &id, settings::settings_wire(&instances, &other));
         }
         "server.updateSettings" => {
@@ -2303,8 +2384,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 exit_failure(tx, &id, &e);
                 return;
             }
-            let current =
-                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(current) => current,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             let next = settings::apply_patch(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
@@ -2313,8 +2396,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Persist every OTHER settings field the patch carried, so a saved
             // writing style / model selection / observability config round-trips
             // instead of resetting to defaults on the next getSettings (#87).
-            let other =
-                settings::merge_other(&settings::load_other(state.rt.store()).await, &payload);
+            let existing_other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let other = settings::merge_other(&existing_other, &payload);
             if let Err(e) = settings::save_other(state.rt.store(), &other).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
                 return;
@@ -2322,8 +2408,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Reconcile + answer with the EFFECTIVE set (saved re-merged under the
             // boot defaults), so a whole-map replace that removed a custom
             // provider drops it from the catalog while stock providers survive.
-            let effective =
-                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let effective = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(effective) => effective,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             settings::reconcile(&mut *state.catalog.write().await, &effective);
             let wire = settings::settings_wire(&effective, &other);
             exit_success(tx, &id, wire.clone());
@@ -2344,8 +2432,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "server.refreshProviders" => {
             // re-reconcile from the durable set (re-probes availability), then
             // answer with the current provider snapshots the UI renders.
-            let instances =
-                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(instances) => instances,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             // A refresh is exactly when to ASK each OpenAI-compatible endpoint
             // what it serves: the user pointed at an Ollama and expects its
             // models to appear without hand-typing slugs (#180).
@@ -2369,8 +2459,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             .await;
         }
         "server.updateProvider" => {
-            let current =
-                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(current) => current,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             let next = settings::apply_provider_update(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist provider failed: {e}"));
@@ -2853,7 +2945,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "subscribeServerConfig" => {
             // an initial snapshot, so a late subscriber is not stuck with
             // whatever it cached before connecting
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             chunk(
                 tx,
                 &id,
@@ -2928,7 +3023,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     exit_typed_failure(tx, &id, json!({
                         "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
                                 else { "OrchestrationGetFullThreadDiffError" },
-                        "message": format!("thread mapping unavailable: {e}"),
+                        "message": format!("thread worktree unavailable: {e}"),
                     }));
                     return;
                 }
@@ -3728,8 +3823,16 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
             };
-            if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
-                terminal::resize(&runner, rows as u16, cols as u16).await;
+            if let (Some(cols), Some(rows)) = (
+                payload.get("cols").and_then(Value::as_u64),
+                payload.get("rows").and_then(Value::as_u64),
+            ) {
+                // A refused resize is not a resize. Acking success here told the
+                // client its terminal had been resized when hearth had rejected
+                // the control outright.
+                if let Err(e) = terminal::resize(&runner, rows as u16, cols as u16).await {
+                    return exit_failure(tx, &id, &format!("terminal.resize: {e}"));
+                }
             }
             exit_success(tx, &id, Value::Null);
         }
@@ -3944,27 +4047,28 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 .open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[])
                 .await
             {
+                // The subscriber asked for pane METADATA. An unreadable pane
+                // store is an answer to that question — "the store is
+                // unavailable" — and it has to arrive on the stream, because a
+                // bare RPC failure renders as no terminals rather than as a
+                // fault the panel can show.
+                chunk(
+                    tx,
+                    &id,
+                    json!({
+                        "type": "store_unavailable",
+                        "threadId": thread,
+                        "terminals": Value::Null,
+                        "error": format!("terminal pane store unavailable: {e}"),
+                    }),
+                );
                 return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}"));
             }
-            let now = now_iso();
-            match state.terminals.list(&thread_owner).await {
-                Ok(panes) => {
-                    let mut rows = Vec::new();
-                    for pane in panes {
-                        rows.push(terminal::pane_summary(&pane, &now).await);
-                    }
-                    chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
-                }
-                Err(e) => {
-                    chunk(tx, &id, json!({
-                        "type": "snapshot",
-                        "terminals": [],
-                        "statusUnavailable": true,
-                        "statusError": e,
-                    }));
-                    return;
-                }
-            }
+            // ATTACH THE TAIL BEFORE EMITTING ANYTHING. The merge left a
+            // second snapshot here, ahead of the attach — so a subscription
+            // whose durable tail then failed had already sent a live-looking
+            // snapshot chunk, and the client rendered a stream that was never
+            // going to receive an update.
             // Metadata fanout on the SDK's generic named-topic seam, scoped
             // per thread so a subscriber only wakes for its own panes.
             // Suppress the retained frame (the snapshot above already covered
@@ -3993,7 +4097,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Err(e) => chunk(
                     tx,
                     &id,
-                    json!({ "type": "store_unavailable", "error": e.to_string() }),
+                    json!({
+                        "type": "store_unavailable",
+                        "terminals": Value::Null,
+                        "error": format!("terminal pane store unavailable: {e}"),
+                    }),
                 ),
             }
             spawn_thread_tail(tail, tx.clone(), id.clone(), topic.clone());
@@ -4218,7 +4326,16 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             exit_failure(tx, &id, &format!("{kind} failed: {e}"));
                             return;
                         }
-                    }
+                    };
+                    let shell_out = match interrupt_foreground_terminal(&state.terminal).await {
+                        Ok(out) => out,
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
+                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
+                            return;
+                        }
+                    };
+                    tracing::info!(%thread_id, %kind, %shell_out, "stop dispatched");
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
                 // and doing nothing was the worst available behaviour — the UI
@@ -4253,7 +4370,17 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     }
                     if let Err(e) = revert_checkpoint(&state, &thread_id, turn_count).await {
                         tracing::error!(%thread_id, turn_count, %e, "checkpoint revert failed");
-                        exit_failure(tx, &id, &format!("checkpoint revert failed: {e}"));
+                        // TYPED failure, not a defect: the client matches on
+                        // the error tag to render a dispatch failure. A bare
+                        // Die reaches it as an unhandled crash instead.
+                        exit_typed_failure(
+                            tx,
+                            &id,
+                            json!({
+                                "_tag": "OrchestrationDispatchCommandError",
+                                "message": format!("checkpoint revert failed: {e}"),
+                            }),
+                        );
                         return;
                     }
                 }

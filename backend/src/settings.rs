@@ -26,18 +26,11 @@ const INSTANCES_KEY: &str = "server_settings:provider_instances";
 const OTHER_KEY: &str = "server_settings:other";
 
 /// The stored non-provider settings fields (empty until the user saves one).
-pub async fn load_other(store: &OrchStore) -> Map<String, Value> {
-    // `kv` is fallible now. An unreadable store is not "no settings saved", but
-    // this loader has no error channel, so keep the existing empty-map fallback
-    // and say WHY in the log rather than silently conflating the two.
-    match store.kv(OTHER_KEY).await {
-        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
-        Ok(None) => Map::new(),
-        Err(e) => {
-            tracing::error!(%e, "settings store unreadable; serving empty settings");
-            Map::new()
-        }
-    }
+pub async fn load_other(store: &OrchStore) -> Result<Map<String, Value>, String> {
+    let Some(raw) = store.kv(OTHER_KEY).await? else {
+        return Ok(Map::new());
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("{OTHER_KEY} is malformed: {e}"))
 }
 
 pub async fn save_other(store: &OrchStore, other: &Map<String, Value>) -> Result<(), String> {
@@ -251,17 +244,14 @@ fn parse_instance_keyed(key: &str, v: &Value) -> Option<ProviderInstanceConfig> 
 pub async fn load_instances(
     store: &OrchStore,
     defaults: Vec<ProviderInstanceConfig>,
-) -> Vec<ProviderInstanceConfig> {
-    let saved: Vec<ProviderInstanceConfig> = match store.kv(INSTANCES_KEY).await {
-        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            tracing::error!(%e, "provider instance store unreadable; using defaults");
-            Vec::new()
-        }
+) -> Result<Vec<ProviderInstanceConfig>, String> {
+    let saved: Vec<ProviderInstanceConfig> = match store.kv(INSTANCES_KEY).await? {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("{INSTANCES_KEY} is malformed: {e}"))?,
+        None => Vec::new(),
     };
     if saved.is_empty() {
-        return defaults;
+        return Ok(defaults);
     }
     let mut out = defaults;
     for s in saved {
@@ -271,7 +261,7 @@ pub async fn load_instances(
             out.push(s);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Persist the current instance set durably (write-through, reported on failure).

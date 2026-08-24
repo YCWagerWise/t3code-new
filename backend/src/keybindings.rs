@@ -417,17 +417,22 @@ fn same_rule(a: &Rule, b: &Rule) -> bool {
     a.command == b.command && a.key == b.key && a.when == b.when
 }
 
-/// Load the user's custom rules. A stored blob that no longer decodes yields an
-/// EMPTY custom set (so the user falls back to working defaults) rather than an
-/// error that would make the settings page unopenable.
-pub async fn load_custom(store: &OrchStore) -> Vec<Rule> {
-    let Ok(Some(raw)) = store.kv(KEYBINDINGS_KEY).await else {
-        return Vec::new();
+/// Load the user's custom rules.
+///
+/// A store that cannot be READ is an error: serving defaults there would tell
+/// the user their bindings are gone. A stored blob that no longer DECODES is
+/// also an error, and both reach the settings page as a message rather than as
+/// a silently empty custom set.
+pub async fn load_custom(store: &OrchStore) -> Result<Vec<Rule>, String> {
+    let Some(raw) = store.kv(KEYBINDINGS_KEY).await? else {
+        return Ok(Vec::new());
     };
-    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
+    let Value::Array(items) = serde_json::from_str::<Value>(&raw)
+        .map_err(|e| format!("{KEYBINDINGS_KEY} is malformed: {e}"))?
+    else {
+        return Err(format!("{KEYBINDINGS_KEY} is malformed: expected an array"));
     };
-    items.iter().filter_map(Rule::from_wire).collect()
+    Ok(items.iter().filter_map(Rule::from_wire).collect())
 }
 
 pub async fn save_custom(store: &OrchStore, rules: &[Rule]) -> Result<(), String> {
