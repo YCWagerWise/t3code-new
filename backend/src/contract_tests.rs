@@ -48,7 +48,11 @@ fn product_backend_does_not_re_grow_deleted_authority() {
     let code: String = src
         .lines()
         .map(|l| {
-            if let Some(idx) = l.find("//") { &l[..idx] } else { l }
+            if let Some(idx) = l.find("//") {
+                &l[..idx]
+            } else {
+                l
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -106,8 +110,7 @@ fn product_backend_does_not_re_grow_deleted_authority() {
     let direct_bus_publish = s("bus()", ".publish(");
     let direct_bus_shell = s("bus()", ".shell_publish(");
     assert!(
-        !code.contains(direct_bus_publish.as_str())
-            && !code.contains(direct_bus_shell.as_str()),
+        !code.contains(direct_bus_publish.as_str()) && !code.contains(direct_bus_shell.as_str()),
         "server_main.rs calls the broker directly; use emit_thread_event / \
          ThreadRuntime::shell_publish so the durable sequence is allocated \
          and the row is recorded before it is announced live."
@@ -163,30 +166,55 @@ fn every_projected_event_type_is_in_the_contract() {
     // the names it puts on the wire.
     let v = |s: &str| s.to_string();
     let events = vec![
-        Lifecycle::TurnStarted { thread_id: v("t"), turn_id: v("u") },
+        Lifecycle::TurnStarted {
+            thread_id: v("t"),
+            turn_id: v("u"),
+        },
         Lifecycle::Delta {
-            thread_id: v("t"), turn_id: v("u"), message_id: v("m"), text: v("hi"),
+            thread_id: v("t"),
+            turn_id: v("u"),
+            message_id: v("m"),
+            text: v("hi"),
         },
         Lifecycle::MessageFinal {
-            thread_id: v("t"), turn_id: v("u"), message_id: v("m"), text: v("hi"),
+            thread_id: v("t"),
+            turn_id: v("u"),
+            message_id: v("m"),
+            text: v("hi"),
         },
         Lifecycle::ApprovalRequested {
-            thread_id: v("t"), turn_id: v("u"), session_id: v("s"), turn: 1,
-            call_id: v("c"), tool: v("run_bash"), args: json!({"command": "ls"}),
+            thread_id: v("t"),
+            turn_id: v("u"),
+            session_id: v("s"),
+            turn: 1,
+            call_id: v("c"),
+            tool: v("run_bash"),
+            args: json!({"command": "ls"}),
         },
         Lifecycle::UserInputRequested {
-            thread_id: v("t"), turn_id: v("u"), session_id: v("s"),
-            prompt: v("which one?"), questions: None,
+            thread_id: v("t"),
+            turn_id: v("u"),
+            session_id: v("s"),
+            prompt: v("which one?"),
+            questions: None,
         },
         Lifecycle::ToolStarted {
-            thread_id: v("t"), turn_id: v("u"), call_id: v("c"),
-            tool: v("run_bash"), args: json!({"command": "ls"}),
+            thread_id: v("t"),
+            turn_id: v("u"),
+            call_id: v("c"),
+            tool: v("run_bash"),
+            args: json!({"command": "ls"}),
         },
         Lifecycle::ToolCompleted {
-            thread_id: v("t"), turn_id: v("u"), call_id: v("c"), output: json!("done"),
+            thread_id: v("t"),
+            turn_id: v("u"),
+            call_id: v("c"),
+            output: json!("done"),
         },
         Lifecycle::TurnEnded {
-            thread_id: v("t"), turn_id: v("u"), outcome: TurnOutcome::Completed,
+            thread_id: v("t"),
+            turn_id: v("u"),
+            outcome: TurnOutcome::Completed,
         },
     ];
 
@@ -241,7 +269,10 @@ fn every_projected_event_type_is_in_the_contract() {
 /// being deleted or re-pointed at the substrate directly.
 async fn checkpoint_turn_start(state: &AppState, cwd: &str, turn_id: &str) {
     use agent_sdk_shell::TurnCheckpointer;
-    let cp = super::WorkspaceCheckpointer { state: state.clone(), cwd: cwd.to_string() };
+    let cp = super::WorkspaceCheckpointer {
+        state: state.clone(),
+        cwd: cwd.to_string(),
+    };
     cp.checkpoint_turn_start(turn_id)
         .await
         .expect("checkpoint_turn_start must succeed");
@@ -307,21 +338,27 @@ async fn state_built(
     let dir = dir.to_path_buf();
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let runner = tools::open_workspace_shell(&dir, data.clone()).await.unwrap();
+    let runner = tools::open_workspace_shell(&dir, data.clone())
+        .await
+        .unwrap();
     let tool_roots = tools::ToolRoots::new(dir.clone(), data.clone(), runner.clone()).await;
     let shell = Shell::new(&data, tool_roots.registry_factory());
     let shell = Arc::new(match &with_model {
         Some(decorate) => decorate(shell),
         None => shell,
     });
-    let rt = ThreadRuntime::open(shell, data.to_str().unwrap(), "main").await.unwrap();
+    let rt = ThreadRuntime::open(shell, data.to_str().unwrap(), "main")
+        .await
+        .unwrap();
     // Seed the workspace project the same way boot does (#370). Every
     // contract test used to inline a `p-workspace` Vec into Store; now
     // the durable store IS the source, so tests use the same seed path.
     rt.save_project(&json!({"id": "p-workspace", "title": "workspace",
         "workspaceRoot": dir.to_string_lossy().into_owned(),
         "defaultModelSelection": null, "scripts": [],
-        "createdAt": now_iso(), "updatedAt": now_iso()})).await.unwrap();
+        "createdAt": now_iso(), "updatedAt": now_iso()}))
+        .await
+        .unwrap();
     let state = AppState {
         rt,
         catalog: Arc::new(RwLock::new(providers::catalog())),
@@ -349,7 +386,9 @@ async fn state_built(
         // whoever ran it.
         usage_sources: Arc::new(Vec::new()),
         usage_rates: Default::default(),
-        env: json!({}), cwd: dir.to_string_lossy().into(), project_name: "t".into(),
+        env: json!({}),
+        cwd: dir.to_string_lossy().into(),
+        project_name: "t".into(),
     };
     state
 }
@@ -362,7 +401,9 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<OutFrame>) -> Vec<Value> {
     // reach the broker with no reader.
     let mut out = vec![];
     while let Ok((s, done)) = rx.try_recv() {
-        if let Some(tx) = done { let _ = tx.send(true); }
+        if let Some(tx) = done {
+            let _ = tx.send(true);
+        }
         out.push(serde_json::from_str(&s).unwrap());
     }
     out
@@ -383,7 +424,9 @@ where
     let mut out: Vec<Value> = vec![];
     while start.elapsed() < deadline {
         out.extend(drain(rx));
-        if out.iter().any(&pred) { return out; }
+        if out.iter().any(&pred) {
+            return out;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     out.extend(drain(rx));
@@ -403,8 +446,18 @@ async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: 
         .unwrap();
 }
 
-async fn request(state: &AppState, tx: &mpsc::UnboundedSender<OutFrame>, method: &str, payload: Value) {
-    handle_request(&json!({ "_tag": "Request", "id": 7, "tag": method, "payload": payload }), tx, state).await;
+async fn request(
+    state: &AppState,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    method: &str,
+    payload: Value,
+) {
+    handle_request(
+        &json!({ "_tag": "Request", "id": 7, "tag": method, "payload": payload }),
+        tx,
+        state,
+    )
+    .await;
 }
 
 /// #400 second failure path: `save_project` succeeds but the
@@ -417,12 +470,16 @@ async fn project_meta_update_fails_when_shell_replay_emission_fails() {
     use agent_sdk_do::ObjectDb;
     let (state, dir) = test_state().await;
     // Seed a real project so the id branch passes.
-    state.rt.save_project(&json!({
-        "id": "p-real", "title": "before",
-        "workspaceRoot": "/tmp",
-        "defaultModelSelection": null, "scripts": [],
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_project(&json!({
+            "id": "p-real", "title": "before",
+            "workspaceRoot": "/tmp",
+            "defaultModelSelection": null, "scripts": [],
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
 
     // Fault-inject: open a second db handle on the threadruntime
     // isolate and DROP the `shell_event` table. `save_project` will
@@ -436,14 +493,20 @@ async fn project_meta_update_fails_when_shell_replay_emission_fails() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
-        &state, &tx, "orchestration.dispatchCommand",
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "project.meta.update",
             "projectId": "p-real",
             "patch": { "title": "after" },
         }}),
-    ).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         exit["exit"]["_tag"], "Failure",
         "shell emit failure must be a visible Failure, not Success{{sequence:_}}: {exit}"
@@ -474,13 +537,16 @@ async fn project_meta_update_refuses_unknown_project_id() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
-        &state, &tx, "orchestration.dispatchCommand",
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "project.meta.update",
             "projectId": "p-does-not-exist",
             "patch": { "title": "renamed" },
         }}),
-    ).await;
+    )
+    .await;
     let frames = drain(&mut rx);
     let exit = frames.iter().find(|f| f["_tag"] == "Exit").expect("exits");
     assert_eq!(
@@ -488,22 +554,32 @@ async fn project_meta_update_refuses_unknown_project_id() {
         "unknown projectId must be a visible Failure, not a Success{{sequence:_}}: {exit}"
     );
     // Contrast: valid project id passes.
-    state.rt.save_project(&json!({
-        "id": "p-real", "title": "before",
-        "workspaceRoot": "/tmp",
-        "defaultModelSelection": null, "scripts": [],
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_project(&json!({
+            "id": "p-real", "title": "before",
+            "workspaceRoot": "/tmp",
+            "defaultModelSelection": null, "scripts": [],
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     request(
-        &state, &tx2, "orchestration.dispatchCommand",
+        &state,
+        &tx2,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "project.meta.update",
             "projectId": "p-real",
             "patch": { "title": "after" },
         }}),
-    ).await;
-    let exit2 = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    )
+    .await;
+    let exit2 = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         exit2["exit"]["_tag"], "Success",
         "a valid update still succeeds: {exit2}"
@@ -517,7 +593,10 @@ async fn project_meta_update_refuses_unknown_project_id() {
         .into_iter()
         .find(|p| p.get("id").and_then(Value::as_str) == Some("p-real"))
         .expect("row present");
-    assert_eq!(stored["title"], "after", "durable row was updated: {stored}");
+    assert_eq!(
+        stored["title"], "after",
+        "durable row was updated: {stored}"
+    );
 }
 
 /// #400 (second failure path): `project.meta.update` must FAIL CLOSED when
@@ -537,12 +616,16 @@ async fn project_meta_update_refuses_unknown_project_id() {
 #[tokio::test]
 async fn project_meta_update_fails_closed_when_shell_event_publish_fails() {
     let (state, _d) = test_state().await;
-    state.rt.save_project(&json!({
-        "id": "p-real-2", "title": "before",
-        "workspaceRoot": "/tmp",
-        "defaultModelSelection": null, "scripts": [],
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_project(&json!({
+            "id": "p-real-2", "title": "before",
+            "workspaceRoot": "/tmp",
+            "defaultModelSelection": null, "scripts": [],
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
 
     // Reserve the NEXT sequence slot the update path will try to claim.
     // `next_sequence` allocates and returns the new value, so counter is
@@ -561,14 +644,20 @@ async fn project_meta_update_fails_closed_when_shell_event_publish_fails() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
-        &state, &tx, "orchestration.dispatchCommand",
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "project.meta.update",
             "projectId": "p-real-2",
             "patch": { "title": "after" },
         }}),
-    ).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         exit["exit"]["_tag"], "Failure",
         "a failed shell_event publish must surface as Failure, never Success: {exit}"
@@ -576,7 +665,10 @@ async fn project_meta_update_fails_closed_when_shell_event_publish_fails() {
     // The failure names the failing subsystem so an operator can trace it.
     let defect = exit["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
     assert!(
-        defect.contains("shell") || defect.contains("emission") || defect.contains("sequence") || defect.contains("already exists"),
+        defect.contains("shell")
+            || defect.contains("emission")
+            || defect.contains("sequence")
+            || defect.contains("already exists"),
         "the failure explains the shell_event publish failure: {exit}"
     );
 }
@@ -621,8 +713,14 @@ async fn subscribe_shell_fails_closed_when_projects_store_is_unreadable() {
         f.get("_tag").and_then(Value::as_str) == Some("Chunk")
             && f["values"][0]["kind"] == "snapshot"
     });
-    assert!(!sneaked, "no snapshot may sneak out with projects:[] on read failure: {frames:?}");
-    let exit = frames.iter().find(|f| f["_tag"] == "Exit").expect("subscribeShell exits");
+    assert!(
+        !sneaked,
+        "no snapshot may sneak out with projects:[] on read failure: {frames:?}"
+    );
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("subscribeShell exits");
     assert_eq!(
         exit["exit"]["_tag"], "Failure",
         "the store-read error must surface as a subscription Failure, not Success: {exit}"
@@ -634,7 +732,10 @@ async fn subscribe_shell_fails_closed_when_projects_store_is_unreadable() {
     // typed unavailable arm for subscribeShell). Assertion reads
     // `Die.defect`, not the `Fail.error.message` shape a declared
     // typed error would use.
-    assert_eq!(cause["_tag"], "Die", "store-read failure is a runtime Die defect: {exit}");
+    assert_eq!(
+        cause["_tag"], "Die",
+        "store-read failure is a runtime Die defect: {exit}"
+    );
     let msg = cause["defect"].as_str().unwrap_or("");
     assert!(
         msg.contains("project") || msg.contains("subscribeShell"),
@@ -678,19 +779,27 @@ async fn subscribe_shell_snapshot_is_a_recorded_fixture_the_ts_contract_decodes(
     // Contract invariants that must hold for a TS decode to succeed —
     // asserted here so drift is caught even in the read-only mode.
     assert_eq!(item["kind"], "snapshot");
-    assert!(item["snapshot"]["snapshotSequence"].as_i64().is_some(),
-        "snapshotSequence is required and integer-typed");
-    assert!(item["snapshot"]["updatedAt"].as_str().is_some(),
-        "updatedAt is required and ISO-string-typed");
-    assert!(item["snapshot"]["projects"].is_array(),
-        "projects is a required array");
-    assert!(item["snapshot"]["threads"].is_array(),
-        "threads is a required array");
+    assert!(
+        item["snapshot"]["snapshotSequence"].as_i64().is_some(),
+        "snapshotSequence is required and integer-typed"
+    );
+    assert!(
+        item["snapshot"]["updatedAt"].as_str().is_some(),
+        "updatedAt is required and ISO-string-typed"
+    );
+    assert!(
+        item["snapshot"]["projects"].is_array(),
+        "projects is a required array"
+    );
+    assert!(
+        item["snapshot"]["threads"].is_array(),
+        "threads is a required array"
+    );
 
     // Update-fixture mode: write the frame bytes verbatim.
     if std::env::var("T3_UPDATE_FIXTURES").ok().as_deref() == Some("1") {
-        let dst = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../packages/contracts/fixtures");
+        let dst =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packages/contracts/fixtures");
         std::fs::create_dir_all(&dst).expect("mkdir fixtures");
         let path = dst.join("subscribe_shell_snapshot.json");
         let bytes = serde_json::to_vec(&item).expect("serialize the shell frame");
@@ -737,7 +846,8 @@ async fn thread_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() {
             .and_then(|x| x.get("kind"))
             .and_then(Value::as_str)
             == Some("thread-upserted")
-    }).await;
+    })
+    .await;
     let chunk = frames
         .iter()
         .find(|f| {
@@ -748,13 +858,19 @@ async fn thread_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() {
     let item = chunk["values"][0].clone();
 
     assert_eq!(item["kind"], "thread-upserted");
-    assert!(item["sequence"].as_i64().is_some(), "sequence is required NonNegativeInt");
-    assert!(item["thread"]["id"].as_str().is_some(), "thread.id is required");
+    assert!(
+        item["sequence"].as_i64().is_some(),
+        "sequence is required NonNegativeInt"
+    );
+    assert!(
+        item["thread"]["id"].as_str().is_some(),
+        "thread.id is required"
+    );
     assert_eq!(item["thread"]["id"], "t-fixture-upsert");
 
     if std::env::var("T3_UPDATE_FIXTURES").ok().as_deref() == Some("1") {
-        let dst = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../packages/contracts/fixtures");
+        let dst =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packages/contracts/fixtures");
         std::fs::create_dir_all(&dst).expect("mkdir fixtures");
         let path = dst.join("thread_upserted.json");
         let bytes = serde_json::to_vec(&item).expect("serialize the thread-upserted frame");
@@ -773,12 +889,16 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
     // Seed a real project the update path can PATCH (the seed persists
     // via the test harness at boot; explicit save to make the id
     // present regardless of any concurrent seed).
-    state.rt.save_project(&json!({
-        "id": "p-fixture-upsert", "title": "before",
-        "workspaceRoot": "/tmp",
-        "defaultModelSelection": null, "scripts": [],
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_project(&json!({
+            "id": "p-fixture-upsert", "title": "before",
+            "workspaceRoot": "/tmp",
+            "defaultModelSelection": null, "scripts": [],
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -789,13 +909,16 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
     // this exercises the real emission path, not a fabricated frame.
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     request(
-        &state, &tx2, "orchestration.dispatchCommand",
+        &state,
+        &tx2,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "project.meta.update",
             "projectId": "p-fixture-upsert",
             "patch": { "title": "after" },
         }}),
-    ).await;
+    )
+    .await;
     let _ack = drain(&mut rx2);
 
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
@@ -804,7 +927,8 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
             .and_then(|x| x.get("kind"))
             .and_then(Value::as_str)
             == Some("project-upserted")
-    }).await;
+    })
+    .await;
     let chunk = frames
         .iter()
         .find(|f| {
@@ -815,13 +939,19 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
     let item = chunk["values"][0].clone();
 
     assert_eq!(item["kind"], "project-upserted");
-    assert!(item["sequence"].as_i64().is_some(), "sequence is required NonNegativeInt");
+    assert!(
+        item["sequence"].as_i64().is_some(),
+        "sequence is required NonNegativeInt"
+    );
     assert_eq!(item["project"]["id"], "p-fixture-upsert");
-    assert_eq!(item["project"]["title"], "after", "patch landed in the emitted frame");
+    assert_eq!(
+        item["project"]["title"], "after",
+        "patch landed in the emitted frame"
+    );
 
     if std::env::var("T3_UPDATE_FIXTURES").ok().as_deref() == Some("1") {
-        let dst = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../packages/contracts/fixtures");
+        let dst =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packages/contracts/fixtures");
         std::fs::create_dir_all(&dst).expect("mkdir fixtures");
         let path = dst.join("project_upserted.json");
         let bytes = serde_json::to_vec(&item).expect("serialize the project-upserted frame");
@@ -841,27 +971,156 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "terminal.open", input.clone()).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "terminal.open must be implemented: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "terminal.open must be implemented: {:?}",
+        f[0]
+    );
     let snap = &f[0]["exit"]["value"];
     assert_eq!(snap["threadId"], "t-1");
     assert_eq!(snap["terminalId"], "term-1");
-    assert!(snap["history"].is_string(), "snapshot carries the rendered screen as history");
+    assert!(
+        snap["history"].is_string(),
+        "snapshot carries the rendered screen as history"
+    );
     assert!(["starting", "running", "exited", "error"].contains(&snap["status"].as_str().unwrap()));
 
     // write + resize → void success.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.write", json!({ "threadId": "t-1", "terminalId": "term-1", "data": "echo hi\n" })).await;
-    request(&state, &tx, "terminal.resize", json!({ "threadId": "t-1", "terminalId": "term-1", "cols": 100, "rows": 40 })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.write",
+        json!({ "threadId": "t-1", "terminalId": "term-1", "data": "echo hi\n" }),
+    )
+    .await;
+    request(
+        &state,
+        &tx,
+        "terminal.resize",
+        json!({ "threadId": "t-1", "terminalId": "term-1", "cols": 100, "rows": 40 }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "terminal.write void success");
-    assert_eq!(f[1]["exit"]["_tag"], "Success", "terminal.resize void success");
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "terminal.write void success"
+    );
+    assert_eq!(
+        f[1]["exit"]["_tag"], "Success",
+        "terminal.resize void success"
+    );
 
     // attach → an initial snapshot stream event (stays open, no Exit).
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "terminal.attach", input).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["values"][0]["type"], "snapshot", "attach opens with a snapshot event: {:?}", f);
-    assert!(f.iter().all(|x| x["_tag"] != "Exit"), "attach is a stream, not terminated");
+    assert_eq!(
+        f[0]["values"][0]["type"], "snapshot",
+        "attach opens with a snapshot event: {:?}",
+        f
+    );
+    assert!(
+        f.iter().all(|x| x["_tag"] != "Exit"),
+        "attach is a stream, not terminated"
+    );
+}
+
+/// #68: terminal control RPCs must report Hearth failures, not ack success
+/// while the PTY rejected the write/control operation.
+#[tokio::test]
+async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
+    let (mut state, dir) = test_state().await;
+    let bad = hearth::Runner::open(
+        hearth::Config::new(dir.clone(), dir.join("bad-hearth"), "bad-terminal")
+            .shell(vec!["/definitely/not/a/t3code-shell".to_string()]),
+    )
+    .await
+    .expect("construct invalid-shell runner");
+    state.terminal = Arc::new(bad);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "terminal.write",
+        json!({ "threadId": "t-1", "terminalId": "missing-pane", "data": "echo hidden\n" }),
+    )
+    .await;
+    request(
+        &state,
+        &tx,
+        "terminal.resize",
+        json!({ "threadId": "t-1", "terminalId": "missing-pane", "cols": 100, "rows": 40 }),
+    )
+    .await;
+
+    let f = drain(&mut rx);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Failure",
+        "write cannot ack success after Hearth failed: {:?}",
+        f[0]
+    );
+    assert!(
+        f[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .unwrap_or("")
+            .contains("terminal.write"),
+        "write failure must name the terminal control operation: {:?}",
+        f[0]
+    );
+    assert_eq!(
+        f[1]["exit"]["_tag"], "Failure",
+        "resize cannot ack success after Hearth failed: {:?}",
+        f[1]
+    );
+    assert!(
+        f[1]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .unwrap_or("")
+            .contains("terminal.resize"),
+        "resize failure must name the terminal control operation: {:?}",
+        f[1]
+    );
+}
+
+/// #79: a terminal subscription is not live unless the SDK durable topic tail
+/// attached. If the broker cannot subscribe, the RPC must fail before emitting a
+/// `started` or `snapshot` chunk that the client would treat as a valid stream.
+#[tokio::test]
+async fn terminal_subscriptions_fail_when_durable_topic_tail_cannot_attach() {
+    let (state, dir) = test_state().await;
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE subs", vec![]).await.unwrap();
+
+    for (method, payload) in [
+        (
+            "subscribeTerminalEvents",
+            json!({ "threadId": "t-1", "terminalId": "term-1" }),
+        ),
+        ("subscribeTerminalMetadata", json!({ "threadId": "t-1" })),
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, payload).await;
+        let frames = drain(&mut rx);
+        assert!(
+            frames.iter().all(|f| f["_tag"] != "Chunk"),
+            "{method} emitted a live-looking stream chunk after tail attach failed: {frames:?}"
+        );
+        let exit = frames.iter().find(|f| f["_tag"] == "Exit").expect("exits");
+        assert_eq!(
+            exit["exit"]["_tag"], "Failure",
+            "{method} must fail the subscription, not report success: {exit}"
+        );
+        assert!(
+            exit["exit"]["cause"][0]["defect"]
+                .as_str()
+                .unwrap_or("")
+                .contains(method),
+            "failure names the terminal subscription method: {exit}"
+        );
+    }
 }
 
 /// The attached pane is EDGE-DRIVEN, and a RECONNECTING pane is too.
@@ -934,7 +1193,10 @@ async fn an_attached_and_a_reconnecting_terminal_pane_both_receive_later_output(
             while let Some((raw, _)) = rx.recv().await {
                 let v: Value = serde_json::from_str(&raw).unwrap();
                 if v["values"][0]["type"] == "output"
-                    && v["values"][0]["data"].as_str().unwrap_or("").contains("PANEMARK")
+                    && v["values"][0]["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("PANEMARK")
                 {
                     return true;
                 }
@@ -943,7 +1205,10 @@ async fn an_attached_and_a_reconnecting_terminal_pane_both_receive_later_output(
         })
         .await
         .unwrap_or(false);
-        assert!(saw, "the {who} pane received output written after it attached");
+        assert!(
+            saw,
+            "the {who} pane received output written after it attached"
+        );
     }
     writer.abort();
 }
@@ -962,7 +1227,13 @@ async fn an_attached_and_a_reconnecting_terminal_pane_both_receive_later_output(
 async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-meta" })).await;
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-meta" }),
+    )
+    .await;
 
     // Read snapshots until one lists `want`, or give up. Anything that has
     // to wait out the timeout is a stream that stopped following the
@@ -988,12 +1259,20 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
         false
     }
 
-    let has = |rows: &Vec<Value>, id: &str| {
-        rows.iter().any(|r| r["terminalId"] == json!(id))
-    };
+    let has = |rows: &Vec<Value>, id: &str| rows.iter().any(|r| r["terminalId"] == json!(id));
 
     // A pane opened AFTER the subscription must appear.
-    state.terminals.open(&terminal::TerminalOwner::thread("t-meta"), "pane-late", None, None, &[]).await.unwrap();
+    state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-meta"),
+            "pane-late",
+            None,
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
     assert!(
         until(&mut rx, |rows| has(rows, "pane-late")).await,
         "a pane opened after attach reaches the metadata stream"
@@ -1001,11 +1280,17 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
 
     // Closing it must publish its removal — and, crucially, must not end the
     // subscription: the agent pane is still listed afterwards.
-    assert!(state.terminals.close(&terminal::TerminalOwner::thread("t-meta"), "pane-late").await, "own-PTY pane closes");
+    assert!(
+        state
+            .terminals
+            .close(&terminal::TerminalOwner::thread("t-meta"), "pane-late")
+            .await,
+        "own-PTY pane closes"
+    );
     assert!(
         until(&mut rx, |rows| !has(rows, "pane-late")
             && has(rows, terminal::AGENT_TERMINAL_ID))
-            .await,
+        .await,
         "the close is published and the stream keeps serving the remaining panes"
     );
 }
@@ -1026,8 +1311,20 @@ async fn disconnected_subscribers_are_dropped_from_the_fan_out_lists() {
     // Two clients subscribe; one then goes away.
     let (tx_gone, rx_gone) = mpsc::unbounded_channel();
     let (tx_live, _rx_live) = mpsc::unbounded_channel();
-    request(&state, &tx_gone, "subscribeTerminalMetadata", json!({ "threadId": "t-sub" })).await;
-    request(&state, &tx_live, "subscribeTerminalMetadata", json!({ "threadId": "t-sub" })).await;
+    request(
+        &state,
+        &tx_gone,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-sub" }),
+    )
+    .await;
+    request(
+        &state,
+        &tx_live,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-sub" }),
+    )
+    .await;
 
     drop(rx_gone); // the socket closes
 
@@ -1061,26 +1358,50 @@ async fn diff_rpcs_report_typed_unavailable_not_a_fake_empty_diff() {
     let (state, _d) = test_state().await;
     // getTurnDiff
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.getTurnDiff",
-        json!({ "input": { "threadId": "t-1", "fromTurnCount": 0, "toTurnCount": 1 } })).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(f["exit"]["_tag"], "Failure",
-               "getTurnDiff refuses visibly, not Success{{diff:\"\"}}: {f}");
-    assert_eq!(f["exit"]["cause"][0]["_tag"], "Fail",
-               "declared error on the cause, not a Die defect: {f}");
-    assert_eq!(f["exit"]["cause"][0]["error"]["_tag"],
-               "OrchestrationGetTurnDiffError",
-               "typed contract error the frontend can branch on: {f}");
+    request(
+        &state,
+        &tx,
+        "orchestration.getTurnDiff",
+        json!({ "input": { "threadId": "t-1", "fromTurnCount": 0, "toTurnCount": 1 } }),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        f["exit"]["_tag"], "Failure",
+        "getTurnDiff refuses visibly, not Success{{diff:\"\"}}: {f}"
+    );
+    assert_eq!(
+        f["exit"]["cause"][0]["_tag"], "Fail",
+        "declared error on the cause, not a Die defect: {f}"
+    );
+    assert_eq!(
+        f["exit"]["cause"][0]["error"]["_tag"], "OrchestrationGetTurnDiffError",
+        "typed contract error the frontend can branch on: {f}"
+    );
     // getFullThreadDiff
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    request(&state, &tx2, "orchestration.getFullThreadDiff",
-        json!({ "input": { "threadId": "t-1", "toTurnCount": 5 } })).await;
-    let f2 = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(f2["exit"]["_tag"], "Failure",
-               "getFullThreadDiff refuses visibly: {f2}");
-    assert_eq!(f2["exit"]["cause"][0]["error"]["_tag"],
-               "OrchestrationGetFullThreadDiffError",
-               "typed contract error: {f2}");
+    request(
+        &state,
+        &tx2,
+        "orchestration.getFullThreadDiff",
+        json!({ "input": { "threadId": "t-1", "toTurnCount": 5 } }),
+    )
+    .await;
+    let f2 = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        f2["exit"]["_tag"], "Failure",
+        "getFullThreadDiff refuses visibly: {f2}"
+    );
+    assert_eq!(
+        f2["exit"]["cause"][0]["error"]["_tag"], "OrchestrationGetFullThreadDiffError",
+        "typed contract error: {f2}"
+    );
 }
 
 /// #74 (remaining): `orchestration.getWorkflowScript` returns the
@@ -1092,18 +1413,34 @@ async fn diff_rpcs_report_typed_unavailable_not_a_fake_empty_diff() {
 async fn get_workflow_script_reports_root_unavailable_on_this_runtime() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.getWorkflowScript",
-        json!({ "input": { "threadId": "t-1", "scriptPath": "/tmp/foo.js" } })).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(f["exit"]["_tag"], "Failure",
-               "an unavailable root is a contract Failure, not Success(null): {f}");
+    request(
+        &state,
+        &tx,
+        "orchestration.getWorkflowScript",
+        json!({ "input": { "threadId": "t-1", "scriptPath": "/tmp/foo.js" } }),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        f["exit"]["_tag"], "Failure",
+        "an unavailable root is a contract Failure, not Success(null): {f}"
+    );
     let err = &f["exit"]["cause"][0]["error"];
-    assert_eq!(err["_tag"], "OrchestrationGetWorkflowScriptError",
-               "typed contract error on the cause: {f}");
-    assert_eq!(err["reason"], "root-unavailable",
-               "specific enumerated reason: {f}");
-    assert_eq!(err["scriptPath"], "/tmp/foo.js",
-               "the input scriptPath is echoed so the client can attribute the error: {f}");
+    assert_eq!(
+        err["_tag"], "OrchestrationGetWorkflowScriptError",
+        "typed contract error on the cause: {f}"
+    );
+    assert_eq!(
+        err["reason"], "root-unavailable",
+        "specific enumerated reason: {f}"
+    );
+    assert_eq!(
+        err["scriptPath"], "/tmp/foo.js",
+        "the input scriptPath is echoed so the client can attribute the error: {f}"
+    );
 }
 
 /// #74 (remaining): `orchestration.getArchivedShellSnapshot` returns
@@ -1116,32 +1453,63 @@ async fn get_archived_shell_snapshot_returns_only_archived_threads() {
     let (state, _d) = test_state().await;
 
     // Two live threads, one archived.
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-live-1", "projectId": "p-workspace", "title": "still open",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-live-2", "projectId": "p-workspace", "title": "also open",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-archived", "projectId": "p-workspace", "title": "put away",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-        "archivedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-live-1", "projectId": "p-workspace", "title": "still open",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-live-2", "projectId": "p-workspace", "title": "also open",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-archived", "projectId": "p-workspace", "title": "put away",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+            "archivedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.getArchivedShellSnapshot", json!({ "input": {} })).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    request(
+        &state,
+        &tx,
+        "orchestration.getArchivedShellSnapshot",
+        json!({ "input": {} }),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f}");
     let snap = &f["exit"]["value"];
     // Contract shape: projects, threads, snapshotSequence (numbered),
     // updatedAt (ISO). The seq comes from the DURABLE counter, so a
     // client that resumes from it survives restart (#299).
-    assert!(snap["snapshotSequence"].as_i64().is_some(), "durable mark: {snap}");
-    assert!(snap["updatedAt"].as_str().is_some(), "iso updatedAt: {snap}");
+    assert!(
+        snap["snapshotSequence"].as_i64().is_some(),
+        "durable mark: {snap}"
+    );
+    assert!(
+        snap["updatedAt"].as_str().is_some(),
+        "iso updatedAt: {snap}"
+    );
     let threads = snap["threads"].as_array().expect("threads array");
-    assert_eq!(threads.len(), 1, "only the archived thread is listed: {threads:?}");
+    assert_eq!(
+        threads.len(),
+        1,
+        "only the archived thread is listed: {threads:?}"
+    );
     assert_eq!(threads[0]["id"], "t-archived");
 
     // And a runtime with NO archived threads returns an empty
@@ -1149,8 +1517,17 @@ async fn get_archived_shell_snapshot_returns_only_archived_threads() {
     // row) — this is the current default state of the archive.
     let (state2, _d2) = test_state().await;
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    request(&state2, &tx2, "orchestration.getArchivedShellSnapshot", json!({ "input": {} })).await;
-    let f2 = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    request(
+        &state2,
+        &tx2,
+        "orchestration.getArchivedShellSnapshot",
+        json!({ "input": {} }),
+    )
+    .await;
+    let f2 = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(f2["exit"]["_tag"], "Success");
     assert_eq!(f2["exit"]["value"]["threads"].as_array().unwrap().len(), 0);
 }
@@ -1182,7 +1559,10 @@ async fn a_validated_model_option_reaches_the_provider_invocation() {
     let (key, value) =
         agent_sdk_provider::codex_option_override(&decoded[0]).expect("a known knob routes");
     assert_eq!(key, "model_reasoning_effort");
-    assert_eq!(value, "\"high\"", "codex config is TOML, so the string is quoted");
+    assert_eq!(
+        value, "\"high\"",
+        "codex config is TOML, so the string is quoted"
+    );
 }
 
 /// #89 first pass: `ModelSelection.options` invalid values are
@@ -1201,7 +1581,12 @@ async fn model_selection_with_invalid_option_is_refused_visibly() {
     // validation on `reasoning` needs a codex snapshot to fire.
     let sel_ok = json!({ "instanceId": "codex", "model": "codex-default" });
     assert!(
-        model_from_selection(&*state.catalog.read().await, &sel_ok, &state.default_model().await).is_ok(),
+        model_from_selection(
+            &*state.catalog.read().await,
+            &sel_ok,
+            &state.default_model().await
+        )
+        .is_ok(),
         "baseline: the selection resolves without options"
     );
 
@@ -1213,10 +1598,16 @@ async fn model_selection_with_invalid_option_is_refused_visibly() {
         "model": "codex-default",
         "options": [ { "id": "reasoning", "value": "ludicrous" } ],
     });
-    let err = model_from_selection(&*state.catalog.read().await, &sel_bad, &state.default_model().await)
-        .expect_err("bogus option value must not resolve");
-    assert!(err.contains("reasoning") || err.contains("invalid"),
-            "the error names the offending option: {err}");
+    let err = model_from_selection(
+        &*state.catalog.read().await,
+        &sel_bad,
+        &state.default_model().await,
+    )
+    .expect_err("bogus option value must not resolve");
+    assert!(
+        err.contains("reasoning") || err.contains("invalid"),
+        "the error names the offending option: {err}"
+    );
 
     // Unknown option IDS are ACCEPTED — SDK's `validate_selection`
     // rule: a newer client's extra knobs must not be erased by an
@@ -1227,7 +1618,12 @@ async fn model_selection_with_invalid_option_is_refused_visibly() {
         "options": [ { "id": "some_future_knob_this_build_never_heard_of", "value": "whatever" } ],
     });
     assert!(
-        model_from_selection(&*state.catalog.read().await, &sel_unknown_id, &state.default_model().await).is_ok(),
+        model_from_selection(
+            &*state.catalog.read().await,
+            &sel_unknown_id,
+            &state.default_model().await
+        )
+        .is_ok(),
         "unknown option ids do not fail closed"
     );
 }
@@ -1262,8 +1658,14 @@ async fn a_whitespace_only_turn_is_refused_before_anything_mutates() {
         }}),
     )
     .await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("an Exit frame");
-    assert_eq!(f["exit"]["_tag"], "Failure", "an empty prompt must be refused visibly: {f}");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("an Exit frame");
+    assert_eq!(
+        f["exit"]["_tag"], "Failure",
+        "an empty prompt must be refused visibly: {f}"
+    );
 
     // NOTHING moved. Each of these is a mutation the old path performed
     // before it ever looked at the text.
@@ -1301,8 +1703,14 @@ async fn a_whitespace_only_turn_is_refused_before_anything_mutates() {
         }}),
     )
     .await;
-    let ok = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("an Exit frame");
-    assert_eq!(ok["exit"]["_tag"], "Success", "a real prompt still dispatches: {ok}");
+    let ok = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("an Exit frame");
+    assert_eq!(
+        ok["exit"]["_tag"], "Success",
+        "a real prompt still dispatches: {ok}"
+    );
 }
 
 /// #77 / packet EK: a `thread.turn.start` carrying non-empty
@@ -1333,7 +1741,10 @@ async fn a_turn_start_with_attachments_is_refused_visibly() {
             "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
         }}),
     ).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         f["exit"]["_tag"], "Failure",
         "dispatch must refuse attachments visibly, not ack + drop: {f}"
@@ -1342,13 +1753,18 @@ async fn a_turn_start_with_attachments_is_refused_visibly() {
     // And the durable store must not have persisted the prompt row —
     // that is the "prompt appears without the image" defect.
     let messages = state.rt.messages("t-att").await;
-    assert!(messages.is_empty(), "no prompt persisted for a refused dispatch: {messages:?}");
+    assert!(
+        messages.is_empty(),
+        "no prompt persisted for a refused dispatch: {messages:?}"
+    );
 
     // Contrast: same command with NO attachments passes dispatch
     // (proves the refusal is scoped to the attachment case).
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     request(
-        &state, &tx2, "orchestration.dispatchCommand",
+        &state,
+        &tx2,
+        "orchestration.dispatchCommand",
         json!({ "input": {
             "type": "thread.turn.start",
             "commandId": "c-2",
@@ -1358,8 +1774,12 @@ async fn a_turn_start_with_attachments_is_refused_visibly() {
             "interactionMode": "chat",
             "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
         }}),
-    ).await;
-    let f2 = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    )
+    .await;
+    let f2 = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         f2["exit"]["_tag"], "Success",
         "the same command with no attachments still dispatches: {f2}"
@@ -1377,33 +1797,65 @@ async fn search_threads_matches_the_durable_message_store() {
     // Seed two threads with contrasting content. Both go through the
     // durable append_message path — no in-memory shortcut — so the test
     // proves the search READS the store, not a scratch value.
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-alpha", "projectId": "p-workspace", "title": "alpha",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-beta", "projectId": "p-workspace", "title": "beta",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-    state.rt.append_message("t-alpha", &json!({
-        "id": "m1", "role": "user", "text": "please refactor the widget FROBNICATOR module",
-        "streaming": false, "createdAt": now_iso(),
-    })).await.unwrap();
-    state.rt.append_message("t-alpha", &json!({
-        "id": "m2", "role": "assistant", "text": "done — the frobnicator now sings",
-        "streaming": false, "createdAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-alpha", "projectId": "p-workspace", "title": "alpha",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-beta", "projectId": "p-workspace", "title": "beta",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    state
+        .rt
+        .append_message(
+            "t-alpha",
+            &json!({
+                "id": "m1", "role": "user", "text": "please refactor the widget FROBNICATOR module",
+                "streaming": false, "createdAt": now_iso(),
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .rt
+        .append_message(
+            "t-alpha",
+            &json!({
+                "id": "m2", "role": "assistant", "text": "done — the frobnicator now sings",
+                "streaming": false, "createdAt": now_iso(),
+            }),
+        )
+        .await
+        .unwrap();
     state.rt.append_message("t-beta", &json!({
         "id": "m3", "role": "system", "text": "frobnicator is a system message — not searchable",
         "streaming": false, "createdAt": now_iso(),
     })).await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.searchThreads",
-        json!({ "input": { "query": "frobnicator" } })).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    request(
+        &state,
+        &tx,
+        "orchestration.searchThreads",
+        json!({ "input": { "query": "frobnicator" } }),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(f["exit"]["_tag"], "Success", "search succeeds: {f}");
-    let matches = f["exit"]["value"]["matches"].as_array().expect("matches array");
+    let matches = f["exit"]["value"]["matches"]
+        .as_array()
+        .expect("matches array");
 
     // t-alpha has user + assistant hits; t-beta's only hit is a
     // `system` message, which the contract's `source` enumeration
@@ -1412,27 +1864,50 @@ async fn search_threads_matches_the_durable_message_store() {
     // list burying other threads), so exactly one match — from
     // t-alpha, source ∈ {user, assistant} — is the expected shape.
     assert!(!matches.is_empty(), "at least one hit: {matches:?}");
-    let alpha_hits: Vec<&Value> = matches.iter()
-        .filter(|m| m["threadId"].as_str() == Some("t-alpha")).collect();
-    assert_eq!(alpha_hits.len(), 1,
-               "one hit per thread; alpha contributes exactly one: {matches:?}");
-    assert!(!matches.iter().any(|m| m["threadId"].as_str() == Some("t-beta")),
-            "t-beta's only message is `system` — the contract's `source` enumeration \
-             excludes it and it must not appear: {matches:?}");
+    let alpha_hits: Vec<&Value> = matches
+        .iter()
+        .filter(|m| m["threadId"].as_str() == Some("t-alpha"))
+        .collect();
+    assert_eq!(
+        alpha_hits.len(),
+        1,
+        "one hit per thread; alpha contributes exactly one: {matches:?}"
+    );
+    assert!(
+        !matches
+            .iter()
+            .any(|m| m["threadId"].as_str() == Some("t-beta")),
+        "t-beta's only message is `system` — the contract's `source` enumeration \
+             excludes it and it must not appear: {matches:?}"
+    );
     for m in matches {
         assert_eq!(m["projectId"], "p-workspace");
         let source = m["source"].as_str().unwrap();
-        assert!(source == "user" || source == "assistant", "contract source: {source}");
+        assert!(
+            source == "user" || source == "assistant",
+            "contract source: {source}"
+        );
         let snippet = m["snippet"].as_str().unwrap();
-        assert!(snippet.to_lowercase().contains("frobnicator"), "snippet: {snippet}");
+        assert!(
+            snippet.to_lowercase().contains("frobnicator"),
+            "snippet: {snippet}"
+        );
         assert!(snippet.chars().count() <= 240, "snippet capped: {snippet}");
     }
 
     // Under-length query is a contract Failure (2..=200 chars).
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    request(&state, &tx2, "orchestration.searchThreads",
-        json!({ "input": { "query": "f" } })).await;
-    let f2 = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    request(
+        &state,
+        &tx2,
+        "orchestration.searchThreads",
+        json!({ "input": { "query": "f" } }),
+    )
+    .await;
+    let f2 = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(f2["exit"]["_tag"], "Failure", "min length enforced: {f2}");
 }
 
@@ -1444,30 +1919,63 @@ async fn search_threads_matches_the_durable_message_store() {
 #[tokio::test]
 async fn search_threads_handles_multibyte_text_without_panicking() {
     let (state, _d) = test_state().await;
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-utf8", "projectId": "p-workspace", "title": "utf8",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-utf8", "projectId": "p-workspace", "title": "utf8",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
     // 100 cyrillic chars, each 2 bytes, then the needle. `find()` on
     // the lowercased hay returns byte offset ≥ 200; saturating_sub(80)
     // lands mid-codepoint under the old byte-slice code and panics.
     let prefix: String = "я".repeat(100);
     let text = format!("{prefix}frobnicator finished");
-    state.rt.append_message("t-utf8", &json!({
-        "id": "m1", "role": "user", "text": text,
-        "streaming": false, "createdAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .append_message(
+            "t-utf8",
+            &json!({
+                "id": "m1", "role": "user", "text": text,
+                "streaming": false, "createdAt": now_iso(),
+            }),
+        )
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.searchThreads",
-        json!({ "input": { "query": "frobnicator" } })).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(f["exit"]["_tag"], "Success", "no panic on multibyte prefix: {f}");
+    request(
+        &state,
+        &tx,
+        "orchestration.searchThreads",
+        json!({ "input": { "query": "frobnicator" } }),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "no panic on multibyte prefix: {f}"
+    );
     let matches = f["exit"]["value"]["matches"].as_array().unwrap();
-    assert_eq!(matches.len(), 1, "the multibyte-prefixed hit is found: {matches:?}");
+    assert_eq!(
+        matches.len(),
+        1,
+        "the multibyte-prefixed hit is found: {matches:?}"
+    );
     let snippet = matches[0]["snippet"].as_str().unwrap();
-    assert!(snippet.contains("frobnicator"), "snippet includes the hit: {snippet}");
-    assert!(snippet.chars().count() <= 240, "snippet stays within cap: {}", snippet.chars().count());
+    assert!(
+        snippet.contains("frobnicator"),
+        "snippet includes the hit: {snippet}"
+    );
+    assert!(
+        snippet.chars().count() <= 240,
+        "snippet stays within cap: {}",
+        snippet.chars().count()
+    );
 }
 
 /// #46: server.discoverSourceControl is implemented and returns a non-empty
@@ -1480,10 +1988,23 @@ async fn subscribe_thread_hydrates_the_session_state() {
     let (state, _d) = test_state().await;
     // no session bound yet → the snapshot honestly reports null.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-hyd" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-hyd" }),
+    )
+    .await;
     let f = drain(&mut rx);
-    let snap = f.iter().find(|x| x["values"][0]["kind"] == "snapshot").unwrap();
-    assert_eq!(snap["values"][0]["snapshot"]["thread"]["session"], Value::Null, "no session → null");
+    let snap = f
+        .iter()
+        .find(|x| x["values"][0]["kind"] == "snapshot")
+        .unwrap();
+    assert_eq!(
+        snap["values"][0]["snapshot"]["thread"]["session"],
+        Value::Null,
+        "no session → null"
+    );
 
     // bind a session for the thread (settles Idle), then a fresh subscribe
     // must hydrate it — session is no longer null and carries a status.
@@ -1493,28 +2014,55 @@ async fn subscribe_thread_hydrates_the_session_state() {
         model_key: "k".into(),
     };
     let def = AgentDefinition {
-        name: "t3code".into(), instructions: "".into(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![], labels: Default::default(), options: vec![],
+        name: "t3code".into(),
+        instructions: "".into(),
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
         cwd: None,
     };
     state.rt.session_for(&binding, def).await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-hyd" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-hyd" }),
+    )
+    .await;
     let f = drain(&mut rx);
-    let snap = f.iter().find(|x| x["values"][0]["kind"] == "snapshot").unwrap();
+    let snap = f
+        .iter()
+        .find(|x| x["values"][0]["kind"] == "snapshot")
+        .unwrap();
     let session = &snap["values"][0]["snapshot"]["thread"]["session"];
     assert_eq!(session["threadId"], "t-hyd", "session hydrated: {session}");
-    assert_eq!(session["status"], "idle", "a settled bound session reports idle, not null");
+    assert_eq!(
+        session["status"], "idle",
+        "a settled bound session reports idle, not null"
+    );
     // The activeTurnId field is EMITTED (not omitted) and is null for a
     // settled session — a settled session must not hydrate a stoppable turn.
     // The live branch (status "running" + a non-null activeTurnId from the
     // durable in-flight marker) is proven where a real turn can actually park:
     // agent-sdk-shell's the_active_turn_id_is_recorded_while_running_and_cleared_on_settle
     // and session_status_prefers_the_live_session_over_a_newer_idle_one (#92).
-    assert!(session.get("activeTurnId").is_some(), "activeTurnId is present on the wire: {session}");
-    assert_eq!(session["activeTurnId"], Value::Null, "a settled session has no active turn: {session}");
+    assert!(
+        session.get("activeTurnId").is_some(),
+        "activeTurnId is present on the wire: {session}"
+    );
+    assert_eq!(
+        session["activeTurnId"],
+        Value::Null,
+        "a settled session has no active turn: {session}"
+    );
 }
 
 /// #66: the review diff panel renders through the Cairn seam. In a repo with
@@ -1524,10 +2072,15 @@ async fn subscribe_thread_hydrates_the_session_state() {
 async fn review_diff_preview_and_file_contents_over_cairn() {
     let (state, dir) = test_state().await;
     let git = |args: &[&str]| {
-        std::process::Command::new("git").args(args).current_dir(&dir)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .output().unwrap();
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
     };
     git(&["init", "-q"]);
     std::fs::write(dir.join("f.txt"), "one\n").unwrap();
@@ -1540,21 +2093,49 @@ async fn review_diff_preview_and_file_contents_over_cairn() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "review.getDiffPreview", json!({ "cwd": cwd })).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "getDiffPreview ok: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "getDiffPreview ok: {:?}",
+        f[0]
+    );
     let sources = f[0]["exit"]["value"]["sources"].as_array().unwrap();
-    assert_eq!(sources.len(), 1, "one working-tree source for the change: {sources:?}");
+    assert_eq!(
+        sources.len(),
+        1,
+        "one working-tree source for the change: {sources:?}"
+    );
     assert_eq!(sources[0]["kind"], "working-tree");
-    assert!(sources[0]["diff"].as_str().unwrap().contains("+two"), "diff shows the edit: {}", sources[0]["diff"]);
+    assert!(
+        sources[0]["diff"].as_str().unwrap().contains("+two"),
+        "diff shows the edit: {}",
+        sources[0]["diff"]
+    );
 
     // old (HEAD) vs new (worktree) contents.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "review.getDiffFileContents", json!({
+    request(
+        &state,
+        &tx,
+        "review.getDiffFileContents",
+        json!({
         "cwd": cwd, "sourceKind": "working-tree", "changeType": "change",
-        "baseRef": "HEAD", "headRef": Value::Null, "oldPath": "f.txt", "newPath": "f.txt" })).await;
+        "baseRef": "HEAD", "headRef": Value::Null, "oldPath": "f.txt", "newPath": "f.txt" }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "getDiffFileContents ok: {:?}", f[0]);
-    assert_eq!(f[0]["exit"]["value"]["oldContents"], "one\n", "old = HEAD blob");
-    assert_eq!(f[0]["exit"]["value"]["newContents"], "two\n", "new = worktree file");
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "getDiffFileContents ok: {:?}",
+        f[0]
+    );
+    assert_eq!(
+        f[0]["exit"]["value"]["oldContents"], "one\n",
+        "old = HEAD blob"
+    );
+    assert_eq!(
+        f[0]["exit"]["value"]["newContents"], "two\n",
+        "new = worktree file"
+    );
 }
 
 /// #47/#60: provider management is durable and routes through the runtime.
@@ -1571,17 +2152,33 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Success");
     let pis = &f[0]["exit"]["value"]["providerInstances"];
-    assert!(pis.get("claudeAgent").is_some() && pis.get("codex").is_some(), "stock providers: {pis}");
+    assert!(
+        pis.get("claudeAgent").is_some() && pis.get("codex").is_some(),
+        "stock providers: {pis}"
+    );
 
     // updateSettings ADDS an Ollama (openai-compat) instance.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({ "patch": { "providerInstances": {
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({ "patch": { "providerInstances": {
         "ollama_local": { "instanceId": "ollama_local", "driver": "openaiCompat",
             "displayName": "Ollama", "enabled": true,
-            "config": { "baseUrl": "http://localhost:11434", "models": ["qwen2.5-coder"] } } } } })).await;
+            "config": { "baseUrl": "http://localhost:11434", "models": ["qwen2.5-coder"] } } } } }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "updateSettings ok: {:?}", f[0]);
-    assert!(f[0]["exit"]["value"]["providerInstances"]["ollama_local"].is_object(), "ollama saved");
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "updateSettings ok: {:?}",
+        f[0]
+    );
+    assert!(
+        f[0]["exit"]["value"]["providerInstances"]["ollama_local"].is_object(),
+        "ollama saved"
+    );
 
     // the picker (getConfig.providers) now advertises Ollama — the catalog
     // was reconciled in place, not just persisted.
@@ -1590,13 +2187,19 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
     let f = drain(&mut rx);
     let providers = f[0]["exit"]["value"]["providers"].as_array().unwrap();
     assert!(
-        providers.iter().any(|p| p["id"] == "ollama_local" || p["instanceId"] == "ollama_local"),
+        providers
+            .iter()
+            .any(|p| p["id"] == "ollama_local" || p["instanceId"] == "ollama_local"),
         "getConfig advertises the added Ollama provider: {providers:?}"
     );
 
     // and it SURVIVES a reload: a fresh catalog built from the store still has it.
-    let reloaded = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
-    assert!(reloaded.iter().any(|c| c.instance_id == "ollama_local"), "ollama persisted across reload");
+    let reloaded =
+        settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+    assert!(
+        reloaded.iter().any(|c| c.instance_id == "ollama_local"),
+        "ollama persisted across reload"
+    );
 
     // #94: REMOVING it — the UI sends the whole map WITHOUT the key — deletes
     // it durably and from the catalog; stock providers survive.
@@ -1605,36 +2208,74 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
         "claudeAgent": { "instanceId": "claudeAgent", "driver": "claudeAgent", "enabled": true, "config": {} },
         "codex": { "instanceId": "codex", "driver": "codex", "enabled": true, "config": {} } } } })).await;
     let f = drain(&mut rx);
-    assert!(f[0]["exit"]["value"]["providerInstances"].get("ollama_local").is_none(), "ollama removed from settings");
+    assert!(
+        f[0]["exit"]["value"]["providerInstances"]
+            .get("ollama_local")
+            .is_none(),
+        "ollama removed from settings"
+    );
     let gone = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
-    assert!(!gone.iter().any(|c| c.instance_id == "ollama_local"), "ollama gone from durable store");
-    assert!(gone.iter().any(|c| c.instance_id == "codex"), "stock codex survived the removal");
+    assert!(
+        !gone.iter().any(|c| c.instance_id == "ollama_local"),
+        "ollama gone from durable store"
+    );
+    assert!(
+        gone.iter().any(|c| c.instance_id == "codex"),
+        "stock codex survived the removal"
+    );
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getConfig", json!({})).await;
     let f = drain(&mut rx);
     let providers = f[0]["exit"]["value"]["providers"].as_array().unwrap();
-    assert!(!providers.iter().any(|p| p["id"] == "ollama_local"), "picker no longer shows removed ollama");
+    assert!(
+        !providers.iter().any(|p| p["id"] == "ollama_local"),
+        "picker no longer shows removed ollama"
+    );
 
     // #87: a NON-provider settings field survives the round-trip instead of
     // resetting to its default on the next getSettings.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({ "patch": { "newWorktreesStartFromOrigin": false } })).await;
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({ "patch": { "newWorktreesStartFromOrigin": false } }),
+    )
+    .await;
     drain(&mut rx);
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getSettings", json!({})).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["value"]["newWorktreesStartFromOrigin"], json!(false), "non-provider field round-trips");
+    assert_eq!(
+        f[0]["exit"]["value"]["newWorktreesStartFromOrigin"],
+        json!(false),
+        "non-provider field round-trips"
+    );
 
     // #121: a MISTYPED field (string where a boolean is required) is REJECTED
     // and leaves the stored settings unchanged — never poisons getSettings.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({ "patch": { "newWorktreesStartFromOrigin": "false" } })).await;
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({ "patch": { "newWorktreesStartFromOrigin": "false" } }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Failure", "invalid settings patch is rejected: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Failure",
+        "invalid settings patch is rejected: {:?}",
+        f[0]
+    );
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getSettings", json!({})).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["value"]["newWorktreesStartFromOrigin"], json!(false), "prior valid value survived the rejected write");
+    assert_eq!(
+        f[0]["exit"]["value"]["newWorktreesStartFromOrigin"],
+        json!(false),
+        "prior valid value survived the rejected write"
+    );
 }
 
 #[tokio::test]
@@ -1643,10 +2284,22 @@ async fn discover_source_control_returns_a_result() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.discoverSourceControl", json!({})).await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "discoverSourceControl implemented: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "discoverSourceControl implemented: {:?}",
+        f[0]
+    );
     let v = &f[0]["exit"]["value"];
-    assert!(v["versionControlSystems"].as_array().is_some_and(|a| !a.is_empty()), "vcs probes present: {v}");
-    assert!(v["sourceControlProviders"].is_array(), "providers present: {v}");
+    assert!(
+        v["versionControlSystems"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "vcs probes present: {v}"
+    );
+    assert!(
+        v["sourceControlProviders"].is_array(),
+        "providers present: {v}"
+    );
 }
 
 #[tokio::test]
@@ -1664,11 +2317,21 @@ async fn get_config_returns_success_exit() {
 async fn unsupported_method_fails_explicitly_not_null_success() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.someUnimplementedMutation", json!({})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.someUnimplementedMutation",
+        json!({}),
+    )
+    .await;
     let frames = drain(&mut rx);
     // The contract fix: an unimplemented RPC is a visible Failure, never a
     // masking Success(null) the reducer would advance past.
-    assert_eq!(frames[0]["exit"]["_tag"], "Failure", "unsupported RPC must fail, got {:?}", frames[0]);
+    assert_eq!(
+        frames[0]["exit"]["_tag"], "Failure",
+        "unsupported RPC must fail, got {:?}",
+        frames[0]
+    );
     assert_eq!(frames[0]["exit"]["cause"][0]["_tag"], "Die");
 }
 
@@ -1695,14 +2358,24 @@ async fn pull_request_rpcs_return_typed_unavailable_not_die_defect() {
         request(&state, &tx, read, json!({})).await;
         let frames = drain(&mut rx);
         let exit = &frames[0]["exit"];
-        assert_eq!(exit["_tag"], "Failure", "{read} must fail typed, got {exit:?}");
+        assert_eq!(
+            exit["_tag"], "Failure",
+            "{read} must fail typed, got {exit:?}"
+        );
         let cause = &exit["cause"][0];
-        assert_eq!(cause["_tag"], "Fail", "{read} must be a declared Fail not a Die: {cause:?}");
+        assert_eq!(
+            cause["_tag"], "Fail",
+            "{read} must be a declared Fail not a Die: {cause:?}"
+        );
         let error = &cause["error"];
-        assert_eq!(error["_tag"], "PullRequestUnavailableError",
-                   "{read} must return the contract's tagged error: {error:?}");
-        assert_eq!(error["reason"], "provider-unsupported",
-                   "{read} must name the honest reason (no provider wired): {error:?}");
+        assert_eq!(
+            error["_tag"], "PullRequestUnavailableError",
+            "{read} must return the contract's tagged error: {error:?}"
+        );
+        assert_eq!(
+            error["reason"], "provider-unsupported",
+            "{read} must name the honest reason (no provider wired): {error:?}"
+        );
     }
 
     for mutation in [
@@ -1716,14 +2389,24 @@ async fn pull_request_rpcs_return_typed_unavailable_not_die_defect() {
         request(&state, &tx, mutation, json!({})).await;
         let frames = drain(&mut rx);
         let exit = &frames[0]["exit"];
-        assert_eq!(exit["_tag"], "Failure", "{mutation} must fail typed, got {exit:?}");
+        assert_eq!(
+            exit["_tag"], "Failure",
+            "{mutation} must fail typed, got {exit:?}"
+        );
         let error = &exit["cause"][0]["error"];
-        assert_eq!(error["_tag"], "PullRequestOperationError",
-                   "{mutation} must return the contract's operation error: {error:?}");
+        assert_eq!(
+            error["_tag"], "PullRequestOperationError",
+            "{mutation} must return the contract's operation error: {error:?}"
+        );
         let op_suffix = mutation.trim_start_matches("pullRequests.");
-        assert_eq!(error["operation"], op_suffix,
-                   "the operation name identifies which mutation was refused: {error:?}");
-        assert!(error["detail"].as_str().unwrap().len() > 0, "detail is non-empty: {error:?}");
+        assert_eq!(
+            error["operation"], op_suffix,
+            "the operation name identifies which mutation was refused: {error:?}"
+        );
+        assert!(
+            error["detail"].as_str().unwrap().len() > 0,
+            "detail is non-empty: {error:?}"
+        );
     }
 }
 
@@ -1731,7 +2414,13 @@ async fn pull_request_rpcs_return_typed_unavailable_not_die_defect() {
 async fn dispatch_acks_with_sequence() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({ "input": { "type": "noop" } })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": { "type": "noop" } }),
+    )
+    .await;
     let frames = drain(&mut rx);
     assert_eq!(frames[0]["exit"]["_tag"], "Success");
     assert!(frames[0]["exit"]["value"]["sequence"].is_number());
@@ -1746,12 +2435,25 @@ async fn get_config_advertises_the_registry_catalog() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getConfig", json!({})).await;
     let providers = drain(&mut rx)[0]["exit"]["value"]["providers"].clone();
-    let ids: Vec<&str> =
-        providers.as_array().unwrap().iter().map(|p| p["instanceId"].as_str().unwrap()).collect();
-    assert!(ids.contains(&"claudeAgent") && ids.contains(&"codex"), "got {ids:?}");
+    let ids: Vec<&str> = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["instanceId"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"claudeAgent") && ids.contains(&"codex"),
+        "got {ids:?}"
+    );
     for p in providers.as_array().unwrap() {
-        assert!(p["models"].as_array().is_some_and(|m| !m.is_empty()), "every provider has models: {p}");
-        assert!(p["status"].is_string(), "status comes from the snapshot: {p}");
+        assert!(
+            p["models"].as_array().is_some_and(|m| !m.is_empty()),
+            "every provider has models: {p}"
+        );
+        assert!(
+            p["status"].is_string(),
+            "status comes from the snapshot: {p}"
+        );
     }
 }
 
@@ -1764,45 +2466,87 @@ async fn a_model_switch_persists_and_keeps_history() {
     let codex = json!({"instanceId": "codex", "model": "codex-default"});
 
     // turn 1 creates the thread on claude
-    ensure_thread_on_shell(&state, &json!({
-        "threadId": "t-switch", "modelSelection": claude,
-        "message": {"text": "first", "messageId": "m1"},
-    })).await;
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-switch", "modelSelection": claude,
+            "message": {"text": "first", "messageId": "m1"},
+        }),
+    )
+    .await;
     // The prompt itself is written by `run_turn_with_prompt_id`, not by
     // thread bootstrap, so a test that never runs a turn seeds it the way
     // the runtime would. What is under test here is the SWITCH, and the
     // invariant that it does not cost the transcript.
     seed_prompt(&state, "t-switch", "m1", "first").await;
     // turn 2 switches to codex
-    ensure_thread_on_shell(&state, &json!({
-        "threadId": "t-switch", "modelSelection": codex,
-        "message": {"text": "second", "messageId": "m2"},
-    })).await;
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-switch", "modelSelection": codex,
+            "message": {"text": "second", "messageId": "m2"},
+        }),
+    )
+    .await;
     seed_prompt(&state, "t-switch", "m2", "second").await;
 
     // the DURABLE thread row carries the new selection
-    let thread = state.rt.threads().await.into_iter()
-        .find(|t| t["id"] == "t-switch").expect("thread persisted");
-    assert_eq!(thread["modelSelection"]["instanceId"], "codex", "switch persisted: {thread}");
+    let thread = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-switch")
+        .expect("thread persisted");
+    assert_eq!(
+        thread["modelSelection"]["instanceId"], "codex",
+        "switch persisted: {thread}"
+    );
 
     // and the subscribeThread snapshot the UI reads agrees, with BOTH
     // messages still there
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({"threadId": "t-switch"})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-switch"}),
+    )
+    .await;
     let frames = drain(&mut rx);
-    let snap = frames.iter().find(|f| f["values"][0]["kind"] == "snapshot")
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
         .expect("snapshot");
     let t = &snap["values"][0]["snapshot"]["thread"];
-    assert_eq!(t["modelSelection"]["instanceId"], "codex", "snapshot shows the switch: {t}");
-    let ids: Vec<&str> = t["messages"].as_array().unwrap().iter()
-        .map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["m1", "m2"], "the switch preserved message history");
+    assert_eq!(
+        t["modelSelection"]["instanceId"], "codex",
+        "snapshot shows the switch: {t}"
+    );
+    let ids: Vec<&str> = t["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["m1", "m2"],
+        "the switch preserved message history"
+    );
 
     // and the next turn ROUTES to the switched provider, not the default —
     // model_from_selection is fallible now (unroutable = error, never a
     // silent default), so a successful codex selection is Ok(CodexResume).
-    let routed = model_from_selection(&*state.catalog.read().await, &codex, &state.default_model().await);
-    assert!(matches!(routed, Ok(ModelRef::CodexResume { .. })), "routed to {routed:?}");
+    let routed = model_from_selection(
+        &*state.catalog.read().await,
+        &codex,
+        &state.default_model().await,
+    );
+    assert!(
+        matches!(routed, Ok(ModelRef::CodexResume { .. })),
+        "routed to {routed:?}"
+    );
 }
 
 /// #26/#27: the VCS RPCs are IMPLEMENTED (over cairn), not answered from
@@ -1822,8 +2566,14 @@ async fn vcs_methods_are_implemented_not_unsupported() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         request(&state, &tx, method, payload).await;
         let frames = drain(&mut rx);
-        let exit = frames.iter().find(|f| f["_tag"] == "Exit").expect("{method} exits");
-        assert_eq!(exit["exit"]["_tag"], "Success", "{method} must be implemented: {exit}");
+        let exit = frames
+            .iter()
+            .find(|f| f["_tag"] == "Exit")
+            .expect("{method} exits");
+        assert_eq!(
+            exit["exit"]["_tag"], "Success",
+            "{method} must be implemented: {exit}"
+        );
     }
 
     // the status stream emits a real snapshot frame
@@ -1836,13 +2586,29 @@ async fn vcs_methods_are_implemented_not_unsupported() {
         .map(|f| f["values"][0].clone())
         .unwrap_or_else(|| panic!("a snapshot chunk, got {frames:?}"));
     assert_eq!(snap["_tag"], "snapshot", "got {snap}");
-    assert_eq!(snap["local"]["isRepo"], json!(true), "real cairn status: {snap}");
+    assert_eq!(
+        snap["local"]["isRepo"],
+        json!(true),
+        "real cairn status: {snap}"
+    );
 
     // and a refused operation FAILS rather than reporting success
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.switchRef", json!({"cwd": cwd, "refName": "--upload-pack=pwn"})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Failure", "an option-shaped ref must be refused: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.switchRef",
+        json!({"cwd": cwd, "refName": "--upload-pack=pwn"}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an option-shaped ref must be refused: {exit}"
+    );
 }
 
 /// #45: naming a path is not authority. A client for THIS environment must
@@ -1859,19 +2625,37 @@ async fn an_outside_repo_cwd_is_refused_by_every_vcs_method() {
     let alien = outside.to_string_lossy().into_owned();
 
     for method in [
-        "vcs.refreshStatus", "vcs.listRefs", "subscribeVcsStatus", "vcs.pull",
-        "vcs.createRef", "vcs.switchRef", "vcs.createWorktree", "vcs.removeWorktree",
-        "vcs.init", "git.runStackedAction",
+        "vcs.refreshStatus",
+        "vcs.listRefs",
+        "subscribeVcsStatus",
+        "vcs.pull",
+        "vcs.createRef",
+        "vcs.switchRef",
+        "vcs.createWorktree",
+        "vcs.removeWorktree",
+        "vcs.init",
+        "git.runStackedAction",
     ] {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        request(&state, &tx, method, json!({
-            "cwd": alien, "refName": "main", "path": alien,
-            "actionId": "a", "action": "commit", "commitMessage": "x",
-        })).await;
+        request(
+            &state,
+            &tx,
+            method,
+            json!({
+                "cwd": alien, "refName": "main", "path": alien,
+                "actionId": "a", "action": "commit", "commitMessage": "x",
+            }),
+        )
+        .await;
         let frames = drain(&mut rx);
-        let exit = frames.iter().find(|f| f["_tag"] == "Exit")
+        let exit = frames
+            .iter()
+            .find(|f| f["_tag"] == "Exit")
             .unwrap_or_else(|| panic!("{method} must answer, got {frames:?}"));
-        assert_eq!(exit["exit"]["_tag"], "Failure", "{method} must fail closed: {exit}");
+        assert_eq!(
+            exit["exit"]["_tag"], "Failure",
+            "{method} must fail closed: {exit}"
+        );
         assert!(
             frames.iter().all(|f| f["_tag"] != "Chunk"),
             "{method} must not leak a snapshot of an outside repo: {frames:?}"
@@ -1881,9 +2665,21 @@ async fn an_outside_repo_cwd_is_refused_by_every_vcs_method() {
     // the environment's OWN workspace still works, so this is a boundary
     // and not a blanket refusal
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.refreshStatus", json!({"cwd": dir.to_string_lossy()})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(exit["exit"]["_tag"], "Success", "the workspace itself is admitted: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.refreshStatus",
+        json!({"cwd": dir.to_string_lossy()}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "the workspace itself is admitted: {exit}"
+    );
 
     let _ = std::fs::remove_dir_all(&outside);
 }
@@ -1902,12 +2698,24 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
         json!({"instanceId": "typo-provider", "model": "x"}),       // unknown instance
     ] {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-            "type": "thread.turn.start", "threadId": "t-bad",
-            "modelSelection": sel, "message": {"text": "hi", "messageId": "m1"},
-        }})).await;
-        let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-        assert_eq!(exit["exit"]["_tag"], "Failure", "selection {sel} must fail: {exit}");
+        request(
+            &state,
+            &tx,
+            "orchestration.dispatchCommand",
+            json!({"input": {
+                "type": "thread.turn.start", "threadId": "t-bad",
+                "modelSelection": sel, "message": {"text": "hi", "messageId": "m1"},
+            }}),
+        )
+        .await;
+        let exit = drain(&mut rx)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .expect("exits");
+        assert_eq!(
+            exit["exit"]["_tag"], "Failure",
+            "selection {sel} must fail: {exit}"
+        );
     }
 
     // no turn was admitted, so the thread was never created under a
@@ -1919,13 +2727,25 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
 
     // a VALID selection still dispatches, so this is a gate and not a wall
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.turn.start", "threadId": "t-ok",
-        "modelSelection": {"instanceId": "codex", "model": "codex-default"},
-        "message": {"text": "hi", "messageId": "m1"},
-    }})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "a routable selection dispatches: {exit}");
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.start", "threadId": "t-ok",
+            "modelSelection": {"instanceId": "codex", "model": "codex-default"},
+            "message": {"text": "hi", "messageId": "m1"},
+        }}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "a routable selection dispatches: {exit}"
+    );
 }
 
 /// The asset surface is BOTH halves or it is nothing: the RPC mints a URL
@@ -1937,28 +2757,69 @@ async fn asset_urls_are_minted_signed_and_confined() {
     std::fs::write(dir.join("logo.png"), b"\x89PNG").unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "assets.createUrl", json!({
-        "resource": {"_tag": "workspace-file", "threadId": "t-1", "path": "logo.png"},
-    })).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "assets.createUrl must be implemented: {exit}");
-    let url = exit["exit"]["value"]["relativeUrl"].as_str().expect("a relativeUrl").to_string();
-    assert!(url.starts_with(&format!("{}/", assets::ROUTE_PREFIX)), "{url}");
-    assert!(exit["exit"]["value"]["expiresAt"].as_i64().unwrap() > 0, "carries an expiry");
+    request(
+        &state,
+        &tx,
+        "assets.createUrl",
+        json!({
+            "resource": {"_tag": "workspace-file", "threadId": "t-1", "path": "logo.png"},
+        }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "assets.createUrl must be implemented: {exit}"
+    );
+    let url = exit["exit"]["value"]["relativeUrl"]
+        .as_str()
+        .expect("a relativeUrl")
+        .to_string();
+    assert!(
+        url.starts_with(&format!("{}/", assets::ROUTE_PREFIX)),
+        "{url}"
+    );
+    assert!(
+        exit["exit"]["value"]["expiresAt"].as_i64().unwrap() > 0,
+        "carries an expiry"
+    );
 
     // the minted token redeems to the very file we asked for
-    let token = url.trim_start_matches(&format!("{}/", assets::ROUTE_PREFIX)).split('/').next().unwrap();
-    let served = assets::verify(token, &state.assets_key, chrono::Utc::now().timestamp_millis())
-        .expect("the URL this server minted verifies against its own key");
+    let token = url
+        .trim_start_matches(&format!("{}/", assets::ROUTE_PREFIX))
+        .split('/')
+        .next()
+        .unwrap();
+    let served = assets::verify(
+        token,
+        &state.assets_key,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .expect("the URL this server minted verifies against its own key");
     assert_eq!(std::fs::read(served).unwrap(), b"\x89PNG");
 
     // and an escape is refused, so no signature is ever issued for it
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "assets.createUrl", json!({
-        "resource": {"_tag": "workspace-file", "threadId": "t-1", "path": "../../etc/passwd"},
-    })).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Failure", "an escaping path must not be signed: {exit}");
+    request(
+        &state,
+        &tx,
+        "assets.createUrl",
+        json!({
+            "resource": {"_tag": "workspace-file", "threadId": "t-1", "path": "../../etc/passwd"},
+        }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an escaping path must not be signed: {exit}"
+    );
 }
 
 /// The client pings this on a timer; failing it made every connected client
@@ -1967,9 +2828,21 @@ async fn asset_urls_are_minted_signed_and_confined() {
 async fn client_activity_reports_are_acknowledged() {
     let (state, _dir) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.reportClientActivity", json!({"activity": "foreground"})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "activity reports are acked: {exit}");
+    request(
+        &state,
+        &tx,
+        "server.reportClientActivity",
+        json!({"activity": "foreground"}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "activity reports are acked: {exit}"
+    );
 }
 
 /// #48: proving the SOURCE repo is ours says nothing about the DESTINATION.
@@ -1982,47 +2855,102 @@ async fn worktree_paths_are_admitted_not_trusted() {
     std::fs::write(dir.join("a.txt"), "x").unwrap();
     let cwd = dir.to_string_lossy().into_owned();
     // a commit so branches can be created off HEAD
-    vcs::run_stacked_action(&cwd, &json!({"actionId":"a","action":"commit","commitMessage":"init"}))
-        .await
-        .unwrap();
+    vcs::run_stacked_action(
+        &cwd,
+        &json!({"actionId":"a","action":"commit","commitMessage":"init"}),
+    )
+    .await
+    .unwrap();
 
     // 1. an outside absolute path is refused BEFORE git runs
     let outside = std::env::temp_dir().join(format!("t3-wt-outside-{}", uuid::Uuid::new_v4()));
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.createWorktree", json!({
-        "cwd": cwd, "refName": "wt-a", "path": outside.to_string_lossy(),
-    })).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Failure", "outside path must be refused: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.createWorktree",
+        json!({
+            "cwd": cwd, "refName": "wt-a", "path": outside.to_string_lossy(),
+        }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "outside path must be refused: {exit}"
+    );
     assert!(!outside.exists(), "nothing was created at the refused path");
 
     // 2. the default path still works, and lands in the worktree area
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.createWorktree", json!({"cwd": cwd, "refName": "wt-b"})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "the default destination works: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.createWorktree",
+        json!({"cwd": cwd, "refName": "wt-b"}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "the default destination works: {exit}"
+    );
     // VcsCreateWorktreeResult wraps the worktree (#62)
-    let made = exit["exit"]["value"]["worktree"]["path"].as_str().unwrap().to_string();
+    let made = exit["exit"]["value"]["worktree"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let base = vcs::worktree_base(&cwd);
     assert!(
         std::path::Path::new(&made).starts_with(&base),
-        "created inside the worktree area: {made} vs {}", base.display()
+        "created inside the worktree area: {made} vs {}",
+        base.display()
     );
 
     // 3. removing an unregistered/outside path is refused
     let alien = std::env::temp_dir().join(format!("t3-wt-alien-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&alien).unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.removeWorktree", json!({"cwd": cwd, "path": alien.to_string_lossy()})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Failure", "an unregistered path must not be force-removed: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.removeWorktree",
+        json!({"cwd": cwd, "path": alien.to_string_lossy()}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an unregistered path must not be force-removed: {exit}"
+    );
     assert!(alien.exists(), "the refused path was NOT deleted");
 
     // 4. removing the one we made succeeds — a boundary, not a wall
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.removeWorktree", json!({"cwd": cwd, "path": made})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "our own worktree removes: {exit}");
+    request(
+        &state,
+        &tx,
+        "vcs.removeWorktree",
+        json!({"cwd": cwd, "path": made}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "our own worktree removes: {exit}"
+    );
 
     let _ = std::fs::remove_dir_all(&alien);
     let _ = std::fs::remove_dir_all(vcs::worktree_base(&cwd));
@@ -2043,9 +2971,12 @@ async fn an_unimplemented_subscription_fails_instead_of_hanging() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         request(&state, &tx, method, json!({})).await;
         let frames = drain(&mut rx);
-        let exit = frames.iter().find(|f| f["_tag"] == "Exit").unwrap_or_else(|| {
-            panic!("{method} parked with no answer — the hang this test exists to stop")
-        });
+        let exit = frames
+            .iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap_or_else(|| {
+                panic!("{method} parked with no answer — the hang this test exists to stop")
+            });
         assert_eq!(exit["exit"]["_tag"], "Failure", "{method}: {exit}");
     }
 
@@ -2053,12 +2984,18 @@ async fn an_unimplemented_subscription_fails_instead_of_hanging() {
     // has nothing to say) — proving this is an allowlist, not "fail all"
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "subscribeEnvironments", json!({})).await;
-    assert!(drain(&mut rx).is_empty(), "an intentionally-empty stream stays open");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "an intentionally-empty stream stays open"
+    );
 
     // and the implemented terminal streams answer for real
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "subscribeTerminalMetadata", json!({})).await;
-    assert!(!drain(&mut rx).is_empty(), "terminal metadata is implemented and emits");
+    assert!(
+        !drain(&mut rx).is_empty(),
+        "terminal metadata is implemented and emits"
+    );
 }
 
 /// #52: the stop button reaches Hearth AND the SDK turn cancel. An ack with
@@ -2071,19 +3008,29 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
     // a real long-running foreground command in the SHARED pty — the same
     // one run_bash uses, which is why a stop has to reach it
     let runner = state.terminal.clone();
-    let running = tokio::spawn(async move {
-        runner.run("sleep 30", false, Some(25), false).await
-    });
+    let running = tokio::spawn(async move { runner.run("sleep 30", false, Some(25), false).await });
     // let the command actually reach the shell before interrupting
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let started = std::time::Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.turn.interrupt", "threadId": "t-stop",
-    }})).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
-    assert_eq!(exit["exit"]["_tag"], "Success", "the stop is accepted: {exit}");
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.interrupt", "threadId": "t-stop",
+        }}),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "the stop is accepted: {exit}"
+    );
 
     // THE point: the command came back early because it was interrupted,
     // not because `sleep 30` finished.
@@ -2102,8 +3049,14 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
     );
 
     // and the PTY itself survived — a stop cancels the command, not the shell
-    let after = state.terminal.run("echo alive", false, Some(10), false).await;
-    assert!(after.output.contains("alive"), "the shell is still usable: {after:?}");
+    let after = state
+        .terminal
+        .run("echo alive", false, Some(10), false)
+        .await;
+    assert!(
+        after.output.contains("alive"),
+        "the shell is still usable: {after:?}"
+    );
 }
 
 /// #68: a settings/provider write must reach the UI's shared config
@@ -2122,20 +3075,35 @@ async fn settings_writes_publish_on_the_config_stream() {
     // against whatever this server happens to emit: the client switches on
     // `event.type`, so a test that read our own `kind` back would stay green
     // while every real client dropped the frame.
-    assert_eq!(first[0]["values"][0]["version"], 1, "contract envelope: {first:?}");
-    assert_eq!(first[0]["values"][0]["type"], "snapshot", "a late subscriber gets state: {first:?}");
+    assert_eq!(
+        first[0]["values"][0]["version"], 1,
+        "contract envelope: {first:?}"
+    );
+    assert_eq!(
+        first[0]["values"][0]["type"], "snapshot",
+        "a late subscriber gets state: {first:?}"
+    );
     assert!(first[0]["values"][0]["config"]["providers"].is_array());
 
     // now write settings on a DIFFERENT connection
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({"patch": {"providerInstances": {
-        "ollama_local": {
-            "driver": "openaiCompat", "enabled": true, "displayName": "Ollama",
-            "config": {"baseUrl": "http://localhost:11434", "models": ["qwen2.5-coder"]},
-        }
-    }}})).await;
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({"patch": {"providerInstances": {
+            "ollama_local": {
+                "driver": "openaiCompat", "enabled": true, "displayName": "Ollama",
+                "config": {"baseUrl": "http://localhost:11434", "models": ["qwen2.5-coder"]},
+            }
+        }}}),
+    )
+    .await;
     assert_eq!(
-        drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap()["exit"]["_tag"],
+        drain(&mut rx)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap()["exit"]["_tag"],
         "Success"
     );
 
@@ -2155,8 +3123,14 @@ async fn settings_writes_publish_on_the_config_stream() {
         .iter()
         .filter_map(|f| f["values"][0]["type"].as_str())
         .collect();
-    assert!(kinds.contains(&"settingsUpdated"), "settings change published: {kinds:?}");
-    assert!(kinds.contains(&"providerStatuses"), "provider statuses published: {kinds:?}");
+    assert!(
+        kinds.contains(&"settingsUpdated"),
+        "settings change published: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"providerStatuses"),
+        "provider statuses published: {kinds:?}"
+    );
 
     // and the published providers carry the newly configured instance, so
     // the projection the picker reads is actually current. The body hangs
@@ -2171,7 +3145,10 @@ async fn settings_writes_publish_on_the_config_stream() {
         .iter()
         .map(|p| p["instanceId"].as_str().unwrap())
         .collect();
-    assert!(ids.contains(&"ollama_local"), "the new provider is in the push: {ids:?}");
+    assert!(
+        ids.contains(&"ollama_local"),
+        "the new provider is in the push: {ids:?}"
+    );
 }
 
 /// #67: the Diagnostics page's RPCs are implemented, not unsupported —
@@ -2183,8 +3160,14 @@ async fn diagnostics_rpcs_are_implemented_and_report_real_processes() {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     request(&state, &tx, "server.getProcessDiagnostics", json!({})).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "not the unsupported arm: {f:?}"
+    );
     let d = &f["exit"]["value"];
     let procs = d["processes"].as_array().expect("processes array");
     if d["error"]["_tag"] == "None" {
@@ -2192,7 +3175,11 @@ async fn diagnostics_rpcs_are_implemented_and_report_real_processes() {
         assert!(!procs.is_empty(), "a real tree, not an empty list: {d}");
         assert!(d["totalRssBytes"].as_i64().unwrap() > 0, "real memory: {d}");
         // Option-typed fields must use Effect's encoding or the client drops them.
-        assert_eq!(procs[0]["pgid"]["_id"], "Option", "encoded Option: {}", procs[0]);
+        assert_eq!(
+            procs[0]["pgid"]["_id"], "Option",
+            "encoded Option: {}",
+            procs[0]
+        );
     } else {
         assert!(
             d["error"]["value"]["message"]
@@ -2200,32 +3187,69 @@ async fn diagnostics_rpcs_are_implemented_and_report_real_processes() {
                 .is_some_and(|m| m.contains("ps failed")),
             "a failed native read must name the collector that failed: {d}"
         );
-        assert_eq!(d["processCount"], 0, "failed ps walk must not fabricate rows: {d}");
+        assert_eq!(
+            d["processCount"], 0,
+            "failed ps walk must not fabricate rows: {d}"
+        );
     }
 
     // history: the read above sampled, so a bucket exists
-    request(&state, &tx, "server.getProcessResourceHistory",
-            json!({"windowMs": 60_000, "bucketMs": 1_000})).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
+    request(
+        &state,
+        &tx,
+        "server.getProcessResourceHistory",
+        json!({"windowMs": 60_000, "bucketMs": 1_000}),
+    )
+    .await;
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "not the unsupported arm: {f:?}"
+    );
     let h = &f["exit"]["value"];
     assert_eq!(h["windowMs"], 60_000, "the caller's window, echoed: {h}");
     if d["error"]["_tag"] == "None" {
-        assert!(h["retainedSampleCount"].as_i64().unwrap() >= 1, "the read sampled: {h}");
-        assert!(!h["buckets"].as_array().unwrap().is_empty(), "a sampled bucket: {h}");
+        assert!(
+            h["retainedSampleCount"].as_i64().unwrap() >= 1,
+            "the read sampled: {h}"
+        );
+        assert!(
+            !h["buckets"].as_array().unwrap().is_empty(),
+            "a sampled bucket: {h}"
+        );
     } else {
-        assert_eq!(h["retainedSampleCount"], 0, "failed ps read must not invent history: {h}");
-        assert!(h["buckets"].as_array().unwrap().is_empty(), "failed ps read must not invent buckets: {h}");
-        assert_eq!(h["health"]["native"]["lastError"]["_tag"], "Some",
-                   "history reports the collector failure: {h}");
+        assert_eq!(
+            h["retainedSampleCount"], 0,
+            "failed ps read must not invent history: {h}"
+        );
+        assert!(
+            h["buckets"].as_array().unwrap().is_empty(),
+            "failed ps read must not invent buckets: {h}"
+        );
+        assert_eq!(
+            h["health"]["native"]["lastError"]["_tag"], "Some",
+            "history reports the collector failure: {h}"
+        );
     }
 
     // trace diagnostics: no OTLP file on this runtime, so it must say so
     // rather than answer with a clean-looking empty scan
     request(&state, &tx, "server.getTraceDiagnostics", json!({})).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
-    assert_eq!(f["exit"]["value"]["error"]["_tag"], "Some", "honest error: {f:?}");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "not the unsupported arm: {f:?}"
+    );
+    assert_eq!(
+        f["exit"]["value"]["error"]["_tag"], "Some",
+        "honest error: {f:?}"
+    );
 }
 
 /// PROOF for #332, at the PRODUCT EDGE: an hourly request without bounds
@@ -2243,7 +3267,9 @@ async fn an_invalid_usage_window_is_a_typed_rpc_failure_not_a_success() {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     request(
-        &state, &tx, "server.getUsageSummary",
+        &state,
+        &tx,
+        "server.getUsageSummary",
         json!({ "input": {
             "sinceDay": "2026-01-01", "untilDay": "2026-01-31",
             "timeZone": "UTC", "resolution": "hour",
@@ -2251,14 +3277,22 @@ async fn an_invalid_usage_window_is_a_typed_rpc_failure_not_a_success() {
     )
     .await;
 
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     assert_eq!(f["exit"]["_tag"], "Failure", "not a success payload: {f}");
     let cause = &f["exit"]["cause"][0];
-    assert_eq!(cause["_tag"], "Fail", "a DECLARED error, not a Die defect: {f}");
+    assert_eq!(
+        cause["_tag"], "Fail",
+        "a DECLARED error, not a Die defect: {f}"
+    );
     assert_eq!(cause["error"]["_tag"], "UsageReadError", "{f}");
     assert_eq!(cause["error"]["reason"], "invalidWindow", "{f}");
     assert!(
-        cause["error"]["detail"].as_str().is_some_and(|d| d.contains("sinceTime")),
+        cause["error"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("sinceTime")),
         "the detail names what was missing: {f}"
     );
 }
@@ -2286,15 +3320,18 @@ async fn usage_summary_and_resource_telemetry_are_implemented_not_fabricated() {
     std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
     std::fs::write(
         &transcript,
-        format!("{}\n", json!({
-            "type": "assistant",
-            "timestamp": "2026-01-14T10:00:00.000Z",
-            "sessionId": "s-1", "requestId": "r-1",
-            "message": { "id": "m-1", "model": "claude-opus-5", "usage": {
-                "input_tokens": 100, "cache_read_input_tokens": 20,
-                "cache_creation_input_tokens": 5, "output_tokens": 40,
-            }},
-        })),
+        format!(
+            "{}\n",
+            json!({
+                "type": "assistant",
+                "timestamp": "2026-01-14T10:00:00.000Z",
+                "sessionId": "s-1", "requestId": "r-1",
+                "message": { "id": "m-1", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 100, "cache_read_input_tokens": 20,
+                    "cache_creation_input_tokens": 5, "output_tokens": 40,
+                }},
+            })
+        ),
     )
     .unwrap();
     let mut state = state;
@@ -2307,51 +3344,88 @@ async fn usage_summary_and_resource_telemetry_are_implemented_not_fabricated() {
         &state, &tx, "server.getUsageSummary",
         json!({ "input": { "sinceDay": "2026-01-01", "untilDay": "2026-01-31", "timeZone": "UTC" } }),
     ).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "not the unsupported arm: {f:?}"
+    );
     let s = &f["exit"]["value"];
     assert_eq!(s["contractVersion"], 4, "shape version pinned: {s}");
     assert_eq!(s["timeZone"], "UTC", "the caller's zone, echoed: {s}");
     assert_eq!(s["sinceDay"], "2026-01-01");
     assert_eq!(s["untilDay"], "2026-01-31");
     let buckets = s["buckets"].as_array().unwrap();
-    assert_eq!(buckets.len(), 1, "the seeded turn must be REPORTED, not swallowed: {s}");
+    assert_eq!(
+        buckets.len(),
+        1,
+        "the seeded turn must be REPORTED, not swallowed: {s}"
+    );
     assert_eq!(buckets[0]["day"], "2026-01-14");
     assert_eq!(buckets[0]["totals"]["outputTokens"], 40);
     let sources = s["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 1, "the scanned source is reported: {s}");
     assert_eq!(sources[0]["status"], "ok");
     assert_eq!(sources[0]["scannedFiles"], 1);
-    assert_eq!(s["pricing"]["status"], "unavailable",
-               "no rate table is cached here, and the payload says so: {s}");
-    assert_eq!(buckets[0]["costSource"], "unpriced",
-               "tokens counted, cost reported as unknown rather than $0: {s}");
+    assert_eq!(
+        s["pricing"]["status"], "unavailable",
+        "no rate table is cached here, and the payload says so: {s}"
+    );
+    assert_eq!(
+        buckets[0]["costSource"], "unpriced",
+        "tokens counted, cost reported as unknown rather than $0: {s}"
+    );
 
     request(&state, &tx, "subscribeResourceTelemetry", json!({})).await;
     // first Chunk arrives synchronously — the handler pushes the initial
     // snapshot before spawning the pump.
     let chunks: Vec<Value> = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
         f.get("_tag").and_then(Value::as_str) == Some("Chunk")
-    }).await;
-    let first = chunks.iter().find(|f| f["_tag"] == "Chunk")
+    })
+    .await;
+    let first = chunks
+        .iter()
+        .find(|f| f["_tag"] == "Chunk")
         .expect("initial snapshot chunk");
     let snap = &first["values"][0];
-    assert!(snap["sampleIntervalMs"].as_i64().unwrap() > 0, "interval reported: {snap}");
+    assert!(
+        snap["sampleIntervalMs"].as_i64().unwrap() > 0,
+        "interval reported: {snap}"
+    );
     let procs = snap["processes"].as_array().expect("processes array");
     if snap["health"]["native"]["status"] == "healthy" {
-        assert!(!procs.is_empty(), "measured tree, not fabricated empty: {snap}");
+        assert!(
+            !procs.is_empty(),
+            "measured tree, not fabricated empty: {snap}"
+        );
         // Per-process I/O must be typed unavailable, not zeroed as healthy.
-        assert_eq!(procs[0]["ioSemantics"], "unavailable",
-                   "ps does not expose per-process I/O; contract requires typed unavailable: {}", procs[0]);
+        assert_eq!(
+            procs[0]["ioSemantics"], "unavailable",
+            "ps does not expose per-process I/O; contract requires typed unavailable: {}",
+            procs[0]
+        );
     } else {
-        assert_eq!(snap["health"]["native"]["status"], "unavailable",
-                   "native source must fail honestly, not report healthy zeros: {snap}");
-        assert_eq!(procs.len(), 0, "failed native source must not fabricate rows: {snap}");
-        assert_eq!(snap["health"]["native"]["lastError"]["_tag"], "Some",
-                   "unavailable native source names the failure: {snap}");
+        assert_eq!(
+            snap["health"]["native"]["status"], "unavailable",
+            "native source must fail honestly, not report healthy zeros: {snap}"
+        );
+        assert_eq!(
+            procs.len(),
+            0,
+            "failed native source must not fabricate rows: {snap}"
+        );
+        assert_eq!(
+            snap["health"]["native"]["lastError"]["_tag"], "Some",
+            "unavailable native source names the failure: {snap}"
+        );
     }
     // Option-typed fields carry Effect encoding.
-    assert_eq!(snap["speedLimitPercent"]["_id"], "Option", "encoded Option: {snap}");
+    assert_eq!(
+        snap["speedLimitPercent"]["_id"], "Option",
+        "encoded Option: {snap}"
+    );
 }
 
 /// #332: `server.getUsageSummary` must route `UsageReadError` through
@@ -2393,7 +3467,10 @@ async fn an_unreadable_usage_source_is_reported_not_silently_empty() {
         &state, &tx, "server.getUsageSummary",
         json!({ "input": { "sinceDay": "2026-01-01", "untilDay": "2026-12-31", "timeZone": "UTC" } }),
     ).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
 
     assert_eq!(
         f["exit"]["_tag"], "Success",
@@ -2402,7 +3479,11 @@ async fn an_unreadable_usage_source_is_reported_not_silently_empty() {
     );
     let summary = &f["exit"]["value"];
     let sources = summary["sources"].as_array().expect("a sources array");
-    assert_eq!(sources.len(), 1, "the configured source is accounted for: {summary}");
+    assert_eq!(
+        sources.len(),
+        1,
+        "the configured source is accounted for: {summary}"
+    );
     let src = &sources[0];
     assert_ne!(
         src["status"], "ok",
@@ -2431,7 +3512,10 @@ async fn usage_summary_invalid_window_exits_failure_not_a_tagged_success() {
         // `{"_tag":"UsageReadError", ...}` for this.
         json!({ "input": { "sinceDay": "2026-02-01", "untilDay": "2026-01-01", "timeZone": "UTC" } }),
     ).await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         f["exit"]["_tag"], "Failure",
         "an invalid window is a contract Failure, not a Success wrapping UsageReadError: {f}"
@@ -2442,11 +3526,16 @@ async fn usage_summary_invalid_window_exits_failure_not_a_tagged_success() {
     // would satisfy "it failed" while giving the UI nothing to say beyond
     // "unknown" — which is why this asserts the tag, not just a message.
     let cause = &f["exit"]["cause"][0];
-    assert_eq!(cause["_tag"], "Fail", "declared error, not a Die defect: {f}");
+    assert_eq!(
+        cause["_tag"], "Fail",
+        "declared error, not a Die defect: {f}"
+    );
     assert_eq!(cause["error"]["_tag"], "UsageReadError", "{f}");
     assert_eq!(cause["error"]["reason"], "invalidWindow", "{f}");
     assert!(
-        cause["error"]["detail"].as_str().is_some_and(|d| d.contains("2026-01-01")),
+        cause["error"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("2026-01-01")),
         "the detail names the window that was rejected: {f}"
     );
 }
@@ -2462,17 +3551,26 @@ async fn keybinding_edits_are_durable_and_reach_the_config_surface() {
 
     // boot config ships the real keyboard, not an empty list
     request(&state, &tx, "server.getConfig", json!({})).await;
-    let cfg = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let cfg = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     let boot = cfg["exit"]["value"].clone();
     assert!(
         boot["keybindings"].as_array().map(|a| a.len()).unwrap_or(0) > 30,
         "defaults must be served: {boot}"
     );
-    assert_ne!(boot["keybindingsConfigPath"], "/dev/null", "path must be real: {boot}");
+    assert_ne!(
+        boot["keybindingsConfigPath"], "/dev/null",
+        "path must be real: {boot}"
+    );
     // the compiled shape the client dispatches on
     let first = &boot["keybindings"][0];
     assert!(first["command"].is_string(), "compiled rule: {first}");
-    assert!(first["shortcut"]["key"].is_string(), "compiled rule: {first}");
+    assert!(
+        first["shortcut"]["key"].is_string(),
+        "compiled rule: {first}"
+    );
 
     // rebind a command
     request(
@@ -2482,18 +3580,39 @@ async fn keybinding_edits_are_durable_and_reach_the_config_surface() {
         json!({"key": "mod+shift+b", "command": "sidebar.toggle"}),
     )
     .await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
-    assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
-    let bound = f["exit"]["value"]["keybindings"].as_array().unwrap().clone();
-    let sidebar: Vec<&Value> =
-        bound.iter().filter(|r| r["command"] == "sidebar.toggle").collect();
-    assert_eq!(sidebar.len(), 1, "the default is retired, not duplicated: {sidebar:?}");
-    assert_eq!(sidebar[0]["shortcut"]["shiftKey"], true, "the custom rule won");
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
+    assert_eq!(
+        f["exit"]["_tag"], "Success",
+        "not the unsupported arm: {f:?}"
+    );
+    let bound = f["exit"]["value"]["keybindings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let sidebar: Vec<&Value> = bound
+        .iter()
+        .filter(|r| r["command"] == "sidebar.toggle")
+        .collect();
+    assert_eq!(
+        sidebar.len(),
+        1,
+        "the default is retired, not duplicated: {sidebar:?}"
+    );
+    assert_eq!(
+        sidebar[0]["shortcut"]["shiftKey"], true,
+        "the custom rule won"
+    );
 
     // DURABLE: a fresh getConfig on a new connection still has it
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     request(&state, &tx2, "server.getConfig", json!({})).await;
-    let again = drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let again = drain(&mut rx2)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     let persisted: Vec<Value> = again["exit"]["value"]["keybindings"]
         .as_array()
         .unwrap()
@@ -2502,7 +3621,10 @@ async fn keybinding_edits_are_durable_and_reach_the_config_surface() {
         .cloned()
         .collect();
     assert_eq!(persisted.len(), 1);
-    assert_eq!(persisted[0]["shortcut"]["shiftKey"], true, "survived the reconnect");
+    assert_eq!(
+        persisted[0]["shortcut"]["shiftKey"], true,
+        "survived the reconnect"
+    );
 
     // removing the override restores the built-in binding rather than
     // leaving the command dead
@@ -2513,7 +3635,10 @@ async fn keybinding_edits_are_durable_and_reach_the_config_surface() {
         json!({"key": "mod+shift+b", "command": "sidebar.toggle"}),
     )
     .await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     assert_eq!(f["exit"]["_tag"], "Success", "{f:?}");
     let restored: Vec<Value> = f["exit"]["value"]["keybindings"]
         .as_array()
@@ -2523,7 +3648,10 @@ async fn keybinding_edits_are_durable_and_reach_the_config_surface() {
         .cloned()
         .collect();
     assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0]["shortcut"]["shiftKey"], false, "default came back");
+    assert_eq!(
+        restored[0]["shortcut"]["shiftKey"], false,
+        "default came back"
+    );
 }
 
 /// An unparseable binding must FAIL visibly. Storing it would report a
@@ -2539,14 +3667,23 @@ async fn an_unparseable_keybinding_is_refused_not_silently_stored() {
         json!({"key": "a+b", "command": "sidebar.toggle"}),
     )
     .await;
-    let f = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let f = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     assert_eq!(f["exit"]["_tag"], "Failure", "must refuse: {f:?}");
     let msg = f["exit"].to_string();
-    assert!(!msg.contains("unsupported"), "the method IS implemented: {msg}");
+    assert!(
+        !msg.contains("unsupported"),
+        "the method IS implemented: {msg}"
+    );
 
     // and nothing was persisted
     request(&state, &tx, "server.getConfig", json!({})).await;
-    let cfg = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap();
+    let cfg = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap();
     let sidebar: Vec<Value> = cfg["exit"]["value"]["keybindings"]
         .as_array()
         .unwrap()
@@ -2577,7 +3714,10 @@ async fn keybinding_writes_publish_the_contract_event() {
     )
     .await;
     assert_eq!(
-        drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap()["exit"]["_tag"],
+        drain(&mut rx)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap()["exit"]["_tag"],
         "Success"
     );
 
@@ -2598,8 +3738,14 @@ async fn keybinding_writes_publish_the_contract_event() {
         .unwrap_or_else(|| panic!("no keybindingsUpdated on the stream: {pushed:?}"));
     let item = &ev["values"][0];
     assert_eq!(item["version"], 1, "contract envelope: {item}");
-    assert!(item["payload"]["keybindings"].is_array(), "payload-shaped: {item}");
-    assert!(item["payload"]["issues"].is_array(), "issues travel with it: {item}");
+    assert!(
+        item["payload"]["keybindings"].is_array(),
+        "payload-shaped: {item}"
+    );
+    assert!(
+        item["payload"]["issues"].is_array(),
+        "issues travel with it: {item}"
+    );
     let palette: Vec<&Value> = item["payload"]["keybindings"]
         .as_array()
         .unwrap()
@@ -2607,7 +3753,10 @@ async fn keybinding_writes_publish_the_contract_event() {
         .filter(|r| r["command"] == "commandPalette.toggle")
         .collect();
     assert_eq!(palette.len(), 1);
-    assert_eq!(palette[0]["shortcut"]["shiftKey"], true, "the new binding is in the push");
+    assert_eq!(
+        palette[0]["shortcut"]["shiftKey"], true,
+        "the new binding is in the push"
+    );
 }
 
 /// #64: the project file RPCs are implemented, admitted, and confined —
@@ -2624,31 +3773,62 @@ async fn project_file_rpcs_are_implemented_and_confined() {
         async move {
             let (tx, mut rx) = mpsc::unbounded_channel();
             request(&state, &tx, m, p).await;
-            drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits")
+            drain(&mut rx)
+                .into_iter()
+                .find(|f| f["_tag"] == "Exit")
+                .expect("exits")
         }
     };
 
-    for m in ["projects.listEntries", "projects.searchEntries", "projects.readFile", "projects.writeFile"] {
+    for m in [
+        "projects.listEntries",
+        "projects.searchEntries",
+        "projects.readFile",
+        "projects.writeFile",
+    ] {
         let payload = match m {
             "projects.searchEntries" => json!({"cwd": cwd, "query": "lib", "limit": 10}),
             "projects.readFile" => json!({"cwd": cwd, "relativePath": "src/lib.rs"}),
-            "projects.writeFile" => json!({"cwd": cwd, "relativePath": "notes.md", "contents": "hi\n"}),
+            "projects.writeFile" => {
+                json!({"cwd": cwd, "relativePath": "notes.md", "contents": "hi\n"})
+            }
             _ => json!({"cwd": cwd}),
         };
         let exit = call(m, payload).await;
-        assert_eq!(exit["exit"]["_tag"], "Success", "{m} must be implemented: {exit}");
+        assert_eq!(
+            exit["exit"]["_tag"], "Success",
+            "{m} must be implemented: {exit}"
+        );
     }
-    assert_eq!(std::fs::read_to_string(dir.join("notes.md")).unwrap(), "hi\n", "the write landed");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.md")).unwrap(),
+        "hi\n",
+        "the write landed"
+    );
 
     // a path escaping the workspace is refused
-    let exit = call("projects.readFile", json!({"cwd": cwd, "relativePath": "../../etc/passwd"})).await;
-    assert_eq!(exit["exit"]["_tag"], "Failure", "an escaping read must be refused: {exit}");
+    let exit = call(
+        "projects.readFile",
+        json!({"cwd": cwd, "relativePath": "../../etc/passwd"}),
+    )
+    .await;
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an escaping read must be refused: {exit}"
+    );
 
     // and an outside cwd is refused before any file work happens
     let outside = std::env::temp_dir().join(format!("t3-proj-out-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&outside).unwrap();
-    let exit = call("projects.listEntries", json!({"cwd": outside.to_string_lossy()})).await;
-    assert_eq!(exit["exit"]["_tag"], "Failure", "an outside project is refused: {exit}");
+    let exit = call(
+        "projects.listEntries",
+        json!({"cwd": outside.to_string_lossy()}),
+    )
+    .await;
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an outside project is refused: {exit}"
+    );
     let _ = std::fs::remove_dir_all(&outside);
 }
 
@@ -2670,7 +3850,10 @@ fn approval_decisions_decode_from_the_contract_vocabulary() {
         }
     };
     assert!(decide(json!({"decision": "accept"})), "accept must APPROVE");
-    assert!(decide(json!({"decision": "acceptForSession"})), "acceptForSession must APPROVE");
+    assert!(
+        decide(json!({"decision": "acceptForSession"})),
+        "acceptForSession must APPROVE"
+    );
     assert!(!decide(json!({"decision": "decline"})));
     assert!(!decide(json!({"decision": "cancel"})));
     // legacy boolean still honoured when no decision is present
@@ -2691,8 +3874,15 @@ fn user_input_answers_decode_from_the_answers_map() {
                 keys.iter()
                     .map(|k| {
                         let v = &m[*k];
-                        let t = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                        if keys.len() == 1 { t } else { format!("{k}: {t}") }
+                        let t = v
+                            .as_str()
+                            .map(String::from)
+                            .unwrap_or_else(|| v.to_string());
+                        if keys.len() == 1 {
+                            t
+                        } else {
+                            format!("{k}: {t}")
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -2700,7 +3890,11 @@ fn user_input_answers_decode_from_the_answers_map() {
             .or_else(|| cmd.get("text").and_then(Value::as_str).map(String::from))
             .unwrap_or_default()
     };
-    assert_eq!(text_of(json!({"answers": {"q1": "yes"}})), "yes", "a single answer is bare");
+    assert_eq!(
+        text_of(json!({"answers": {"q1": "yes"}})),
+        "yes",
+        "a single answer is bare"
+    );
     assert_eq!(
         text_of(json!({"answers": {"b": "two", "a": "one"}})),
         "a: one\nb: two",
@@ -2716,7 +3910,10 @@ fn user_input_answers_decode_from_the_answers_map() {
 fn runtime_modes_produce_a_real_gate() {
     let (ask, instr) = policy_for("approval-required", "default");
     assert!(ask.contains(&"run_bash".to_string()), "shell asks: {ask:?}");
-    assert!(ask.contains(&"write_file".to_string()), "edits ask: {ask:?}");
+    assert!(
+        ask.contains(&"write_file".to_string()),
+        "edits ask: {ask:?}"
+    );
     assert!(ask.contains(&"edit_file".to_string()));
     assert!(instr.contains("approval"), "{instr}");
 
@@ -2734,7 +3931,10 @@ fn runtime_modes_produce_a_real_gate() {
     // plan mode gates mutations even under full-access: an instruction the
     // model can ignore is not a policy
     let (ask, instr) = policy_for("full-access", "plan");
-    assert!(ask.contains(&"write_file".to_string()), "plan mode gates edits: {ask:?}");
+    assert!(
+        ask.contains(&"write_file".to_string()),
+        "plan mode gates edits: {ask:?}"
+    );
     assert!(ask.contains(&"run_bash".to_string()));
     assert!(instr.contains("PLAN"), "{instr}");
 }
@@ -2745,16 +3945,37 @@ fn runtime_modes_produce_a_real_gate() {
 /// is refused.
 #[test]
 fn approval_decision_enum_is_decoded_not_defaulted_to_deny() {
-    assert!(approval_allow(&json!({"decision": "accept"})), "accept allows");
-    assert!(approval_allow(&json!({"decision": "acceptForSession"})), "acceptForSession allows");
-    assert!(!approval_allow(&json!({"decision": "decline"})), "decline denies");
-    assert!(!approval_allow(&json!({"decision": "cancel"})), "cancel denies");
+    assert!(
+        approval_allow(&json!({"decision": "accept"})),
+        "accept allows"
+    );
+    assert!(
+        approval_allow(&json!({"decision": "acceptForSession"})),
+        "acceptForSession allows"
+    );
+    assert!(
+        !approval_allow(&json!({"decision": "decline"})),
+        "decline denies"
+    );
+    assert!(
+        !approval_allow(&json!({"decision": "cancel"})),
+        "cancel denies"
+    );
     // no decision → legacy boolean fallback, not a silent deny of a true.
-    assert!(approval_allow(&json!({"approved": true})), "legacy approved bool honored");
+    assert!(
+        approval_allow(&json!({"approved": true})),
+        "legacy approved bool honored"
+    );
     assert!(!approval_allow(&json!({"approved": false})));
-    assert!(!approval_allow(&json!({})), "nothing to go on defaults to deny (fail closed)");
+    assert!(
+        !approval_allow(&json!({})),
+        "nothing to go on defaults to deny (fail closed)"
+    );
     // a present decision is authoritative over a stale/legacy boolean.
-    assert!(approval_allow(&json!({"decision": "accept", "approved": false})), "decision wins");
+    assert!(
+        approval_allow(&json!({"decision": "accept", "approved": false})),
+        "decision wins"
+    );
 }
 
 /// #73: metadata changed outside a turn is DURABLE, validated, announced —
@@ -2774,14 +3995,24 @@ async fn a_failed_command_is_reported_as_failure_exactly_once() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    request(&state, &tx, "orchestration.dispatchCommand", json!({
-        "input": { "type": "thread.meta.update", "threadId": "t-nonexistent",
-                   "patch": { "title": "should not land" } }
-    })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({
+            "input": { "type": "thread.meta.update", "threadId": "t-nonexistent",
+                       "patch": { "title": "should not land" } }
+        }),
+    )
+    .await;
 
-    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
     assert_eq!(
-        exits.len(), 1,
+        exits.len(),
+        1,
         "one request, one terminal — a Success ack followed by a Failure is a protocol \
          violation the client cannot reconcile: {exits:#?}"
     );
@@ -2800,14 +4031,26 @@ async fn a_successful_command_acks_once_and_the_change_is_durable() {
     let (state, _d) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    request(&state, &tx, "orchestration.dispatchCommand", json!({
-        "input": { "type": "project.meta.update", "projectId": "p-workspace",
-                   "patch": { "title": "renamed by test" } }
-    })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({
+            "input": { "type": "project.meta.update", "projectId": "p-workspace",
+                       "patch": { "title": "renamed by test" } }
+        }),
+    )
+    .await;
 
-    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
     assert_eq!(exits.len(), 1, "exactly one terminal: {exits:#?}");
-    assert_eq!(exits[0]["exit"]["_tag"], "Success", "the valid update is acked: {exits:#?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Success",
+        "the valid update is acked: {exits:#?}"
+    );
     assert!(
         exits[0]["exit"]["value"]["sequence"].is_i64(),
         "the ack still carries its durable dispatch sequence: {exits:#?}"
@@ -2818,7 +4061,11 @@ async fn a_successful_command_acks_once_and_the_change_is_durable() {
         .iter()
         .find(|p| p["id"] == "p-workspace")
         .and_then(|p| p["title"].as_str());
-    assert_eq!(title, Some("renamed by test"), "the ack was not a lie: {projects:#?}");
+    assert_eq!(
+        title,
+        Some("renamed by test"),
+        "the ack was not a lie: {projects:#?}"
+    );
 }
 
 /// LIVE-WIRE REGRESSION: a durable project change must be ANNOUNCED, or a
@@ -2836,17 +4083,27 @@ async fn a_project_update_is_replayable_by_a_client_that_was_away() {
     let mark = state.rt.shell_sequence().await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({
-        "input": { "type": "project.meta.update", "projectId": "p-workspace",
-                   "patch": { "title": "renamed while away" } }
-    })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({
+            "input": { "type": "project.meta.update", "projectId": "p-workspace",
+                       "patch": { "title": "renamed while away" } }
+        }),
+    )
+    .await;
     drain(&mut rx);
 
     // What a reconnecting client asks for: everything after the mark it held.
-    let missed = state.rt.shell_events_after(mark, 500).await.expect("replay readable");
-    let found = missed.iter().any(|f| {
-        f["kind"] == "project-upserted" && f["project"]["title"] == "renamed while away"
-    });
+    let missed = state
+        .rt
+        .shell_events_after(mark, 500)
+        .await
+        .expect("replay readable");
+    let found = missed
+        .iter()
+        .any(|f| f["kind"] == "project-upserted" && f["project"]["title"] == "renamed while away");
     assert!(
         found,
         "the change must be in the REPLAY LOG, not only in the durable row — a snapshot-only \
@@ -2865,18 +4122,36 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
 
     // change the mode + title OUTSIDE a turn
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.meta.update", "threadId": "t-meta",
-        "patch": {"runtimeMode": "approval-required", "title": "renamed"},
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.meta.update", "threadId": "t-meta",
+            "patch": {"runtimeMode": "approval-required", "title": "renamed"},
+        }}),
+    )
+    .await;
     assert_eq!(
-        drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap()["exit"]["_tag"],
+        drain(&mut rx)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap()["exit"]["_tag"],
         "Success"
     );
 
     // it is DURABLE
-    let t = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-meta").unwrap();
-    assert_eq!(t["runtimeMode"], "approval-required", "the mode persisted: {t}");
+    let t = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-meta")
+        .unwrap();
+    assert_eq!(
+        t["runtimeMode"], "approval-required",
+        "the mode persisted: {t}"
+    );
     assert_eq!(t["title"], "renamed");
 
     // and a turn that does NOT repeat the mode still gets the gate
@@ -2886,12 +4161,24 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
 
     // an unroutable model selection is REFUSED rather than persisted
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.meta.update", "threadId": "t-meta",
-        "patch": {"modelSelection": {"instanceId": "nope", "model": "x"}},
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.meta.update", "threadId": "t-meta",
+            "patch": {"modelSelection": {"instanceId": "nope", "model": "x"}},
+        }}),
+    )
+    .await;
     let _ = drain(&mut rx);
-    let t = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-meta").unwrap();
+    let t = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-meta")
+        .unwrap();
     assert_ne!(
         t["modelSelection"]["instanceId"], "nope",
         "a selection the runtime cannot route must not be stored: {t}"
@@ -2907,9 +4194,15 @@ async fn provider_entries_use_the_contract_shapes() {
 
     // add a deliberately BROKEN instance so an unavailable row is rendered
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({"patch": {"providerInstances": {
-        "broken_ollama": {"driver": "openaiCompat", "enabled": true, "config": {}},
-    }}})).await;
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({"patch": {"providerInstances": {
+            "broken_ollama": {"driver": "openaiCompat", "enabled": true, "config": {}},
+        }}}),
+    )
+    .await;
     let _ = drain(&mut rx);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2920,20 +4213,31 @@ async fn provider_entries_use_the_contract_shapes() {
     let mut saw_unavailable = false;
     for p in providers.as_array().unwrap() {
         let status = p["status"].as_str().unwrap();
-        assert!(VALID.contains(&status), "invalid ServerProviderState {status:?}: {p}");
+        assert!(
+            VALID.contains(&status),
+            "invalid ServerProviderState {status:?}: {p}"
+        );
 
         if p["availability"] == "unavailable" {
             saw_unavailable = true;
             // the contract REQUIRES these on an unavailable snapshot
             assert_eq!(p["installed"], json!(false), "{p}");
             assert_eq!(p["enabled"], json!(false), "{p}");
-            assert!(p["unavailableReason"].as_str().is_some_and(|r| !r.is_empty()), "{p}");
+            assert!(
+                p["unavailableReason"]
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty()),
+                "{p}"
+            );
         }
 
         // options are the contract's tagged union, never the SDK struct
         for o in p["options"].as_array().unwrap() {
             let t = o["type"].as_str().unwrap();
-            assert!(t == "select" || t == "boolean", "unknown option type {t}: {o}");
+            assert!(
+                t == "select" || t == "boolean",
+                "unknown option type {t}: {o}"
+            );
             assert!(o["id"].as_str().is_some_and(|s| !s.is_empty()));
             assert!(o["label"].as_str().is_some_and(|s| !s.is_empty()));
             assert!(o.get("values").is_none(), "SDK `values` leaked: {o}");
@@ -2945,11 +4249,20 @@ async fn provider_entries_use_the_contract_shapes() {
                     assert!(c["id"].as_str().is_some_and(|s| !s.is_empty()), "{c}");
                     assert!(c["label"].as_str().is_some_and(|s| !s.is_empty()), "{c}");
                 }
-                assert_eq!(choices.iter().filter(|c| c["isDefault"] == json!(true)).count(), 1);
+                assert_eq!(
+                    choices
+                        .iter()
+                        .filter(|c| c["isDefault"] == json!(true))
+                        .count(),
+                    1
+                );
             }
         }
     }
-    assert!(saw_unavailable, "the broken instance rendered as an unavailable row");
+    assert!(
+        saw_unavailable,
+        "the broken instance rendered as an unavailable row"
+    );
 }
 
 /// A change the USER makes outside the backend moves the panel.
@@ -2975,8 +4288,16 @@ async fn an_edit_made_outside_the_backend_reaches_a_vcs_subscriber() {
     let cwd = dir.to_string_lossy().into_owned();
     let sh = |c: &str| {
         let out = std::process::Command::new("sh")
-            .arg("-c").arg(c).current_dir(&dir).output().expect("sh");
-        assert!(out.status.success(), "`{c}`: {}", String::from_utf8_lossy(&out.stderr));
+            .arg("-c")
+            .arg(c)
+            .current_dir(&dir)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "`{c}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     sh("git config user.email t@t && git config user.name t");
     // The runtime's own store lives under this same temp dir, so its
@@ -3019,8 +4340,12 @@ async fn an_edit_made_outside_the_backend_reaches_a_vcs_subscriber() {
         .next()
         .expect("the subscriber registered a watch");
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    let watcher =
-        tokio::spawn(watch_one_tree(state.clone(), watched, baseline, Some(ready_tx)));
+    let watcher = tokio::spawn(watch_one_tree(
+        state.clone(),
+        watched,
+        baseline,
+        Some(ready_tx),
+    ));
     ready.await.expect("the watch is placed");
 
     sh("git checkout -q -b user-branch");
@@ -3041,7 +4366,89 @@ async fn an_edit_made_outside_the_backend_reaches_a_vcs_subscriber() {
         }
     }
     watcher.abort();
-    assert!(saw, "an out-of-band branch switch reached the subscriber through the watch");
+    assert!(
+        saw,
+        "an out-of-band branch switch reached the subscriber through the watch"
+    );
+}
+
+/// A status read failure after the watch is already live is still a status
+/// update, not silence. The contract arm exists (`statusUnavailable`); the
+/// watcher must publish it when cairn reports that a filesystem edge led to an
+/// unreadable repository state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vcs_watch_status_error_reaches_the_subscriber_as_unavailable() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let sh = |c: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(c)
+            .current_dir(&dir)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "`{c}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    sh("git config user.email t@t && git config user.name t");
+    std::fs::write(dir.join(".gitignore"), "data/\n").unwrap();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    sh("git add -A && git commit -qm base");
+
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+    request(&state, &sub_tx, "subscribeVcsStatus", json!({"cwd": cwd})).await;
+    assert_eq!(drain(&mut sub_rx)[0]["values"][0]["_tag"], "snapshot");
+
+    let (watched, baseline) = state
+        .rt
+        .watch_marks("vcs")
+        .await
+        .expect("the watch registry is readable")
+        .into_iter()
+        .next()
+        .expect("the subscriber registered a watch");
+    let (ready_tx, ready) = tokio::sync::oneshot::channel();
+    let watcher = tokio::spawn(watch_one_tree(
+        state.clone(),
+        watched,
+        baseline,
+        Some(ready_tx),
+    ));
+    ready.await.expect("the watch is placed");
+
+    std::fs::write(dir.join(".git/index"), b"\x00not a git index\x00").unwrap();
+
+    let mut saw = false;
+    while let Ok(Some((raw, _))) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), sub_rx.recv()).await
+    {
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        if v["values"][0]["_tag"] == "localUpdated" {
+            let local = &v["values"][0]["local"];
+            if local["statusUnavailable"] == json!(true) {
+                assert_eq!(
+                    local["isRepo"],
+                    json!(true),
+                    "the repo was demoted instead of degraded: {local}"
+                );
+                assert!(
+                    local["statusError"].as_str().is_some_and(|e| !e.is_empty()),
+                    "the unavailable status carries no error: {local}"
+                );
+                saw = true;
+                break;
+            }
+        }
+    }
+    watcher.abort();
+    assert!(
+        saw,
+        "a post-subscription status error was not published as statusUnavailable"
+    );
 }
 
 /// A bare context: these tools do not read anything off it.
@@ -3064,14 +4471,24 @@ async fn a_worktree_thread_shells_and_edits_inside_its_worktree() {
     let worktree = worktree.canonicalize().unwrap();
 
     // the turn path opens the worktree's shell before building tools
-    state.tool_roots.ensure(&worktree).await.expect("worktree shell opens");
+    state
+        .tool_roots
+        .ensure(&worktree)
+        .await
+        .expect("worktree shell opens");
 
     let def = |cwd: Option<String>| AgentDefinition {
         name: "t3code".into(),
         instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
-        labels: Default::default(), options: vec![],
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
         cwd,
     };
 
@@ -3119,7 +4536,10 @@ async fn a_worktree_thread_shells_and_edits_inside_its_worktree() {
         )
         .await
         .expect("write_file runs");
-    assert!(worktree.join("made-here.txt").is_file(), "the edit landed in the worktree");
+    assert!(
+        worktree.join("made-here.txt").is_file(),
+        "the edit landed in the worktree"
+    );
     assert!(
         !dir.join("made-here.txt").exists(),
         "and NOT in the workspace root — that is the bug #207 describes"
@@ -3169,16 +4589,25 @@ async fn a_work_root_with_no_shell_gets_its_own_durable_shell_not_the_workspace_
     let reg = factory(&AgentDefinition {
         name: "t3code".into(),
         instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
-        labels: Default::default(), options: vec![],
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
         cwd: Some(worktree.to_string_lossy().into_owned()),
     });
 
     let out = reg
         .get("/tool/run_bash")
         .expect("run_bash is registered")
-        .call_json(&ToolCtx, json!({"command": "echo wt-unopened-ran", "background": false}))
+        .call_json(
+            &ToolCtx,
+            json!({"command": "echo wt-unopened-ran", "background": false}),
+        )
         .await
         .expect("an admitted root resolves its durable shell without a prior ensure()");
     assert_eq!(
@@ -3228,12 +4657,17 @@ async fn a_stacked_action_that_fails_exits_failure_and_says_which_phase() {
     // git phase — no injected error, no mocked failure, no feature flag. The
     // commit half can succeed; the push half cannot, and that is the point:
     // a PARTIALLY completed stacked action must still exit Failure.
-    request(&state, &tx, "git.runStackedAction", json!({
-        "cwd": cwd,
-        "actionId": "a-fail",
-        "action": "commit_push",
-        "commitMessage": "init",
-    }))
+    request(
+        &state,
+        &tx,
+        "git.runStackedAction",
+        json!({
+            "cwd": cwd,
+            "actionId": "a-fail",
+            "action": "commit_push",
+            "commitMessage": "init",
+        }),
+    )
     .await;
 
     let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -3243,9 +4677,9 @@ async fn a_stacked_action_that_fails_exits_failure_and_says_which_phase() {
     // PRECONDITION: the push actually had to refuse. If some environment gave
     // this repo a usable remote, the action legitimately succeeds and the
     // assertions below would be testing nothing.
-    let failed_frame = frames.iter().find(|f| {
-        f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_failed"
-    });
+    let failed_frame = frames
+        .iter()
+        .find(|f| f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_failed");
     assert!(
         failed_frame.is_some(),
         "PRECONDITION: commit_push with no remote must emit action_failed, else \
@@ -3324,7 +4758,10 @@ async fn stacked_action_progress_is_readable_while_the_action_is_still_running()
     let hook_done = dir.join("hook-finished");
     std::fs::write(
         &pre_commit,
-        format!("#!/bin/sh\nsleep {HOOK_SLEEP}\ntouch '{}'\n", hook_done.display()),
+        format!(
+            "#!/bin/sh\nsleep {HOOK_SLEEP}\ntouch '{}'\n",
+            hook_done.display()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -3342,10 +4779,16 @@ async fn stacked_action_progress_is_readable_while_the_action_is_still_running()
         let tx = tx.clone();
         let cwd = cwd.clone();
         tokio::spawn(async move {
-            request(&state, &tx, "git.runStackedAction", json!({
-                "cwd": cwd, "actionId": "a-live", "action": "commit",
-                "commitMessage": "init",
-            })).await;
+            request(
+                &state,
+                &tx,
+                "git.runStackedAction",
+                json!({
+                    "cwd": cwd, "actionId": "a-live", "action": "commit",
+                    "commitMessage": "init",
+                }),
+            )
+            .await;
         })
     };
 
@@ -3382,7 +4825,9 @@ async fn stacked_action_progress_is_readable_while_the_action_is_still_running()
     let elapsed = started.elapsed();
 
     assert!(
-        progress.iter().any(|f| f["values"][0]["kind"] == "action_started"),
+        progress
+            .iter()
+            .any(|f| f["values"][0]["kind"] == "action_started"),
         "no action_started became readable in {:?}, while the commit phase was still \
          blocked in its {HOOK_SLEEP}s pre-commit hook. The frames are being collected \
          and replayed after the action completes, which is a transcript, not a \
@@ -3439,11 +4884,20 @@ async fn vcs_status_is_a_live_subscription_not_a_one_shot() {
 
     // mutate THROUGH the backend on another connection
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "git.runStackedAction", json!({
-        "cwd": cwd, "actionId": "c1", "action": "commit", "commitMessage": "init",
-    })).await;
+    request(
+        &state,
+        &tx,
+        "git.runStackedAction",
+        json!({
+            "cwd": cwd, "actionId": "c1", "action": "commit", "commitMessage": "init",
+        }),
+    )
+    .await;
     assert_eq!(
-        drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").unwrap()["exit"]["_tag"],
+        drain(&mut rx)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap()["exit"]["_tag"],
         "Success"
     );
 
@@ -3461,22 +4915,34 @@ async fn vcs_status_is_a_live_subscription_not_a_one_shot() {
         f["values"][0]["_tag"] == "localUpdated"
     })
     .await;
-    let tags: Vec<&str> =
-        pushed.iter().filter_map(|f| f["values"][0]["_tag"].as_str()).collect();
-    assert!(tags.contains(&"localUpdated"), "a commit pushes local status: {tags:?}");
+    let tags: Vec<&str> = pushed
+        .iter()
+        .filter_map(|f| f["values"][0]["_tag"].as_str())
+        .collect();
+    assert!(
+        tags.contains(&"localUpdated"),
+        "a commit pushes local status: {tags:?}"
+    );
     let local = pushed
         .iter()
         .find(|f| f["values"][0]["_tag"] == "localUpdated")
         .map(|f| f["values"][0]["local"].clone())
         .unwrap();
     assert_eq!(
-        local["hasWorkingTreeChanges"], json!(false),
+        local["hasWorkingTreeChanges"],
+        json!(false),
         "the pushed status reflects the commit, not the pre-commit tree: {local}"
     );
 
     // a branch switch pushes too
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "vcs.createRef", json!({"cwd": cwd, "refName": "feature/x", "switchRef": true})).await;
+    request(
+        &state,
+        &tx,
+        "vcs.createRef",
+        json!({"cwd": cwd, "refName": "feature/x", "switchRef": true}),
+    )
+    .await;
     let _ = drain(&mut rx);
     // VCS fanout is on the SDK broker now (packet DM); delivery to the
     // pumping tail is a spawned await away, so spin briefly for the
@@ -3510,10 +4976,16 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
 
     // a runtime where Claude is DISABLED, so it cannot be the default
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "server.updateSettings", json!({"patch": {"providerInstances": {
-        "claudeAgent": {"driver": "claudeAgent", "enabled": false},
-        "codex": {"driver": "codex", "enabled": true},
-    }}})).await;
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({"patch": {"providerInstances": {
+            "claudeAgent": {"driver": "claudeAgent", "enabled": false},
+            "codex": {"driver": "codex", "enabled": true},
+        }}}),
+    )
+    .await;
     let _ = drain(&mut rx);
     // the default the RUNTIME resolves now
     let runtime_default = {
@@ -3526,23 +4998,45 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
     };
 
     // start a turn with NO modelSelection at all
-    ensure_thread_on_shell(&state, &json!({
-        "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
-    })).await;
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
+        }),
+    )
+    .await;
 
-    let t = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-default").unwrap();
+    let t = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-default")
+        .unwrap();
     let shown = t["modelSelection"]["instanceId"].as_str().unwrap_or("");
     assert_ne!(
         shown, "claudeAgent",
         "must not manufacture a Claude selection on a runtime without it: {t}"
     );
-    assert_eq!(shown, runtime_default, "the announced provider is the one that will run: {t}");
+    assert_eq!(
+        shown, runtime_default,
+        "the announced provider is the one that will run: {t}"
+    );
 
     // and the snapshot the UI reads agrees
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({"threadId": "t-default"})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-default"}),
+    )
+    .await;
     let frames = drain(&mut rx);
-    let snap = frames.iter().find(|f| f["values"][0]["kind"] == "snapshot").expect("snapshot");
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .expect("snapshot");
     assert_eq!(
         snap["values"][0]["snapshot"]["thread"]["modelSelection"]["instanceId"],
         json!(runtime_default),
@@ -3550,12 +5044,22 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
     );
 
     // an EXPLICIT selection is still honoured verbatim
-    ensure_thread_on_shell(&state, &json!({
-        "threadId": "t-explicit",
-        "modelSelection": {"instanceId": "codex", "model": "codex-default"},
-        "message": {"text": "hi", "messageId": "m1"},
-    })).await;
-    let t = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-explicit").unwrap();
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-explicit",
+            "modelSelection": {"instanceId": "codex", "model": "codex-default"},
+            "message": {"text": "hi", "messageId": "m1"},
+        }),
+    )
+    .await;
+    let t = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-explicit")
+        .unwrap();
     assert_eq!(t["modelSelection"]["instanceId"], "codex", "{t}");
 }
 
@@ -3568,11 +5072,23 @@ async fn subscribe_thread_snapshot_reads_durable_messages() {
         "createdAt": now_iso(), "updatedAt": now_iso() });
     state.rt.append_message("t-1", &umsg).await.unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-1" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-1" }),
+    )
+    .await;
     let frames = drain(&mut rx);
-    let snap = frames.iter().find(|f| f["values"][0]["kind"] == "snapshot").expect("snapshot frame");
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .expect("snapshot frame");
     let msgs = &snap["values"][0]["snapshot"]["thread"]["messages"];
-    assert_eq!(msgs[0]["id"], "m1", "snapshot serves durable message, got {msgs:?}");
+    assert_eq!(
+        msgs[0]["id"], "m1",
+        "snapshot serves durable message, got {msgs:?}"
+    );
 }
 
 /// PROOF (#299): the wire sequence does not REWIND across a restart.
@@ -3634,13 +5150,19 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     // as a fresh joiner, and the assertion is that the POST-restart upsert
     // gets a strictly greater number than the client's mark.
     let published = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
-        f.get("values").and_then(|v| v.get(0)).and_then(|x| x.get("kind")).and_then(Value::as_str)
+        f.get("values")
+            .and_then(|v| v.get(0))
+            .and_then(|x| x.get("kind"))
+            .and_then(Value::as_str)
             == Some("thread-upserted")
             && f["values"][0]["thread"]["id"] == "t-after-restart"
     })
     .await
     .into_iter()
-    .find(|f| f["values"][0]["kind"] == "thread-upserted" && f["values"][0]["thread"]["id"] == "t-after-restart")
+    .find(|f| {
+        f["values"][0]["kind"] == "thread-upserted"
+            && f["values"][0]["thread"]["id"] == "t-after-restart"
+    })
     .expect("the upsert was announced on the shell stream");
     let seq = published["values"][0]["sequence"]
         .as_i64()
@@ -3675,13 +5197,14 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
                 "projectId": "p-workspace", "createdAt": now_iso(), "updatedAt": now_iso()}))
             .await
             .unwrap();
-        for (id, role, text) in
-            [("m1", "user", "hi"), ("m2", "assistant", "hello there")]
-        {
+        for (id, role, text) in [("m1", "user", "hi"), ("m2", "assistant", "hello there")] {
             state
                 .rt
-                .append_message("t-reconnect", &json!({"id": id, "role": role, "text": text,
-                    "streaming": false, "createdAt": now_iso(), "updatedAt": now_iso()}))
+                .append_message(
+                    "t-reconnect",
+                    &json!({"id": id, "role": role, "text": text,
+                    "streaming": false, "createdAt": now_iso(), "updatedAt": now_iso()}),
+                )
                 .await
                 .unwrap();
         }
@@ -3690,8 +5213,13 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
     // Second process over the same directory — nothing carried in memory.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({"threadId": "t-reconnect"}))
-        .await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-reconnect"}),
+    )
+    .await;
     let frames = drain(&mut rx);
 
     let snap = frames
@@ -3702,7 +5230,9 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
     assert_eq!(thread["id"], "t-reconnect");
     let msgs = thread["messages"].as_array().expect("messages array");
     assert_eq!(
-        msgs.iter().map(|m| m["id"].as_str().unwrap_or_default()).collect::<Vec<_>>(),
+        msgs.iter()
+            .map(|m| m["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
         vec!["m1", "m2"],
         "the pre-restart transcript came back in order, got {msgs:?}"
     );
@@ -3718,7 +5248,9 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         "subscribeThread stays open after a restart, got {frames:?}"
     );
     assert!(
-        frames.iter().any(|f| f["values"][0]["kind"] == "synchronized"),
+        frames
+            .iter()
+            .any(|f| f["values"][0]["kind"] == "synchronized"),
         "the client is told the subscription is live"
     );
 }
@@ -3730,11 +5262,13 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
 async fn model_switch_persists_in_thread_snapshot() {
     let (state, _d) = test_state().await;
     let tid = "t-switch";
-    let cmd = |inst: &str, model: &str, text: &str| json!({
-        "type": "thread.turn.start", "threadId": tid,
-        "modelSelection": { "instanceId": inst, "model": model },
-        "message": { "text": text }
-    });
+    let cmd = |inst: &str, model: &str, text: &str| {
+        json!({
+            "type": "thread.turn.start", "threadId": tid,
+            "modelSelection": { "instanceId": inst, "model": model },
+            "message": { "text": text }
+        })
+    };
     // First turn creates the thread on instance A.
     ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await;
     seed_prompt(&state, tid, "m-a", "hi").await;
@@ -3744,13 +5278,32 @@ async fn model_switch_persists_in_thread_snapshot() {
 
     // The snapshot must reflect the switched selection, and keep both msgs.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": tid })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": tid }),
+    )
+    .await;
     let frames = drain(&mut rx);
-    let snap = frames.iter().find(|f| f["values"][0]["kind"] == "snapshot").expect("snapshot frame");
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .expect("snapshot frame");
     let thread = &snap["values"][0]["snapshot"]["thread"];
-    assert_eq!(thread["modelSelection"]["instanceId"], "codex", "switched instance persisted");
-    assert_eq!(thread["modelSelection"]["model"], "model-b", "switched model persisted");
-    assert_eq!(thread["messages"].as_array().unwrap().len(), 2, "history preserved across switch");
+    assert_eq!(
+        thread["modelSelection"]["instanceId"], "codex",
+        "switched instance persisted"
+    );
+    assert_eq!(
+        thread["modelSelection"]["model"], "model-b",
+        "switched model persisted"
+    );
+    assert_eq!(
+        thread["messages"].as_array().unwrap().len(),
+        2,
+        "history preserved across switch"
+    );
 }
 
 /// #81: tool work reaches the WIRE as a durable activity row, in contract
@@ -3807,17 +5360,26 @@ async fn tool_activity_reaches_the_thread_stream_in_contract_shape() {
     let a = &started["event"]["payload"]["activity"];
     assert_eq!(a["tone"], "tool");
     assert_eq!(a["turnId"], "turn-1");
-    assert_eq!(a["payload"]["callId"], "call-9", "a stable id to click into");
+    assert_eq!(
+        a["payload"]["callId"], "call-9",
+        "a stable id to click into"
+    );
     assert_eq!(a["payload"]["input"]["command"], "cargo test --all");
     assert_eq!(
         a["summary"], "run_bash: cargo test --all",
         "the summary names WHAT is running, not just the tool"
     );
-    assert!(!a["summary"].as_str().unwrap().is_empty(), "the contract refuses an empty summary");
+    assert!(
+        !a["summary"].as_str().unwrap().is_empty(),
+        "the contract refuses an empty summary"
+    );
 
     // the result row pairs by call id and summarises one line
     let d = &done["event"]["payload"]["activity"];
-    assert_eq!(d["payload"]["callId"], "call-9", "the result is paired by id");
+    assert_eq!(
+        d["payload"]["callId"], "call-9",
+        "the result is paired by id"
+    );
     // …and it REPLACES the running row rather than appending a second one:
     // the client reducer drops any activity whose id it already has, so a
     // different id would leave the "running" row spinning forever (#136).
@@ -3827,9 +5389,11 @@ async fn tool_activity_reaches_the_thread_stream_in_contract_shape() {
         d["id"], a["id"]
     );
     let summary = d["summary"].as_str().unwrap();
-    assert!(!summary.is_empty() && !summary.contains('\n'), "one line, non-empty: {summary:?}");
+    assert!(
+        !summary.is_empty() && !summary.contains('\n'),
+        "one line, non-empty: {summary:?}"
+    );
 }
-
 
 /// #55/#57/#82/#98/#99/#105/#118/#133: panes are REAL, with the identity the
 /// client chose.
@@ -3861,9 +5425,15 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
 
     // The thread's pane.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["value"]["threadId"], SAME);
     assert!(
@@ -3875,12 +5445,21 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
 
     // A child session's pane, same terminal id AND same literal owner id.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     let child = &f[0]["exit"]["value"];
-    assert_eq!(child["sessionId"], SAME, "the child pane reports its session: {child:?}");
+    assert_eq!(
+        child["sessionId"], SAME,
+        "the child pane reports its session: {child:?}"
+    );
     assert!(
         child["threadId"].is_null(),
         "a child-session pane must not claim a thread — that is the ownership \
@@ -3894,8 +5473,16 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
         session_id: SAME.to_string(),
         worktree_path: None,
     };
-    let a = state.terminals.get(&thread_owner, "pane-1").await.expect("thread pane");
-    let b = state.terminals.get(&child_owner, "pane-1").await.expect("child pane");
+    let a = state
+        .terminals
+        .get(&thread_owner, "pane-1")
+        .await
+        .expect("thread pane");
+    let b = state
+        .terminals
+        .get(&child_owner, "pane-1")
+        .await
+        .expect("child pane");
     assert!(
         !std::sync::Arc::ptr_eq(&a.runner, &b.runner),
         "the child session joined the thread's shell instead of getting its own"
@@ -3907,9 +5494,15 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
 
     // And closing the CHILD leaves the thread's pane alone.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.close", json!({
-        "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1",
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.close",
+        json!({
+            "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1",
+        }),
+    )
+    .await;
     let _ = drain(&mut rx);
     assert!(
         state.terminals.get(&child_owner, "pane-1").await.is_none(),
@@ -3930,10 +5523,16 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
 
     // a pane opened for a directory LANDS there — not just echoes it back
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
-        "env": { "PANE": "a" }, "cols": 80, "rows": 24,
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
+            "env": { "PANE": "a" }, "cols": 80, "rows": 24,
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     let snap = &f[0]["exit"]["value"];
     assert_eq!(snap["terminalId"], "pane-a");
@@ -3941,36 +5540,87 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     // on macOS), which is the point: admission resolves before it compares.
     let sub_real = sub.canonicalize().unwrap();
     assert_eq!(
-        snap["cwd"], sub_real.to_string_lossy().as_ref(),
+        snap["cwd"],
+        sub_real.to_string_lossy().as_ref(),
         "the pane reports where it really is"
     );
 
-    let pane_a = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.expect("registered");
-    let where_a = pane_a.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
-    assert!(where_a.output.contains("sub"), "the shell started in the requested cwd: {where_a:?}");
-    assert!(where_a.output.contains("[a]"), "the launch env reached the shell: {where_a:?}");
+    let pane_a = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+        .await
+        .expect("registered");
+    let where_a = pane_a
+        .runner
+        .run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_a.output.contains("sub"),
+        "the shell started in the requested cwd: {where_a:?}"
+    );
+    assert!(
+        where_a.output.contains("[a]"),
+        "the launch env reached the shell: {where_a:?}"
+    );
 
     // a SECOND pane is a different shell — not the first one's cursor
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": "t-1", "terminalId": "pane-b", "worktreePath": dir.to_string_lossy(),
-        "env": { "PANE": "b" },
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": "t-1", "terminalId": "pane-b", "worktreePath": dir.to_string_lossy(),
+            "env": { "PANE": "b" },
+        }),
+    )
+    .await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let pane_b = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.expect("registered");
-    let where_b = pane_b.runner.run("echo [$PANE]", false, Some(10), false).await;
-    assert!(where_b.output.contains("[b]"), "pane B has its OWN env: {where_b:?}");
-    let recheck_a = pane_a.runner.run("echo [$PANE]", false, Some(10), false).await;
-    assert!(recheck_a.output.contains("[a]"), "pane A is untouched by pane B: {recheck_a:?}");
+    let pane_b = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-b")
+        .await
+        .expect("registered");
+    let where_b = pane_b
+        .runner
+        .run("echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_b.output.contains("[b]"),
+        "pane B has its OWN env: {where_b:?}"
+    );
+    let recheck_a = pane_a
+        .runner
+        .run("echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        recheck_a.output.contains("[a]"),
+        "pane A is untouched by pane B: {recheck_a:?}"
+    );
 
     // metadata lists every pane for the thread, including the agent's shell
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-1" })).await;
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-1" }),
+    )
+    .await;
     let f = drain(&mut rx);
     let listed = f[0]["values"][0]["terminals"].as_array().unwrap();
-    let ids: Vec<&str> = listed.iter().map(|t| t["terminalId"].as_str().unwrap()).collect();
-    assert!(ids.contains(&"pane-a") && ids.contains(&"pane-b"), "every open pane is listed: {ids:?}");
-    assert!(ids.contains(&terminal::AGENT_TERMINAL_ID), "the agent's shell is findable: {ids:?}");
+    let ids: Vec<&str> = listed
+        .iter()
+        .map(|t| t["terminalId"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"pane-a") && ids.contains(&"pane-b"),
+        "every open pane is listed: {ids:?}"
+    );
+    assert!(
+        ids.contains(&terminal::AGENT_TERMINAL_ID),
+        "the agent's shell is findable: {ids:?}"
+    );
     let row_a = listed.iter().find(|t| t["terminalId"] == "pane-a").unwrap();
     assert_eq!(row_a["cwd"], sub_real.to_string_lossy().as_ref());
     let row_b = listed.iter().find(|t| t["terminalId"] == "pane-b").unwrap();
@@ -3981,31 +5631,62 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     );
 
     // RESTART replaces the environment — a fresh pane is actually fresh
-    pane_a.runner.run("export LEAKED=yes", false, Some(10), false).await;
+    pane_a
+        .runner
+        .run("export LEAKED=yes", false, Some(10), false)
+        .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.restart", json!({
-        "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
-        "env": { "PANE": "restarted" },
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.restart",
+        json!({
+            "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
+            "env": { "PANE": "restarted" },
+        }),
+    )
+    .await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let after = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap();
-    let env_after = after.runner.run("echo [$PANE][$LEAKED]", false, Some(10), false).await;
+    let after = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+        .await
+        .unwrap();
+    let env_after = after
+        .runner
+        .run("echo [$PANE][$LEAKED]", false, Some(10), false)
+        .await;
     assert!(
         env_after.output.contains("[restarted][]"),
         "restart applied the new env and dropped the old exports: {env_after:?}"
     );
 
     // CLEAR empties the screen without killing the shell
-    after.runner.run("echo BEFORE-CLEAR", false, Some(10), false).await;
+    after
+        .runner
+        .run("echo BEFORE-CLEAR", false, Some(10), false)
+        .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.clear", json!({ "threadId": "t-1", "terminalId": "pane-a" })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.clear",
+        json!({ "threadId": "t-1", "terminalId": "pane-a" }),
+    )
+    .await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
     assert!(
         !after.runner.read_screen().await.contains("BEFORE-CLEAR"),
         "the screen was cleared"
     );
-    let alive = after.runner.run("echo STILL-ALIVE", false, Some(10), false).await;
-    assert!(alive.output.contains("STILL-ALIVE"), "clear did not kill the shell: {alive:?}");
+    let alive = after
+        .runner
+        .run("echo STILL-ALIVE", false, Some(10), false)
+        .await;
+    assert!(
+        alive.output.contains("STILL-ALIVE"),
+        "clear did not kill the shell: {alive:?}"
+    );
 
     // CLOSE ends that pane only — and actually STOPS ITS SHELL (#210): the
     // pid running before the close must be gone afterwards, or a "closed"
@@ -4021,10 +5702,30 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .and_then(|t| t.parse::<i32>().ok())
         .expect("the pane shell has a pid");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.close", json!({ "threadId": "t-1", "terminalId": "pane-a" })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.close",
+        json!({ "threadId": "t-1", "terminalId": "pane-a" }),
+    )
+    .await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.is_none(), "pane A is gone");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.is_some(), "pane B is untouched");
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+            .await
+            .is_none(),
+        "pane A is gone"
+    );
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "pane-b")
+            .await
+            .is_some(),
+        "pane B is untouched"
+    );
     // The process is really gone, checked ONCE, immediately.
     //
     // This used to poll for a second and it was hiding a real defect: `close`
@@ -4046,17 +5747,40 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
          `close` must kill AND wait, or a zombie keeps answering existence probes"
     );
     // pane B's shell is untouched by A's close
-    let b_alive = pane_b.runner.run("echo B-STILL-ALIVE", false, Some(10), false).await;
-    assert!(b_alive.output.contains("B-STILL-ALIVE"), "pane B died with A: {b_alive:?}");
+    let b_alive = pane_b
+        .runner
+        .run("echo B-STILL-ALIVE", false, Some(10), false)
+        .await;
+    assert!(
+        b_alive.output.contains("B-STILL-ALIVE"),
+        "pane B died with A: {b_alive:?}"
+    );
 
     // closing the AGENT's pane must never kill the agent's shell
-    let _ = state.terminals.open(&terminal::TerminalOwner::thread("t-1"), terminal::AGENT_TERMINAL_ID, None, None, &[]).await;
+    let _ = state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-1"),
+            terminal::AGENT_TERMINAL_ID,
+            None,
+            None,
+            &[],
+        )
+        .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.close",
-        json!({ "threadId": "t-1", "terminalId": terminal::AGENT_TERMINAL_ID })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.close",
+        json!({ "threadId": "t-1", "terminalId": terminal::AGENT_TERMINAL_ID }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Success");
-    let agent_alive = state.terminal.run("echo AGENT-ALIVE", false, Some(10), false).await;
+    let agent_alive = state
+        .terminal
+        .run("echo AGENT-ALIVE", false, Some(10), false)
+        .await;
     assert!(
         agent_alive.output.contains("AGENT-ALIVE"),
         "closing a VIEW of the agent's shell does not end the agent's work: {agent_alive:?}"
@@ -4064,7 +5788,6 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// #137/#78/#79: the FIRST turn's context reaches the thread.
 ///
@@ -4106,7 +5829,10 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
     let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
         f.get("values")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().any(|x| x.get("kind").and_then(Value::as_str) == Some("thread-upserted")))
+            .map(|arr| {
+                arr.iter()
+                    .any(|x| x.get("kind").and_then(Value::as_str) == Some("thread-upserted"))
+            })
             .unwrap_or(false)
     })
     .await;
@@ -4116,15 +5842,31 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
         .find(|v| v["kind"] == "thread-upserted")
         .unwrap_or_else(|| panic!("no thread-upserted in {announced:#?}"));
     let thread = &upsert["thread"];
-    assert_eq!(thread["projectId"], "p-chosen", "the chosen project, not the first one");
-    assert_eq!(thread["worktreePath"], wt.to_string_lossy().as_ref(), "the worktree travels");
+    assert_eq!(
+        thread["projectId"], "p-chosen",
+        "the chosen project, not the first one"
+    );
+    assert_eq!(
+        thread["worktreePath"],
+        wt.to_string_lossy().as_ref(),
+        "the worktree travels"
+    );
     assert_eq!(thread["branch"], "feature/x", "so does its branch");
-    assert_eq!(thread["runtimeMode"], "approval-required", "a supervised mode is not downgraded");
-    assert_eq!(thread["title"], "Chosen title", "the composer's title wins over the message prefix");
+    assert_eq!(
+        thread["runtimeMode"], "approval-required",
+        "a supervised mode is not downgraded"
+    );
+    assert_eq!(
+        thread["title"], "Chosen title",
+        "the composer's title wins over the message prefix"
+    );
 
     // and it is DURABLE — a reload sees the same context
     let stored = state.rt.threads().await;
-    let saved = stored.iter().find(|t| t["id"] == "t-ctx").expect("persisted");
+    let saved = stored
+        .iter()
+        .find(|t| t["id"] == "t-ctx")
+        .expect("persisted");
     assert_eq!(saved["projectId"], "p-chosen");
     assert_eq!(saved["worktreePath"], wt.to_string_lossy().as_ref());
     assert_eq!(saved["runtimeMode"], "approval-required");
@@ -4139,7 +5881,6 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// #72: the path picker and open-in-editor are implemented, and their
 /// failures are DISTINGUISHABLE.
 #[tokio::test]
@@ -4152,44 +5893,90 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
 
     // completing a partial segment lists only matching DIRECTORIES
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "filesystem.browse",
-        json!({ "partialPath": format!("{}/al", dir.to_string_lossy()) })).await;
+    request(
+        &state,
+        &tx,
+        "filesystem.browse",
+        json!({ "partialPath": format!("{}/al", dir.to_string_lossy()) }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "browse is implemented: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "browse is implemented: {:?}",
+        f[0]
+    );
     let result = &f[0]["exit"]["value"];
-    let names: Vec<&str> =
-        result["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["albatross", "alpha"], "prefix-matched and sorted: {names:?}");
+    let names: Vec<&str> = result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["albatross", "alpha"],
+        "prefix-matched and sorted: {names:?}"
+    );
     assert_eq!(result["parentPath"], dir.to_string_lossy().as_ref());
     assert!(
-        result["entries"].as_array().unwrap().iter().all(|e| e["fullPath"].as_str().unwrap().contains("/al")),
+        result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["fullPath"].as_str().unwrap().contains("/al")),
         "entries carry usable absolute paths"
     );
 
     // a directory itself lists its children, and files are never offered
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "filesystem.browse",
-        json!({ "partialPath": format!("{}/", dir.to_string_lossy()) })).await;
+    request(
+        &state,
+        &tx,
+        "filesystem.browse",
+        json!({ "partialPath": format!("{}/", dir.to_string_lossy()) }),
+    )
+    .await;
     let listed = drain(&mut rx);
-    let names: Vec<&str> = listed[0]["exit"]["value"]["entries"].as_array().unwrap()
-        .iter().map(|e| e["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = listed[0]["exit"]["value"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"beta"), "{names:?}");
-    assert!(!names.contains(&"not-a-dir.txt"), "a picker for directories does not offer files");
+    assert!(
+        !names.contains(&"not-a-dir.txt"),
+        "a picker for directories does not offer files"
+    );
 
     // an unreadable parent FAILS, and says which failure it was
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "filesystem.browse",
-        json!({ "partialPath": "/definitely/not/here/at/all/x" })).await;
+    request(
+        &state,
+        &tx,
+        "filesystem.browse",
+        json!({ "partialPath": "/definitely/not/here/at/all/x" }),
+    )
+    .await;
     let bad = drain(&mut rx);
     assert_eq!(bad[0]["exit"]["_tag"], "Failure");
     let msg = bad[0]["exit"]["cause"].to_string();
-    assert!(msg.contains("read_directory_failed"), "the failure is classified: {msg}");
+    assert!(
+        msg.contains("read_directory_failed"),
+        "the failure is classified: {msg}"
+    );
 
     // open-in-editor: an editor this box does not have is a NAMED failure,
     // not a generic "could not open"
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "shell.openInEditor",
-        json!({ "cwd": dir.to_string_lossy(), "editor": "textmate" })).await;
+    request(
+        &state,
+        &tx,
+        "shell.openInEditor",
+        json!({ "cwd": dir.to_string_lossy(), "editor": "textmate" }),
+    )
+    .await;
     let f = drain(&mut rx);
     if f[0]["exit"]["_tag"] == "Failure" {
         let msg = f[0]["exit"]["cause"].to_string();
@@ -4201,14 +5988,18 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
 
     // an editor id the contract does not define is refused outright
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "shell.openInEditor",
-        json!({ "cwd": dir.to_string_lossy(), "editor": "not-an-editor" })).await;
+    request(
+        &state,
+        &tx,
+        "shell.openInEditor",
+        json!({ "cwd": dir.to_string_lossy(), "editor": "not-an-editor" }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
     assert!(f[0]["exit"]["cause"].to_string().contains("unknown editor"));
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// #84: `projects.searchContents` is implemented AND honours its options.
 ///
@@ -4246,19 +6037,28 @@ async fn project_content_search_honours_every_option() {
     let first = &m[0];
     assert_eq!(first["path"], "code.rs");
     assert_eq!(first["lineNumber"], 1, "line numbers are 1-based");
-    assert_eq!(first["matchRanges"][0]["start"], 4, "the range points at the match");
+    assert_eq!(
+        first["matchRanges"][0]["start"], 4,
+        "the range points at the match"
+    );
 
     // caseSensitive drops the capitalised one
     let mut cs = base.clone();
     cs["caseSensitive"] = json!(true);
-    let m = search(cs).await[0]["exit"]["value"]["matches"].as_array().unwrap().len();
+    let m = search(cs).await[0]["exit"]["value"]["matches"]
+        .as_array()
+        .unwrap()
+        .len();
     assert_eq!(m, 2, "caseSensitive changed the answer");
 
     // wholeWord drops "needles"
     let mut ww = base.clone();
     ww["wholeWord"] = json!(true);
     ww["caseSensitive"] = json!(true);
-    let m = search(ww).await[0]["exit"]["value"]["matches"].as_array().unwrap().len();
+    let m = search(ww).await[0]["exit"]["value"]["matches"]
+        .as_array()
+        .unwrap()
+        .len();
     assert_eq!(m, 1, "wholeWord changed the answer");
 
     // a real regex matches what a literal never would
@@ -4267,7 +6067,10 @@ async fn project_content_search_honours_every_option() {
     re["useRegex"] = json!(true);
     let out = search(re).await;
     assert!(
-        !out[0]["exit"]["value"]["matches"].as_array().unwrap().is_empty(),
+        !out[0]["exit"]["value"]["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
         "the regex ran: {:?}",
         out[0]["exit"]["value"]
     );
@@ -4277,7 +6080,10 @@ async fn project_content_search_honours_every_option() {
     bad["query"] = json!("needle(");
     bad["useRegex"] = json!(true);
     let out = search(bad).await;
-    assert_eq!(out[0]["exit"]["_tag"], "Success", "a half-typed regex is not a failed request");
+    assert_eq!(
+        out[0]["exit"]["_tag"], "Success",
+        "a half-typed regex is not a failed request"
+    );
     assert!(
         out[0]["exit"]["value"]["regexFallbackError"].is_string(),
         "the fallback is reported: {:?}",
@@ -4288,11 +6094,16 @@ async fn project_content_search_honours_every_option() {
     let mut small = base.clone();
     small["limit"] = json!(1);
     let out = search(small).await;
-    assert_eq!(out[0]["exit"]["value"]["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(out[0]["exit"]["value"]["truncated"], true, "truncation is never silent");
+    assert_eq!(
+        out[0]["exit"]["value"]["matches"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        out[0]["exit"]["value"]["truncated"], true,
+        "truncation is never silent"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// #83: the thread subscription honours the client's resume/pagination
 /// contract instead of always re-sending everything.
@@ -4332,7 +6143,10 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
             for i in 0..120 {
                 let seq = rt.next_sequence().await.unwrap();
                 let item = agent_sdk_shell::thread_event_item(
-                    seq, "t-win", "thread.message-delta", json!({ "text": format!("d{i}") }),
+                    seq,
+                    "t-win",
+                    "thread.message-delta",
+                    json!({ "text": format!("d{i}") }),
                 );
                 rt.record_and_publish("t-win", seq, &item).await.unwrap();
                 seqs.push(seq);
@@ -4354,7 +6168,10 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| carries(v, last)).await;
+        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
+            carries(v, last)
+        })
+        .await;
         // The mark the client was told it holds through. The resume path
         // sends no snapshot, so it is the `afterSequence` the client asked
         // from — 0 here, i.e. every event is owed.
@@ -4383,12 +6200,26 @@ async fn subscribe_thread_resumes_from_a_sequence_and_windows_by_turn() {
 
     // three turns of history in the durable store + the event log
     for i in 0..3 {
-        state.rt.append_message("t-res", &json!({
-            "id": format!("u{i}"), "role": "user", "text": format!("question {i}"),
-        })).await.unwrap();
-        state.rt.append_message("t-res", &json!({
-            "id": format!("a{i}"), "role": "assistant", "text": format!("answer {i}"),
-        })).await.unwrap();
+        state
+            .rt
+            .append_message(
+                "t-res",
+                &json!({
+                    "id": format!("u{i}"), "role": "user", "text": format!("question {i}"),
+                }),
+            )
+            .await
+            .unwrap();
+        state
+            .rt
+            .append_message(
+                "t-res",
+                &json!({
+                    "id": format!("a{i}"), "role": "assistant", "text": format!("answer {i}"),
+                }),
+            )
+            .await
+            .unwrap();
         projector
             .project(Lifecycle::MessageFinal {
                 thread_id: "t-res".into(),
@@ -4402,25 +6233,52 @@ async fn subscribe_thread_resumes_from_a_sequence_and_windows_by_turn() {
 
     // a FULL subscribe: snapshot with every message, no page metadata
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-res" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-res" }),
+    )
+    .await;
     let f = drain(&mut rx);
-    let snap = f.iter().find(|x| x["values"][0]["kind"] == "snapshot").expect("snapshot");
+    let snap = f
+        .iter()
+        .find(|x| x["values"][0]["kind"] == "snapshot")
+        .expect("snapshot");
     let full = &snap["values"][0]["snapshot"];
     assert_eq!(full["thread"]["messages"].as_array().unwrap().len(), 6);
-    assert!(full["page"].is_null(), "an unwindowed snapshot carries no page metadata");
+    assert!(
+        full["page"].is_null(),
+        "an unwindowed snapshot carries no page metadata"
+    );
     let watermark = full["snapshotSequence"].as_i64().unwrap();
 
     // a WINDOWED subscribe: only the last turn, and it says there is more
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread",
-        json!({ "threadId": "t-res", "turnLimit": 1 })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-res", "turnLimit": 1 }),
+    )
+    .await;
     let f = drain(&mut rx);
-    let snap = f.iter().find(|x| x["values"][0]["kind"] == "snapshot").expect("snapshot");
+    let snap = f
+        .iter()
+        .find(|x| x["values"][0]["kind"] == "snapshot")
+        .expect("snapshot");
     let win = &snap["values"][0]["snapshot"];
     let msgs = win["thread"]["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 2, "one whole turn: its question AND its answer: {msgs:#?}");
+    assert_eq!(
+        msgs.len(),
+        2,
+        "one whole turn: its question AND its answer: {msgs:#?}"
+    );
     assert_eq!(msgs[0]["id"], "u2", "the window starts at a USER message");
-    assert_eq!(win["page"]["hasMore"], true, "the client is told older turns exist");
+    assert_eq!(
+        win["page"]["hasMore"], true,
+        "the client is told older turns exist"
+    );
     assert_eq!(win["page"]["beforeCursor"], "u2", "and where to page from");
     assert!(
         win["page"]["threadSequence"].as_i64().unwrap() > 0,
@@ -4430,9 +6288,15 @@ async fn subscribe_thread_resumes_from_a_sequence_and_windows_by_turn() {
 
     // a RESUME: no snapshot at all, just what was missed, then the marker
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({
-        "threadId": "t-res", "afterSequence": 0, "requestCompletionMarker": true,
-    })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({
+            "threadId": "t-res", "afterSequence": 0, "requestCompletionMarker": true,
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     let kinds: Vec<&str> = f
         .iter()
@@ -4440,24 +6304,42 @@ async fn subscribe_thread_resumes_from_a_sequence_and_windows_by_turn() {
         .filter_map(|v| v["kind"].as_str().map(str::to_string))
         .map(|k| Box::leak(k.into_boxed_str()) as &str)
         .collect();
-    assert!(!kinds.contains(&"snapshot"), "a resuming client is not re-sent the thread: {kinds:?}");
-    assert!(kinds.contains(&"event"), "it IS sent the events it missed: {kinds:?}");
-    assert_eq!(kinds.last(), Some(&"synchronized"), "then the marker, before live: {kinds:?}");
+    assert!(
+        !kinds.contains(&"snapshot"),
+        "a resuming client is not re-sent the thread: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"event"),
+        "it IS sent the events it missed: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last(),
+        Some(&"synchronized"),
+        "then the marker, before live: {kinds:?}"
+    );
 
     // resuming from the CURRENT high-water mark replays nothing
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({
-        "threadId": "t-res", "afterSequence": watermark,
-    })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({
+            "threadId": "t-res", "afterSequence": watermark,
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     let events: Vec<Value> = f
         .iter()
         .flat_map(|x| x["values"].as_array().cloned().unwrap_or_default())
         .filter(|v| v["kind"] == "event")
         .collect();
-    assert!(events.is_empty(), "an up-to-date client gets no replay: {events:#?}");
+    assert!(
+        events.is_empty(),
+        "an up-to-date client gets no replay: {events:#?}"
+    );
 }
-
 
 /// #139: this runtime advertises that a model/provider switch does NOT
 /// require a new thread — the frontend block is inert here, by declaration
@@ -4468,7 +6350,9 @@ async fn providers_declare_that_switching_models_needs_no_new_thread() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getConfig", json!({})).await;
     let f = drain(&mut rx);
-    let providers = f[0]["exit"]["value"]["providers"].as_array().expect("providers");
+    let providers = f[0]["exit"]["value"]["providers"]
+        .as_array()
+        .expect("providers");
     assert!(!providers.is_empty(), "the runtime advertises providers");
     for p in providers {
         assert_eq!(
@@ -4479,7 +6363,6 @@ async fn providers_declare_that_switching_models_needs_no_new_thread() {
     }
 }
 
-
 /// #173: the metadata LIVE path reports the real panes, not a hard-coded id.
 ///
 /// The initial snapshot already listed the registry; a live update that
@@ -4489,10 +6372,26 @@ async fn providers_declare_that_switching_models_needs_no_new_thread() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_metadata_updates_report_the_real_panes() {
     let (state, dir) = test_state().await;
-    state.terminals.open(&terminal::TerminalOwner::thread("t-1"), "pane-x", Some(&state.cwd), None, &[]).await.unwrap();
+    state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-1"),
+            "pane-x",
+            Some(&state.cwd),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-1" })).await;
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-1" }),
+    )
+    .await;
     let initial = drain(&mut rx);
     let ids: Vec<String> = initial[0]["values"][0]["terminals"]
         .as_array()
@@ -4500,10 +6399,17 @@ async fn terminal_metadata_updates_report_the_real_panes() {
         .iter()
         .map(|t| t["terminalId"].as_str().unwrap().to_string())
         .collect();
-    assert!(ids.contains(&"pane-x".to_string()), "the snapshot lists the real pane: {ids:?}");
+    assert!(
+        ids.contains(&"pane-x".to_string()),
+        "the snapshot lists the real pane: {ids:?}"
+    );
 
     // move the pane's lifecycle — the live path must speak about pane-x
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-x").await.unwrap();
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-x")
+        .await
+        .unwrap();
     pane.runner.run("echo moving", false, Some(10), false).await;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4535,7 +6441,6 @@ async fn terminal_metadata_updates_report_the_real_panes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// #58: the repository actions discovery unlocks are IMPLEMENTED — they
 /// reach a real tool and fail with a reason, instead of the
 /// unsupported-method arm.
@@ -4546,20 +6451,41 @@ async fn source_control_repository_actions_are_wired() {
     // clone refuses a destination that already exists — before running git,
     // and with a message that says why
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.cloneRepository", json!({
-        "provider": "github", "repository": "t3/t3",
-        "destinationPath": dir.to_string_lossy(),
-    })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.cloneRepository",
+        json!({
+            "provider": "github", "repository": "t3/t3",
+            "destinationPath": dir.to_string_lossy(),
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Failure", "not the unsupported arm: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Failure",
+        "not the unsupported arm: {:?}",
+        f[0]
+    );
     let msg = f[0]["exit"]["cause"].to_string();
-    assert!(msg.contains("already exists"), "refused for the right reason: {msg}");
-    assert!(!msg.contains("unsupported"), "the method IS implemented: {msg}");
+    assert!(
+        msg.contains("already exists"),
+        "refused for the right reason: {msg}"
+    );
+    assert!(
+        !msg.contains("unsupported"),
+        "the method IS implemented: {msg}"
+    );
 
     // a provider this environment cannot drive is named, not silently ignored
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.lookupRepository",
-        json!({ "provider": "bitbucket", "repository": "a/b" })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.lookupRepository",
+        json!({ "provider": "bitbucket", "repository": "a/b" }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
     assert!(
@@ -4572,14 +6498,22 @@ async fn source_control_repository_actions_are_wired() {
     let plain = dir.join("not-a-repo");
     std::fs::create_dir_all(&plain).unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.publishRepository", json!({
-        "cwd": plain.to_string_lossy(), "provider": "github",
-        "repository": "t3/x", "visibility": "private",
-    })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.publishRepository",
+        json!({
+            "cwd": plain.to_string_lossy(), "provider": "github",
+            "repository": "t3/x", "visibility": "private",
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
     assert!(
-        f[0]["exit"]["cause"].to_string().contains("not a git repository"),
+        f[0]["exit"]["cause"]
+            .to_string()
+            .contains("not a git repository"),
         "{:?}",
         f[0]["exit"]["cause"]
     );
@@ -4587,14 +6521,18 @@ async fn source_control_repository_actions_are_wired() {
     // a lookup for a repository that needs the network either works or fails
     // with gh's own message — never with "unsupported method"
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.lookupRepository",
-        json!({ "provider": "github", "repository": "t3-oss/t3-code-does-not-exist" })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.lookupRepository",
+        json!({ "provider": "github", "repository": "t3-oss/t3-code-does-not-exist" }),
+    )
+    .await;
     let f = drain(&mut rx);
     let body = f[0].to_string();
     assert!(!body.contains("unsupported method"), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// #178/#179/#181: client-supplied paths are ADMITTED through the same
 /// workspace/worktree authority as file and git operations — refusals are
@@ -4609,35 +6547,64 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
     // git runs — the directory must not appear.
     let target = outside.join("cloned");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.cloneRepository", json!({
-        "remoteUrl": "https://example.invalid/x.git",
-        "destinationPath": target.to_string_lossy(),
-    })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.cloneRepository",
+        json!({
+            "remoteUrl": "https://example.invalid/x.git",
+            "destinationPath": target.to_string_lossy(),
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
     assert!(
-        f[0]["exit"]["cause"].to_string().contains("outside this environment"),
+        f[0]["exit"]["cause"]
+            .to_string()
+            .contains("outside this environment"),
         "{:?}",
         f[0]["exit"]["cause"]
     );
-    assert!(!target.exists(), "nothing was created outside the environment");
+    assert!(
+        !target.exists(),
+        "nothing was created outside the environment"
+    );
 
     // #181: publishing a repository outside the environment is refused,
     // even though it IS a valid git repository.
     let foreign = outside.join("repo");
     std::fs::create_dir_all(&foreign).unwrap();
-    for args in [vec!["init", "-q", "."], vec!["config", "user.email", "t@t"], vec!["config", "user.name", "t"]] {
-        std::process::Command::new("git").args(&args).current_dir(&foreign).output().unwrap();
+    for args in [
+        vec!["init", "-q", "."],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&foreign)
+            .output()
+            .unwrap();
     }
     std::fs::write(foreign.join("f.txt"), "x").unwrap();
     for args in [vec!["add", "-A"], vec!["commit", "-qm", "base"]] {
-        std::process::Command::new("git").args(&args).current_dir(&foreign).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&foreign)
+            .output()
+            .unwrap();
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "sourceControl.publishRepository", json!({
-        "cwd": foreign.to_string_lossy(), "provider": "github",
-        "repository": "someone/else", "visibility": "private",
-    })).await;
+    request(
+        &state,
+        &tx,
+        "sourceControl.publishRepository",
+        json!({
+            "cwd": foreign.to_string_lossy(), "provider": "github",
+            "repository": "someone/else", "visibility": "private",
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
     let why = f[0]["exit"]["cause"].to_string();
@@ -4648,34 +6615,66 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
 
     // #179: a terminal cannot be opened outside the environment either
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": "t-1", "terminalId": "escape", "cwd": outside.to_string_lossy(),
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": "t-1", "terminalId": "escape", "cwd": outside.to_string_lossy(),
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Failure", "a PTY obeys the same boundary: {:?}", f[0]);
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "escape").await.is_none(), "no pane was registered");
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Failure",
+        "a PTY obeys the same boundary: {:?}",
+        f[0]
+    );
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "escape")
+            .await
+            .is_none(),
+        "no pane was registered"
+    );
 
     // …nor attached to one
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.attach", json!({
-        "threadId": "t-1", "terminalId": "escape2", "worktreePath": outside.to_string_lossy(),
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.attach",
+        json!({
+            "threadId": "t-1", "terminalId": "escape2", "worktreePath": outside.to_string_lossy(),
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure");
 
     // and the workspace itself is still allowed — the boundary admits, it
     // does not just refuse
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", json!({
-        "threadId": "t-1", "terminalId": "inside", "cwd": state.cwd.clone(),
-    })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.open",
+        json!({
+            "threadId": "t-1", "terminalId": "inside", "cwd": state.cwd.clone(),
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "the workspace is admissible: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "the workspace is admissible: {:?}",
+        f[0]
+    );
 
     let _ = std::fs::remove_dir_all(&outside);
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// #182: a RUNNING shell tool tells the UI where to watch it.
 ///
@@ -4707,17 +6706,32 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
         .find(|e| e["event"]["payload"]["activity"]["kind"] == "tool.started")
         .unwrap_or_else(|| panic!("no tool.started in {items:#?}"));
     let target = &started["event"]["payload"]["activity"]["payload"]["terminal"];
-    assert_eq!(target["attachable"], true, "the row says it can be watched: {target}");
+    assert_eq!(
+        target["attachable"], true,
+        "the row says it can be watched: {target}"
+    );
     let terminal_id = target["terminalId"].as_str().expect("a terminal id");
 
     // and that id really attaches to the agent's live shell — before the
     // tool completes
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.attach",
-        json!({ "threadId": "t-1", "terminalId": terminal_id })).await;
+    request(
+        &state,
+        &tx,
+        "terminal.attach",
+        json!({ "threadId": "t-1", "terminalId": terminal_id }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["values"][0]["type"], "snapshot", "attach opened: {f:?}");
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), terminal_id).await.expect("registered");
+    assert_eq!(
+        f[0]["values"][0]["type"], "snapshot",
+        "attach opened: {f:?}"
+    );
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), terminal_id)
+        .await
+        .expect("registered");
     assert!(pane.shared, "it is the AGENT's shell, not a fresh pane");
 
     // a non-shell tool advertises no terminal rather than a misleading one
@@ -4744,7 +6758,6 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 /// PROOF (#228): subscribing to a terminal's events does NOT create it.
 ///
 /// `TerminalRegistry::open` returns an existing pane unchanged, so a
@@ -4759,28 +6772,61 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
 
     // The subscription arrives FIRST, with no cwd/worktree of its own.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalEvents", json!({
-        "threadId": "t-9", "terminalId": "pane-x",
-    })).await;
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalEvents",
+        json!({
+            "threadId": "t-9", "terminalId": "pane-x",
+        }),
+    )
+    .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["values"][0]["pending"], json!(true), "no pane exists yet: {f:?}");
+    assert_eq!(
+        f[0]["values"][0]["pending"],
+        json!(true),
+        "no pane exists yet: {f:?}"
+    );
     assert!(
-        state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.is_none(),
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-9"), "pane-x")
+            .await
+            .is_none(),
         "the subscription created a pane and pinned its identity"
     );
 
     // The real open supplies the identity.
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    request(&state, &tx2, "terminal.open", json!({
-        "threadId": "t-9", "terminalId": "pane-x",
-        "worktreePath": sub_dir.to_string_lossy(), "env": { "PANE": "x" },
-    })).await;
+    request(
+        &state,
+        &tx2,
+        "terminal.open",
+        json!({
+            "threadId": "t-9", "terminalId": "pane-x",
+            "worktreePath": sub_dir.to_string_lossy(), "env": { "PANE": "x" },
+        }),
+    )
+    .await;
     assert_eq!(drain(&mut rx2)[0]["exit"]["_tag"], "Success");
 
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.expect("opened");
-    let where_x = pane.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
-    assert!(where_x.output.contains("wt"), "the pane landed in the requested worktree: {where_x:?}");
-    assert!(where_x.output.contains("[x]"), "the requested env reached the shell: {where_x:?}");
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-9"), "pane-x")
+        .await
+        .expect("opened");
+    let where_x = pane
+        .runner
+        .run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_x.output.contains("wt"),
+        "the pane landed in the requested worktree: {where_x:?}"
+    );
+    assert!(
+        where_x.output.contains("[x]"),
+        "the requested env reached the shell: {where_x:?}"
+    );
 }
 
 /// PROOF (#225): a no-selection turn is admitted against the LIVE catalog.
@@ -4852,13 +6898,27 @@ async fn turn_admission_follows_the_live_catalog_not_the_boot_default() {
 fn the_snapshot_approval_row_matches_the_live_one_field_for_field() {
     let args = json!({ "command": "rm -rf build" });
     let live = approval_requested_activity(
-        "sess-1", 3, "call-9", "run_bash", &args, Some("turn-1"), "T0",
+        "sess-1",
+        3,
+        "call-9",
+        "run_bash",
+        &args,
+        Some("turn-1"),
+        "T0",
     );
     let snapshot =
         approval_requested_activity("sess-1", 3, "call-9", "run_bash", &args, None, "T0");
 
     // Every field the contract requires is present on the SNAPSHOT row.
-    for field in ["id", "tone", "kind", "summary", "payload", "turnId", "createdAt"] {
+    for field in [
+        "id",
+        "tone",
+        "kind",
+        "summary",
+        "payload",
+        "turnId",
+        "createdAt",
+    ] {
         assert!(
             snapshot.get(field).is_some(),
             "the reconnect row is missing the contract-required `{field}`: {snapshot}"
@@ -4867,14 +6927,20 @@ fn the_snapshot_approval_row_matches_the_live_one_field_for_field() {
     // The routing lives INSIDE payload, not at the top level — the flat
     // shape is what made the row undecodable.
     assert_eq!(snapshot["payload"]["requestId"], json!("sess-1|3|call-9"));
-    assert_eq!(snapshot["payload"]["requestKind"], live["payload"]["requestKind"]);
+    assert_eq!(
+        snapshot["payload"]["requestKind"],
+        live["payload"]["requestKind"]
+    );
     assert!(
         snapshot.get("requestId").is_none() && snapshot.get("toolName").is_none(),
         "the old flat fields are back at the top level: {snapshot}"
     );
     // Same row identity, so a live event arriving after the snapshot
     // REPLACES the hydrated row instead of duplicating the banner.
-    assert_eq!(snapshot["id"], live["id"], "snapshot and live must be one row");
+    assert_eq!(
+        snapshot["id"], live["id"],
+        "snapshot and live must be one row"
+    );
     assert_eq!(snapshot["kind"], live["kind"]);
     assert_eq!(snapshot["tone"], live["tone"]);
     assert_eq!(snapshot["summary"], live["summary"]);
@@ -5045,7 +7111,9 @@ async fn a_settled_approval_is_a_replayable_resolved_activity() {
         .find(|e| e["event"]["type"] == "thread.activity-appended")
         .unwrap_or_else(|| panic!("the resolution is missing from replay: {replayed:?}"));
     assert!(
-        !replayed.iter().any(|e| e["event"]["type"] == "thread.approval-resolved"),
+        !replayed
+            .iter()
+            .any(|e| e["event"]["type"] == "thread.approval-resolved"),
         "the invented event type is back: {replayed:?}"
     );
     let activity = &ev["event"]["payload"]["activity"];
@@ -5144,8 +7212,14 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
     // counter can name a sequence whose frame is not written yet, and a
     // snapshot taken after that read does not contain it, so a tail
     // suppressing `<= mark` would swallow it.
-    let mark = snap["values"][0]["snapshot"]["snapshotSequence"].as_i64().unwrap();
-    assert_eq!(mark, state.rt.shell_sequence().await, "the mark is the recorded shell watermark");
+    let mark = snap["values"][0]["snapshot"]["snapshotSequence"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        mark,
+        state.rt.shell_sequence().await,
+        "the mark is the recorded shell watermark"
+    );
 }
 
 /// PROOF (#370): the shell snapshot's `projects` field comes from the
@@ -5170,7 +7244,10 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         .unwrap_or_else(|| panic!("no shell snapshot A in {frames_a:#?}"));
     let projects_a = snap_a["values"][0]["snapshot"]["projects"].clone();
     let created_a = projects_a[0]["createdAt"].clone();
-    assert!(created_a.is_string(), "the seeded project carries createdAt: {projects_a:#?}");
+    assert!(
+        created_a.is_string(),
+        "the seeded project carries createdAt: {projects_a:#?}"
+    );
 
     // Second process over the SAME data dir. If projects were still a
     // boot-time constant on `Store`, this snapshot would carry a fresh
@@ -5178,10 +7255,14 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
     // Instead, the second process's boot check sees the row already
     // there, skips the write, and the snapshot mirrors process A.
     let data = tmp.join("data");
-    let runner_b = tools::open_workspace_shell(&tmp, data.clone()).await.unwrap();
+    let runner_b = tools::open_workspace_shell(&tmp, data.clone())
+        .await
+        .unwrap();
     let tool_roots_b = tools::ToolRoots::new(tmp.clone(), data.clone(), runner_b.clone()).await;
     let shell_b = Arc::new(Shell::new(&data, tool_roots_b.registry_factory()));
-    let rt_b = ThreadRuntime::open(shell_b, data.to_str().unwrap(), "main").await.unwrap();
+    let rt_b = ThreadRuntime::open(shell_b, data.to_str().unwrap(), "main")
+        .await
+        .unwrap();
     // Boot rule: seed only if empty. On this SECOND process the row is
     // already there, so this is a no-op — createdAt stays put.
     match rt_b.projects().await {
@@ -5258,18 +7339,28 @@ async fn the_shell_subscription_is_a_live_tail_above_the_mark_it_advertises() {
         .emit_shell_event(json!({ "kind": "threadUpserted", "id": "t-live" }))
         .await
         .expect("emit a shell frame");
-    assert!(seq > mark, "a frame emitted after the reply is above the mark {mark}");
+    assert!(
+        seq > mark,
+        "a frame emitted after the reply is above the mark {mark}"
+    );
 
     let seen = drain_until(&mut rx, std::time::Duration::from_secs(10), |v| {
-        v["values"].as_array().map(|vs| vs.iter().any(|x| {
-            agent_sdk_shell::event_sequence(x) == Some(seq)
-        })).unwrap_or(false)
+        v["values"]
+            .as_array()
+            .map(|vs| {
+                vs.iter()
+                    .any(|x| agent_sdk_shell::event_sequence(x) == Some(seq))
+            })
+            .unwrap_or(false)
     })
     .await;
     assert!(
-        seen.iter().any(|v| v["values"].as_array().map(|vs| vs.iter().any(|x| {
-            agent_sdk_shell::event_sequence(x) == Some(seq)
-        })).unwrap_or(false)),
+        seen.iter().any(|v| v["values"]
+            .as_array()
+            .map(|vs| vs
+                .iter()
+                .any(|x| { agent_sdk_shell::event_sequence(x) == Some(seq) }))
+            .unwrap_or(false)),
         "the frame emitted after subscribeShell must reach the subscriber on the \
          attached tail: {seen:#?}"
     );
@@ -5288,7 +7379,11 @@ async fn the_shell_subscription_is_a_live_tail_above_the_mark_it_advertises() {
 #[tokio::test]
 async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() {
     let (state, _d) = test_state().await;
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access", "id": "t-big", "title": "big" })).await.unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access", "id": "t-big", "title": "big" }))
+        .await
+        .unwrap();
     seed_prompt(&state, "t-big", "u1", "hello").await;
 
     // Past the handler's page (MAX_CATCHUP = 500).
@@ -5307,9 +7402,14 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
 
     // The reconnect: the client asks to resume from the very beginning.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({
-        "threadId": "t-big", "afterSequence": 0,
-    }))
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({
+            "threadId": "t-big", "afterSequence": 0,
+        }),
+    )
     .await;
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(5), |f| {
         f["values"][0]["kind"] == "snapshot"
@@ -5324,7 +7424,9 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
     let snapshot = items
         .iter()
         .find(|v| v["kind"] == "snapshot")
-        .unwrap_or_else(|| panic!("an over-limit reconnect must fall back to a snapshot: {items:#?}"));
+        .unwrap_or_else(|| {
+            panic!("an over-limit reconnect must fall back to a snapshot: {items:#?}")
+        });
     let replayed = items.iter().filter(|v| v["kind"] == "event").count();
     assert_eq!(
         replayed, 0,
@@ -5343,7 +7445,12 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
          re-request events already in its snapshot"
     );
     assert!(
-        state.rt.events_after("t-big", mark, 10).await.unwrap().is_empty(),
+        state
+            .rt
+            .events_after("t-big", mark, 10)
+            .await
+            .unwrap()
+            .is_empty(),
         "nothing is recorded above the mark yet, so the client resumes with no gap"
     );
 
@@ -5365,7 +7472,8 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
     })
     .await;
     assert!(
-        live.iter().any(|f| f["values"][0]["event"]["payload"]["activity"]["id"] == "a-after"),
+        live.iter()
+            .any(|f| f["values"][0]["event"]["payload"]["activity"]["id"] == "a-after"),
         "the replacement tail must be live after the snapshot fallback: {live:#?}"
     );
 }
@@ -5378,13 +7486,21 @@ async fn a_shell_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snaps
     for i in 0..520 {
         state
             .rt
-            .emit_shell_event(json!({ "kind": "thread-upserted", "thread": { "id": format!("t{i}") } }))
+            .emit_shell_event(
+                json!({ "kind": "thread-upserted", "thread": { "id": format!("t{i}") } }),
+            )
             .await
             .unwrap();
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeShell", json!({ "afterSequence": 0 })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeShell",
+        json!({ "afterSequence": 0 }),
+    )
+    .await;
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(5), |f| {
         f["values"][0]["kind"] == "snapshot"
     })
@@ -5398,13 +7514,23 @@ async fn a_shell_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snaps
         .find(|v| v["kind"] == "snapshot")
         .unwrap_or_else(|| panic!("an over-limit shell reconnect must fall back: {items:#?}"));
     assert_eq!(
-        items.iter().filter(|v| v["kind"] == "thread-upserted").count(),
+        items
+            .iter()
+            .filter(|v| v["kind"] == "thread-upserted")
+            .count(),
         0,
         "the truncated page must not be shipped alongside the snapshot: {items:#?}"
     );
-    let mark = snapshot["snapshot"]["snapshotSequence"].as_i64().expect("a resume mark");
+    let mark = snapshot["snapshot"]["snapshotSequence"]
+        .as_i64()
+        .expect("a resume mark");
     assert!(
-        state.rt.shell_events_after(mark, 10).await.unwrap().is_empty(),
+        state
+            .rt
+            .shell_events_after(mark, 10)
+            .await
+            .unwrap()
+            .is_empty(),
         "the shell mark must cover every recorded frame, or the client resumes over a hole"
     );
 
@@ -5419,7 +7545,8 @@ async fn a_shell_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snaps
     })
     .await;
     assert!(
-        live.iter().any(|f| f["values"][0]["thread"]["id"] == "t-after"),
+        live.iter()
+            .any(|f| f["values"][0]["thread"]["id"] == "t-after"),
         "the replacement shell tail must be live: {live:#?}"
     );
 }
@@ -5446,7 +7573,11 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&state.cwd)
+            .output()
+            .unwrap();
     }
     let file = std::path::Path::new(&state.cwd).join("f.txt");
 
@@ -5461,7 +7592,11 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     std::fs::write(&file, "v3\n").unwrap();
 
     let summaries = checkpoint_summaries(&state, &state.cwd).await;
-    assert_eq!(summaries.len(), 3, "three turns, three checkpoints: {summaries:#?}");
+    assert_eq!(
+        summaries.len(),
+        3,
+        "three turns, three checkpoints: {summaries:#?}"
+    );
 
     // ORDER: newest first, and turnCount counts from 1 at the newest.
     assert_eq!(
@@ -5469,13 +7604,20 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
         "the FIRST row is the most recent turn: {summaries:#?}"
     );
     assert_eq!(summaries[0]["checkpointTurnCount"], 1);
-    assert_eq!(summaries[2]["turnId"], "turn-1", "and the last row is the oldest");
+    assert_eq!(
+        summaries[2]["turnId"], "turn-1",
+        "and the last row is the oldest"
+    );
     assert_eq!(summaries[2]["checkpointTurnCount"], 3);
 
     // ROUND TRIP: reverting turnCount 1 restores what turn-3 started from —
     // "v2" — not "v0". Under the inversion this restored v0 and threw away
     // two turns of work.
-    state.rt.save_thread(&thread_row_ck("t-order")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-order"))
+        .await
+        .unwrap();
     revert_checkpoint(&state, "t-order", 1).await;
     assert_eq!(
         std::fs::read_to_string(&file).unwrap().trim(),
@@ -5500,7 +7642,11 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&state.cwd)
+            .output()
+            .unwrap();
     }
     let file = std::path::Path::new(&state.cwd).join("edited.txt");
     std::fs::write(&file, "before the turn\n").unwrap();
@@ -5524,11 +7670,21 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
     }
     // ...the "agent" edits, including a file it created with bash.
     std::fs::write(&file, "the agent rewrote this\n").unwrap();
-    std::fs::write(std::path::Path::new(&state.cwd).join("agent-made.txt"), "new\n").unwrap();
+    std::fs::write(
+        std::path::Path::new(&state.cwd).join("agent-made.txt"),
+        "new\n",
+    )
+    .unwrap();
 
     // The SNAPSHOT the diff panel reads.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-ck" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-ck" }),
+    )
+    .await;
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(5), |f| {
         f["values"][0]["kind"] == "snapshot"
     })
@@ -5540,9 +7696,16 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
     let checkpoints = snap["values"][0]["snapshot"]["thread"]["checkpoints"]
         .as_array()
         .expect("checkpoints is an array");
-    assert_eq!(checkpoints.len(), 1, "the turn's checkpoint must be listed: {checkpoints:#?}");
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "the turn's checkpoint must be listed: {checkpoints:#?}"
+    );
     let cp = &checkpoints[0];
-    assert_eq!(cp["turnId"], "turn-1", "addressed by the turn it belongs to");
+    assert_eq!(
+        cp["turnId"], "turn-1",
+        "addressed by the turn it belongs to"
+    );
     assert_eq!(cp["status"], "ready");
     assert_eq!(cp["checkpointTurnCount"], 1, "reverting it undoes one turn");
     // #396: the checkpoint reference the contract carries is the
@@ -5568,17 +7731,25 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
     );
     let files = cp["files"].as_array().expect("files");
     let named: Vec<&str> = files.iter().filter_map(|f| f["path"].as_str()).collect();
-    assert!(named.contains(&"edited.txt"), "the edited file must be reviewable: {files:#?}");
+    assert!(
+        named.contains(&"edited.txt"),
+        "the edited file must be reviewable: {files:#?}"
+    );
     assert!(
         named.contains(&"agent-made.txt"),
         "a file the turn CREATED must be reviewable too — that is the case a \
          tracked-files-only diff misses: {files:#?}"
     );
     assert!(
-        !named.iter().any(|p| p.contains(".db-wal") || p.contains(".db-tshm") || p.starts_with("data/")),
+        !named
+            .iter()
+            .any(|p| p.contains(".db-wal") || p.contains(".db-tshm") || p.starts_with("data/")),
         "the runtime's own isolate files must not appear in a turn review: {named:?}"
     );
-    let created = files.iter().find(|f| f["path"] == "agent-made.txt").unwrap();
+    let created = files
+        .iter()
+        .find(|f| f["path"] == "agent-made.txt")
+        .unwrap();
     assert_eq!(created["kind"], "added");
     assert_eq!(created["additions"], 1);
 
@@ -5593,7 +7764,10 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
     )
     .await;
     assert_eq!(
-        drain(&mut rx2).into_iter().find(|f| f["_tag"] == "Exit").unwrap()["exit"]["_tag"],
+        drain(&mut rx2)
+            .into_iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap()["exit"]["_tag"],
         "Success"
     );
     // The FILES actually moved — this is the assertion the old noop-after-ack
@@ -5610,15 +7784,19 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
         "the reverted file must hold its pre-turn contents"
     );
     assert!(
-        !std::path::Path::new(&state.cwd).join("agent-made.txt").exists(),
+        !std::path::Path::new(&state.cwd)
+            .join("agent-made.txt")
+            .exists(),
         "a file the turn created must be gone after reverting it"
     );
 
     // And the thread was TOLD, durably — a revert the UI cannot see is a
     // destructive action with no confirmation.
     let replayed = state.rt.events_after("t-ck", before, 100).await.unwrap();
-    let types: Vec<&str> =
-        replayed.iter().filter_map(|e| e["event"]["type"].as_str()).collect();
+    let types: Vec<&str> = replayed
+        .iter()
+        .filter_map(|e| e["event"]["type"].as_str())
+        .collect();
     assert!(
         types.contains(&"thread.checkpoint-revert-requested"),
         "the request must be acknowledged on the stream: {types:?}"
@@ -5651,11 +7829,18 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&state.cwd)
+            .output()
+            .unwrap();
     }
     let file = std::path::Path::new(&state.cwd).join("oob.txt");
-    std::fs::write(&file, "before
-").unwrap();
+    std::fs::write(
+        &file, "before
+",
+    )
+    .unwrap();
 
     state.rt.save_thread(&thread_row_ck("t-oob")).await.unwrap();
     {
@@ -5683,9 +7868,20 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     // It is in the summary, because cairn diffs the WORKTREE and not a
     // journal of what the runtime believes it wrote.
     let summaries = checkpoint_summaries(&state, &state.cwd).await;
-    let cp = summaries.iter().find(|c| c["turnId"] == "turn-oob").expect("the turn's checkpoint");
-    let named: Vec<&str> = cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
-    assert!(named.contains(&"oob.txt"), "an out-of-band edit must be reviewable: {named:?}");
+    let cp = summaries
+        .iter()
+        .find(|c| c["turnId"] == "turn-oob")
+        .expect("the turn's checkpoint");
+    let named: Vec<&str> = cp["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(
+        named.contains(&"oob.txt"),
+        "an out-of-band edit must be reviewable: {named:?}"
+    );
 
     // RESTART: a second AppState over the same directory, as a new process
     // would see it. The stack is in the repository, so it is still there.
@@ -5729,7 +7925,11 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&state.cwd)
+            .output()
+            .unwrap();
     }
     let src = std::path::Path::new(&state.cwd).join("src.txt");
     std::fs::write(&src, "v1\n").unwrap();
@@ -5742,7 +7942,11 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
     let marker = data.join("runtime-state.marker");
     std::fs::write(&marker, "at-checkpoint-time\n").unwrap();
 
-    state.rt.save_thread(&thread_row_ck("t-scope")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-scope"))
+        .await
+        .unwrap();
     {
         use agent_sdk_shell::Projector as _;
         turn_projector(&state, state.cwd.clone())
@@ -5761,10 +7965,20 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 
     // The review does not mention the runtime's files...
     let summaries = checkpoint_summaries(&state, &state.cwd).await;
-    let cp = summaries.iter().find(|c| c["turnId"] == "turn-scope").expect("the checkpoint");
-    let named: Vec<&str> =
-        cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
-    assert!(named.contains(&"src.txt"), "the turn's real edit is reviewable: {named:?}");
+    let cp = summaries
+        .iter()
+        .find(|c| c["turnId"] == "turn-scope")
+        .expect("the checkpoint");
+    let named: Vec<&str> = cp["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(
+        named.contains(&"src.txt"),
+        "the turn's real edit is reviewable: {named:?}"
+    );
     assert!(
         !named.iter().any(|p| p.starts_with("data/")),
         "runtime state must not be in the review: {named:?}"
@@ -5779,7 +7993,11 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert_eq!(std::fs::read_to_string(&src).unwrap(), "v1\n", "the turn's edit was reverted");
+    assert_eq!(
+        std::fs::read_to_string(&src).unwrap(),
+        "v1\n",
+        "the turn's edit was reverted"
+    );
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
         "advanced-since\n",
@@ -5813,7 +8031,11 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git").args(&args).current_dir(repo).output().unwrap();
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
         }
     }
     // Both trees have a file, with DIFFERENT contents so we can tell them
@@ -5830,9 +8052,13 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
         "worktreePath": worktree.to_string_lossy(),
         "createdAt": now_iso(), "updatedAt": now_iso(),
     });
-    tokio::time::timeout(std::time::Duration::from_secs(30), state.rt.save_thread(&thread))
-        .await
-        .expect("save_thread must not hang").unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.rt.save_thread(&thread),
+    )
+    .await
+    .expect("save_thread must not hang")
+    .unwrap();
 
     // Checkpoint the WORKTREE (this is what CheckpointingProjector does on
     // TurnStarted with def.cwd = the thread's worktree).
@@ -5871,22 +8097,39 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
     // And the snapshot's checkpoint summary must read from the WORKTREE
     // too, so the panel shows the same tree that will be reverted.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-wt" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-wt" }),
+    )
+    .await;
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(5), |f| {
         f["values"][0]["kind"] == "snapshot"
-    }).await;
-    let snap = frames.iter().find(|f| f["values"][0]["kind"] == "snapshot").expect("snapshot");
+    })
+    .await;
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .expect("snapshot");
     // After revert, the ref is gone, so the summary is empty. What matters
     // is that the summary was READ from the worktree (the workspace has
     // never had a checkpoint at all, so a workspace-cwd read would also
     // return empty — this proves the code path even in the empty case).
     let checkpoints = snap["values"][0]["snapshot"]["thread"]["checkpoints"]
-        .as_array().expect("checkpoints array present");
-    assert!(checkpoints.is_empty() || checkpoints.iter().all(|c| {
-        c["checkpointRef"].as_str().map(|r| r.starts_with("refs/")).unwrap_or(false)
-    }), "checkpoints are valid git refs or absent after revert: {checkpoints:#?}");
+        .as_array()
+        .expect("checkpoints array present");
+    assert!(
+        checkpoints.is_empty()
+            || checkpoints.iter().all(|c| {
+                c["checkpointRef"]
+                    .as_str()
+                    .map(|r| r.starts_with("refs/"))
+                    .unwrap_or(false)
+            }),
+        "checkpoints are valid git refs or absent after revert: {checkpoints:#?}"
+    );
 }
-
 
 /// PROOF (#74): the five orchestration query RPCs answer instead of
 /// falling through to `unsupported method`, and none of them fabricates an
@@ -5899,7 +8142,11 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&state.cwd)
+            .output()
+            .unwrap();
     }
     let file = std::path::Path::new(&state.cwd).join("q.txt");
     std::fs::write(&file, "first\n").unwrap();
@@ -5914,51 +8161,96 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         async move {
             let (tx, mut rx) = mpsc::unbounded_channel();
             request(&state, &tx, m, json!({ "input": input })).await;
-            drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("an Exit frame")
+            drain(&mut rx)
+                .into_iter()
+                .find(|f| f["_tag"] == "Exit")
+                .expect("an Exit frame")
         }
     };
 
     // getTurnDiff: the last turn's changes, read off its checkpoint.
-    let ex = call("orchestration.getTurnDiff",
-        json!({ "threadId": "t-q", "fromTurnCount": 0, "toTurnCount": 1 })).await;
-    assert_eq!(ex["exit"]["_tag"], "Success", "getTurnDiff must be served: {ex}");
+    let ex = call(
+        "orchestration.getTurnDiff",
+        json!({ "threadId": "t-q", "fromTurnCount": 0, "toTurnCount": 1 }),
+    )
+    .await;
+    assert_eq!(
+        ex["exit"]["_tag"], "Success",
+        "getTurnDiff must be served: {ex}"
+    );
     let out = &ex["exit"]["value"];
     assert_eq!(out["threadId"], "t-q");
     assert_eq!(out["fromTurnCount"], 0);
     assert_eq!(out["toTurnCount"], 1);
     let diff = out["diff"].as_str().expect("a diff string");
-    assert!(diff.contains("-first") && diff.contains("+second"), "real patch text: {diff}");
+    assert!(
+        diff.contains("-first") && diff.contains("+second"),
+        "real patch text: {diff}"
+    );
 
     // getFullThreadDiff: same read with the near end pinned to the worktree.
-    let ex = call("orchestration.getFullThreadDiff",
-        json!({ "threadId": "t-q", "toTurnCount": 1 })).await;
-    assert_eq!(ex["exit"]["_tag"], "Success", "getFullThreadDiff must be served: {ex}");
+    let ex = call(
+        "orchestration.getFullThreadDiff",
+        json!({ "threadId": "t-q", "toTurnCount": 1 }),
+    )
+    .await;
+    assert_eq!(
+        ex["exit"]["_tag"], "Success",
+        "getFullThreadDiff must be served: {ex}"
+    );
     assert_eq!(ex["exit"]["value"]["fromTurnCount"], 0);
-    assert!(ex["exit"]["value"]["diff"].as_str().unwrap().contains("+second"));
+    assert!(ex["exit"]["value"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+second"));
 
     // A range with no checkpoint is the contract's ERROR, never diff: "".
-    let ex = call("orchestration.getTurnDiff",
-        json!({ "threadId": "t-q", "fromTurnCount": 0, "toTurnCount": 99 })).await;
-    assert_eq!(ex["exit"]["_tag"], "Failure", "a missing checkpoint must not read as no-changes: {ex}");
-    assert_eq!(ex["exit"]["cause"][0]["error"]["_tag"], "OrchestrationGetTurnDiffError");
+    let ex = call(
+        "orchestration.getTurnDiff",
+        json!({ "threadId": "t-q", "fromTurnCount": 0, "toTurnCount": 99 }),
+    )
+    .await;
+    assert_eq!(
+        ex["exit"]["_tag"], "Failure",
+        "a missing checkpoint must not read as no-changes: {ex}"
+    );
+    assert_eq!(
+        ex["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationGetTurnDiffError"
+    );
 
     // searchThreads: over the DURABLE message store.
     let ex = call("orchestration.searchThreads", json!({ "query": "parser" })).await;
-    assert_eq!(ex["exit"]["_tag"], "Success", "searchThreads must be served: {ex}");
+    assert_eq!(
+        ex["exit"]["_tag"], "Success",
+        "searchThreads must be served: {ex}"
+    );
     let matches = ex["exit"]["value"]["matches"].as_array().expect("matches");
-    assert_eq!(matches.len(), 1, "the seeded prompt must be found: {matches:#?}");
+    assert_eq!(
+        matches.len(),
+        1,
+        "the seeded prompt must be found: {matches:#?}"
+    );
     assert_eq!(matches[0]["threadId"], "t-q");
     assert_eq!(matches[0]["source"], "user");
     assert!(
         matches[0]["snippet"].as_str().unwrap().contains("parser"),
-        "the snippet must contain the hit: {}", matches[0]["snippet"]
+        "the snippet must contain the hit: {}",
+        matches[0]["snippet"]
     );
     // and a query that matches nothing is an empty list, not an error
-    let ex = call("orchestration.searchThreads", json!({ "query": "zzzznotthere" })).await;
+    let ex = call(
+        "orchestration.searchThreads",
+        json!({ "query": "zzzznotthere" }),
+    )
+    .await;
     assert_eq!(ex["exit"]["value"]["matches"].as_array().unwrap().len(), 0);
     // the contract's minimum length is enforced by the runtime too
     let ex = call("orchestration.searchThreads", json!({ "query": "a" })).await;
-    assert_eq!(ex["exit"]["_tag"], "Failure", "a 1-char scan must be refused: {ex}");
+    assert_eq!(
+        ex["exit"]["_tag"], "Failure",
+        "a 1-char scan must be refused: {ex}"
+    );
 
     // getArchivedShellSnapshot: archived threads only, stamped from the
     // same sequence space the live shell stream uses.
@@ -5971,7 +8263,10 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         .await
         .unwrap();
     let ex = call("orchestration.getArchivedShellSnapshot", json!({})).await;
-    assert_eq!(ex["exit"]["_tag"], "Success", "getArchivedShellSnapshot must be served: {ex}");
+    assert_eq!(
+        ex["exit"]["_tag"], "Success",
+        "getArchivedShellSnapshot must be served: {ex}"
+    );
     let snap = &ex["exit"]["value"];
     let ids: Vec<&str> = snap["threads"]
         .as_array()
@@ -5987,15 +8282,17 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
 
     // getWorkflowScript: this runtime has no scripts root, so it reports the
     // contract's own reason rather than an empty script body.
-    let ex = call("orchestration.getWorkflowScript",
-        json!({ "threadId": "t-q", "scriptPath": "/tmp/x.js" })).await;
+    let ex = call(
+        "orchestration.getWorkflowScript",
+        json!({ "threadId": "t-q", "scriptPath": "/tmp/x.js" }),
+    )
+    .await;
     assert_eq!(ex["exit"]["_tag"], "Failure");
     let err = &ex["exit"]["cause"][0]["error"];
     assert_eq!(err["_tag"], "OrchestrationGetWorkflowScriptError");
     assert_eq!(err["reason"], "root-unavailable");
     assert_eq!(err["scriptPath"], "/tmp/x.js");
 }
-
 
 /// #411 (Ack): the Effect RPC client sends `{"_tag":"Ack",...}` on every
 /// stream chunk for flow control. The dispatcher must RECOGNIZE it and
@@ -6025,7 +8322,9 @@ async fn ws_ack_frame_is_recognized_and_no_op() {
     // The empty-frames assertion above already proves that, but assert
     // negatively too so a regression is loud.
     assert!(
-        !frames.iter().any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
+        !frames
+            .iter()
+            .any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
         "Ack must not fall through to the unknown-tag Error path"
     );
 }
@@ -6116,14 +8415,21 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
     let def = AgentDefinition {
         name: "t3code".into(),
         instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec!["read_file".into()], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec!["read_file".into()],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
         // The tool registry is built over `def.cwd` (tools.rs:496), NOT over
         // `state.cwd`. Left as None it falls back to boot_root, `read_file`
         // cannot see the spin.txt this test wrote, the tool errors, and the
         // turn settles `Failed` — which would make the interrupt assertion
         // below a coin flip between the cancel and the tool error.
-        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+        labels: Default::default(),
+        options: vec![],
+        cwd: Some(state.cwd.clone()),
     };
     // Binds `thread_session`, which is the row `sessions_for_thread` reads and
     // the one the old test never created.
@@ -6154,7 +8460,10 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert!(running, "the turn must be running before the interrupt is meaningful");
+    assert!(
+        running,
+        "the turn must be running before the interrupt is meaningful"
+    );
 
     // THE WIRE FRAME. Same shape the Effect RPC client sends on stop.
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -6260,7 +8569,10 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
         ("subscribeServerLifecycle", json!({})),
         ("subscribeServerConfig", json!({})),
         ("subscribeVcsStatus", json!({ "cwd": state.cwd.clone() })),
-        ("orchestration.subscribeShell", json!({ "cwd": state.cwd.clone() })),
+        (
+            "orchestration.subscribeShell",
+            json!({ "cwd": state.cwd.clone() }),
+        ),
     ];
 
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -6317,7 +8629,9 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
     )
     .await
     .expect("#404: the WS dispatcher stopped answering Ping after the burst");
-    let pong = rx3.try_recv().expect("Ping must still produce a Pong frame");
+    let pong = rx3
+        .try_recv()
+        .expect("Ping must still produce a Pong frame");
     assert!(
         pong.0.contains("Pong"),
         "expected a Pong after the startup burst, got {:?}",
@@ -6396,14 +8710,21 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     let def = AgentDefinition {
         name: "t3code".into(),
         instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec!["read_file".into()], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec!["read_file".into()],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
         // The tool registry is built over `def.cwd` (tools.rs:496), NOT over
         // `state.cwd`. Left as None it falls back to boot_root, `read_file`
         // cannot see the spin.txt this test wrote, the tool errors, and the
         // turn settles `Failed` — which would make the interrupt assertion
         // below a coin flip between the cancel and the tool error.
-        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+        labels: Default::default(),
+        options: vec![],
+        cwd: Some(state.cwd.clone()),
     };
     state.rt.session_for(&binding, def.clone()).await.unwrap();
 
@@ -6426,7 +8747,10 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert!(running, "the turn must be running before the interrupt is meaningful");
+    assert!(
+        running,
+        "the turn must be running before the interrupt is meaningful"
+    );
 
     // THE MISROUTED FRAME: well-formed, known tag, but a thread that is not
     // the one running.
@@ -6467,10 +8791,14 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     let (state, _d) = test_state().await;
     // Seed a thread so `state.rt.interrupt` has a real row to look up
     // (interrupt on an unknown thread is a no-op, not an error).
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-int", "projectId": "p-workspace", "title": "int",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-int", "projectId": "p-workspace", "title": "int",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     // Effect RPC embeds the original payload alongside the request id;
@@ -6495,7 +8823,9 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
         .map(|(s, _)| serde_json::from_str(&s).unwrap())
         .collect();
     assert!(
-        !frames.iter().any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
+        !frames
+            .iter()
+            .any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
         "Interrupt must not fall through to the unknown-tag Error path; got {frames:?}"
     );
     assert!(
@@ -6531,11 +8861,12 @@ async fn ws_interrupt_frame_without_thread_id_does_not_error() {
         .map(|(s, _)| serde_json::from_str(&s).unwrap())
         .collect();
     assert!(
-        !frames.iter().any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
+        !frames
+            .iter()
+            .any(|f| f.get("_tag").and_then(|v| v.as_str()) == Some("Error")),
         "known tag Interrupt (payload just unroutable) must not become an Error frame: {frames:?}"
     );
 }
-
 
 /// PROOF (#65): a revert moves the TRANSCRIPT and the TURN ORDINALS, not just
 /// the files.
@@ -6571,10 +8902,18 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
     let file = std::path::Path::new(&state.cwd).join("work.txt");
     std::fs::write(&file, "before any turn\n").unwrap();
 
-    state.rt.save_thread(&checkpoint_thread("t-rev")).await.unwrap();
+    state
+        .rt
+        .save_thread(&checkpoint_thread("t-rev"))
+        .await
+        .unwrap();
 
     // TURN 1: ordinal, snapshot, a message, then its edit.
-    let first = state.rt.record_turn_mark("t-rev", "turn-1", None).await.unwrap();
+    let first = state
+        .rt
+        .record_turn_mark("t-rev", "turn-1", None)
+        .await
+        .unwrap();
     assert_eq!(first, 1, "the first turn on a thread is ordinal 1");
     checkpoint_turn_start(&state, &state.cwd.clone(), "turn-1").await;
     state
@@ -6589,7 +8928,11 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
     std::fs::write(&file, "turn one wrote this\n").unwrap();
 
     // TURN 2: same again. This is the turn we will revert.
-    let second = state.rt.record_turn_mark("t-rev", "turn-2", None).await.unwrap();
+    let second = state
+        .rt
+        .record_turn_mark("t-rev", "turn-2", None)
+        .await
+        .unwrap();
     assert_eq!(second, 2);
     checkpoint_turn_start(&state, &state.cwd.clone(), "turn-2").await;
     state
@@ -6656,11 +8999,18 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
     // 3. ORDINALS — the silent one.
     let marks = state.rt.turn_marks("t-rev").await.unwrap();
     assert_eq!(
-        marks.iter().map(|(c, id, _)| (*c, id.clone())).collect::<Vec<_>>(),
+        marks
+            .iter()
+            .map(|(c, id, _)| (*c, id.clone()))
+            .collect::<Vec<_>>(),
         vec![(1, "turn-1".to_string())],
         "the reverted turn's ordinal must be gone, not merely unused"
     );
-    let next = state.rt.record_turn_mark("t-rev", "turn-3", None).await.unwrap();
+    let next = state
+        .rt
+        .record_turn_mark("t-rev", "turn-3", None)
+        .await
+        .unwrap();
     assert_eq!(
         next, 2,
         "the next turn must REUSE ordinal 2. Got {next}: the counter climbed \
@@ -6683,7 +9033,10 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
         }
     }
     let refused = state.rt.revert_thread_to_turn("t-rev", 99, &Refuses).await;
-    assert!(refused.is_err(), "a refused workspace revert must be an error");
+    assert!(
+        refused.is_err(),
+        "a refused workspace revert must be an error"
+    );
     let survived: Vec<String> = state
         .rt
         .messages("t-rev")
@@ -6741,7 +9094,13 @@ async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_rest
     // Process two: a fresh backend over the same data dir, reconnecting.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-wt" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-wt" }),
+    )
+    .await;
     let frames = drain(&mut rx);
     let snap = frames
         .iter()
@@ -6750,14 +9109,23 @@ async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_rest
     let thread = &snap["values"][0]["snapshot"]["thread"];
 
     assert_eq!(thread["id"], "t-wt");
-    assert_eq!(thread["projectId"], "p-1", "the durable project, not the seed row: {thread}");
+    assert_eq!(
+        thread["projectId"], "p-1",
+        "the durable project, not the seed row: {thread}"
+    );
     assert_eq!(thread["title"], "port the sink");
     assert_eq!(
         thread["runtimeMode"], "approval-required",
         "a read-only thread must NOT reconnect as full-access: {thread}"
     );
-    assert_eq!(thread["interactionMode"], "plan", "the durable interaction mode survives: {thread}");
-    assert_eq!(thread["branch"], "feat/sink", "the branch travels with the thread: {thread}");
+    assert_eq!(
+        thread["interactionMode"], "plan",
+        "the durable interaction mode survives: {thread}"
+    );
+    assert_eq!(
+        thread["branch"], "feat/sink",
+        "the branch travels with the thread: {thread}"
+    );
     assert_eq!(
         thread["worktreePath"], wt_s,
         "the reducer-visible worktree agrees with the one checkpoints already read: {thread}"
@@ -6768,8 +9136,14 @@ async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_rest
     );
     // The product-owned parts are still there — the projection adds, it does
     // not replace the snapshot.
-    assert!(thread.get("messages").is_some(), "messages present: {thread}");
-    assert!(thread.get("checkpoints").is_some(), "checkpoints present: {thread}");
+    assert!(
+        thread.get("messages").is_some(),
+        "messages present: {thread}"
+    );
+    assert!(
+        thread.get("checkpoints").is_some(),
+        "checkpoints present: {thread}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6780,14 +9154,26 @@ async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_rest
 async fn a_thread_with_no_durable_row_still_snapshots_with_declared_defaults() {
     let (state, dir) = test_state().await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-new" })).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-new" }),
+    )
+    .await;
     let frames = drain(&mut rx);
-    let snap = frames.iter().find(|x| x["values"][0]["kind"] == "snapshot").expect("a snapshot");
+    let snap = frames
+        .iter()
+        .find(|x| x["values"][0]["kind"] == "snapshot")
+        .expect("a snapshot");
     let thread = &snap["values"][0]["snapshot"]["thread"];
     assert_eq!(thread["runtimeMode"], "full-access");
     assert_eq!(thread["branch"], Value::Null);
     assert_eq!(thread["worktreePath"], Value::Null);
-    assert!(!thread["projectId"].as_str().unwrap_or("").is_empty(), "seed project id: {thread}");
+    assert!(
+        !thread["projectId"].as_str().unwrap_or("").is_empty(),
+        "seed project id: {thread}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6829,7 +9215,13 @@ async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
     // Process two: a fresh backend over the same data dir.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-pane" })).await;
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-pane" }),
+    )
+    .await;
     let f = drain(&mut rx);
     let body = serde_json::to_string(&f).unwrap();
     assert!(
@@ -6881,15 +9273,23 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
         agent_sdk_shell::RuntimeMode::ApprovalRequired,
         "2026-08-24T00:00:00.000Z",
     )
-    .on_worktree(Some(wt.to_string_lossy().into_owned()), Some("feat/sink".into()))
+    .on_worktree(
+        Some(wt.to_string_lossy().into_owned()),
+        Some("feat/sink".into()),
+    )
     .with_interaction_mode("plan")
     .project(json!({ "session": Value::Null }))
     .unwrap();
     state.rt.save_thread(&row).await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.subscribeThread", json!({ "threadId": "t-wt-fixture" }))
-        .await;
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-wt-fixture" }),
+    )
+    .await;
     let frames = drain(&mut rx);
     let chunk = frames
         .iter()
@@ -6904,19 +9304,31 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
     // (non-writing) mode. These are the FACTS, not just the types — a fixture
     // that decodes but reports full-access is exactly the bug.
     let thread = &item["snapshot"]["thread"];
-    assert_eq!(thread["runtimeMode"], "approval-required", "the captured frame must not lie: {thread}");
+    assert_eq!(
+        thread["runtimeMode"], "approval-required",
+        "the captured frame must not lie: {thread}"
+    );
     assert_eq!(thread["interactionMode"], "plan");
     assert_eq!(thread["branch"], "feat/sink");
     assert_eq!(thread["worktreePath"], wt.to_string_lossy().as_ref());
     assert_eq!(thread["projectId"], "p-1");
     assert_eq!(thread["modelSelection"]["instanceId"], "claudeAgent");
-    assert!(thread["messages"].is_array(), "messages is a required array");
-    assert!(thread["activities"].is_array(), "activities is a required array");
-    assert!(thread["checkpoints"].is_array(), "checkpoints is a required array");
+    assert!(
+        thread["messages"].is_array(),
+        "messages is a required array"
+    );
+    assert!(
+        thread["activities"].is_array(),
+        "activities is a required array"
+    );
+    assert!(
+        thread["checkpoints"].is_array(),
+        "checkpoints is a required array"
+    );
 
     if std::env::var("T3_UPDATE_FIXTURES").ok().as_deref() == Some("1") {
-        let dst = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../packages/contracts/fixtures");
+        let dst =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packages/contracts/fixtures");
         std::fs::create_dir_all(&dst).expect("mkdir fixtures");
         // The worktree path is a per-run temp directory, so the captured bytes
         // would otherwise be different on every regeneration and the fixture
@@ -6931,7 +9343,6 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 /// MEASUREMENT (#13, product half): how many do-rs ISOLATES one `AppState`
 /// opens. Not a style test — the descriptor budget is
@@ -6948,13 +9359,20 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
     let _ = state.tool_roots.ensure(&dir).await;
 
     fn dbs(root: &std::path::Path, out: &mut Vec<String>, base: &std::path::Path) {
-        let Ok(rd) = std::fs::read_dir(root) else { return };
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
                 dbs(&p, out, base);
             } else if p.extension().and_then(|s| s.to_str()) == Some("db") {
-                out.push(p.strip_prefix(base).unwrap_or(&p).to_string_lossy().into_owned());
+                out.push(
+                    p.strip_prefix(base)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
     }
@@ -6964,7 +9382,11 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
     // Measuring both is how we find out whether the budget is modelling the
     // thing that actually exhausts.
     let fds = {
-        let d = if std::path::Path::new("/proc/self/fd").exists() { "/proc/self/fd" } else { "/dev/fd" };
+        let d = if std::path::Path::new("/proc/self/fd").exists() {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
         std::fs::read_dir(d).map(|r| r.count()).unwrap_or(0)
     };
     eprintln!("APPSTATE_FD_TOTAL={fds}");

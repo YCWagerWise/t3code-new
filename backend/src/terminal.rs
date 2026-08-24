@@ -56,7 +56,15 @@ pub async fn session_snapshot(
     cwd: &str,
     now: &str,
 ) -> Value {
-    snapshot_of(runner, &TerminalOwner::thread(thread_id), terminal_id, cwd, None, now).await
+    snapshot_of(
+        runner,
+        &TerminalOwner::thread(thread_id),
+        terminal_id,
+        cwd,
+        None,
+        now,
+    )
+    .await
 }
 
 /// The snapshot for a registered pane — reports the pane's real cwd and
@@ -110,7 +118,15 @@ pub async fn summary(
     cwd: &str,
     now: &str,
 ) -> Value {
-    summary_of(runner, &TerminalOwner::thread(thread_id), terminal_id, cwd, None, now).await
+    summary_of(
+        runner,
+        &TerminalOwner::thread(thread_id),
+        terminal_id,
+        cwd,
+        None,
+        now,
+    )
+    .await
 }
 
 /// The metadata row for a registered pane.
@@ -167,27 +183,35 @@ pub fn output_event(thread_id: &str, terminal_id: &str, data: String) -> Value {
 }
 
 /// `terminal.write` → drive the shared PTY's foreground.
-pub async fn write(runner: &Runner, data: &str) {
-    let _ = runner.send_keys(data).await;
+pub async fn write(runner: &Runner, data: &str) -> Result<(), String> {
+    control_result("terminal.write", runner.send_keys(data).await)
 }
 
 /// `terminal.resize` → resize the real PTY so wrapped output re-flows.
-pub async fn resize(runner: &Runner, rows: u16, cols: u16) {
-    let _ = runner.resize(rows, cols).await;
+pub async fn resize(runner: &Runner, rows: u16, cols: u16) -> Result<(), String> {
+    control_result("terminal.resize", runner.resize(rows, cols).await)
 }
 
 /// Interrupt the shared PTY's FOREGROUND process — a human "stop" while the
 /// agent has a bash command running (Ctrl-C to the foreground, never the harness
 /// itself, since hearth owns the process group). This is what a stop control
 /// reaches (#52), distinct from `terminal.close` which only closes a pane.
-pub async fn interrupt(runner: &Runner) {
-    let _ = runner.interrupt().await;
+pub async fn interrupt(runner: &Runner) -> Result<(), String> {
+    control_result("terminal.interrupt", runner.interrupt().await)
 }
 
 /// `terminal.clear` → empty the pane's screen, keeping its shell (cwd, env and
 /// any running program all survive).
-pub async fn clear(runner: &Runner) {
-    let _ = runner.clear_screen().await;
+pub async fn clear(runner: &Runner) -> Result<(), String> {
+    control_result("terminal.clear", runner.clear_screen().await)
+}
+
+fn control_result(op: &str, result: String) -> Result<(), String> {
+    if result.starts_with("ERROR:") {
+        Err(format!("{op}: {result}"))
+    } else {
+        Ok(())
+    }
 }
 
 /// The launch environment a client asked for, as pairs. Absent/blank values are
@@ -284,7 +308,10 @@ pub enum TerminalOwner {
     /// A thread's own pane. Addressed exactly as it always was.
     Thread { thread_id: String },
     /// A PTY owned by an agent/fleet CHILD session, in its own worktree.
-    ChildSession { session_id: String, worktree_path: Option<String> },
+    ChildSession {
+        session_id: String,
+        worktree_path: Option<String>,
+    },
 }
 
 impl TerminalOwner {
@@ -296,7 +323,11 @@ impl TerminalOwner {
     /// the exact "wrong ownership boundary" #149 describes, and it would look
     /// like it worked.
     pub fn parse(input: &Value) -> TerminalOwner {
-        let session = input.get("sessionId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let session = input
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         match session {
             Some(session_id) => TerminalOwner::ChildSession {
                 session_id: session_id.to_string(),
@@ -313,7 +344,9 @@ impl TerminalOwner {
     }
 
     pub fn thread(thread_id: &str) -> TerminalOwner {
-        TerminalOwner::Thread { thread_id: thread_id.to_string() }
+        TerminalOwner::Thread {
+            thread_id: thread_id.to_string(),
+        }
     }
 
     /// The registry's namespace for this owner.
@@ -403,7 +436,11 @@ impl TerminalRegistry {
     ) -> Result<Self, String> {
         let panes = agent_sdk_exec::Panes::new(sessions, db);
         panes.migrate().await?;
-        Ok(TerminalRegistry { workspace, workspace_cwd, panes })
+        Ok(TerminalRegistry {
+            workspace,
+            workspace_cwd,
+            panes,
+        })
     }
 
     /// The agent's own shell — what `run_bash` uses.
@@ -475,7 +512,13 @@ impl TerminalRegistry {
                 .await?
         } else {
             self.panes
-                .open(&scope, terminal_id, &path, worktree_path.filter(|p| !p.is_empty()), env)
+                .open(
+                    &scope,
+                    terminal_id,
+                    &path,
+                    worktree_path.filter(|p| !p.is_empty()),
+                    env,
+                )
                 .await?
         };
         Ok(self.to_pane(pane, owner))
@@ -491,7 +534,11 @@ impl TerminalRegistry {
         terminal_id: &str,
         timeout: std::time::Duration,
     ) -> Option<Pane> {
-        match self.panes.wait_for(&owner.scope(), terminal_id, timeout).await {
+        match self
+            .panes
+            .wait_for(&owner.scope(), terminal_id, timeout)
+            .await
+        {
             Ok(Some(p)) => Some(self.to_pane(p, owner)),
             Ok(None) => None,
             Err(e) => {
@@ -515,7 +562,8 @@ impl TerminalRegistry {
     ) -> Result<Pane, String> {
         // Open first so a restart of a pane this process has never seen still
         // works — the durable row is enough.
-        self.open(owner, terminal_id, cwd, worktree_path, env).await?;
+        self.open(owner, terminal_id, cwd, worktree_path, env)
+            .await?;
         let dir = worktree_path
             .filter(|p| !p.is_empty())
             .or(cwd.filter(|p| !p.is_empty()))
@@ -566,7 +614,9 @@ impl TerminalRegistry {
             match self.panes.get(&scope, &r.terminal_id).await {
                 Ok(Some(p)) => out.push(self.to_pane(p, owner)),
                 Ok(None) => {}
-                Err(e) => tracing::error!(%e, %scope, terminal_id = %r.terminal_id, "pane unresolvable"),
+                Err(e) => {
+                    tracing::error!(%e, %scope, terminal_id = %r.terminal_id, "pane unresolvable")
+                }
             }
         }
         out
@@ -621,7 +671,9 @@ mod wait_tests {
 
             let waiter = {
                 let (reg, t, k) = (reg.clone(), thread_id.clone(), term.clone());
-                tokio::spawn(async move { reg.wait_for(&TerminalOwner::thread(&t), &k, TIMEOUT).await })
+                tokio::spawn(
+                    async move { reg.wait_for(&TerminalOwner::thread(&t), &k, TIMEOUT).await },
+                )
             };
 
             // Hand the waiter a moment to reach its check, so the open lands in
@@ -629,8 +681,13 @@ mod wait_tests {
             // that can drop an edge.
             tokio::task::yield_now().await;
 
-            reg.open(&TerminalOwner::thread(&thread_id), &term, None, None, &[]).await.expect("open");
-            assert!(waiter.await.unwrap().is_some(), "round {i}: the waiter saw the pane");
+            reg.open(&TerminalOwner::thread(&thread_id), &term, None, None, &[])
+                .await
+                .expect("open");
+            assert!(
+                waiter.await.unwrap().is_some(),
+                "round {i}: the waiter saw the pane"
+            );
             worst = worst.max(round_start.elapsed());
         }
 
@@ -673,7 +730,10 @@ mod wait_tests {
         let racers: Vec<_> = (0..4)
             .map(|_| {
                 let reg = reg.clone();
-                tokio::spawn(async move { reg.open(&TerminalOwner::thread("t-race"), "term-1", None, None, &[]).await })
+                tokio::spawn(async move {
+                    reg.open(&TerminalOwner::thread("t-race"), "term-1", None, None, &[])
+                        .await
+                })
             })
             .collect();
 
@@ -684,7 +744,10 @@ mod wait_tests {
 
         // The registry can only ever hold one of them, so every caller must have
         // been handed THAT one — any other Arc is a shell the registry has lost.
-        let registered = reg.get(&TerminalOwner::thread("t-race"), "term-1").await.expect("pane registered");
+        let registered = reg
+            .get(&TerminalOwner::thread("t-race"), "term-1")
+            .await
+            .expect("pane registered");
         for (i, p) in panes.iter().enumerate() {
             assert!(
                 Arc::ptr_eq(&p.runner, &registered.runner),
@@ -706,11 +769,21 @@ mod wait_tests {
     async fn closing_the_agent_pane_leaves_it_registered_and_listed() {
         let reg = registry().await;
         let opened = reg
-            .open(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID, None, None, &[])
+            .open(
+                &TerminalOwner::thread("t-agent"),
+                AGENT_TERMINAL_ID,
+                None,
+                None,
+                &[],
+            )
             .await
             .expect("agent pane opens");
 
-        assert!(!reg.close(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID).await, "the shared shell is not killed");
+        assert!(
+            !reg.close(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID)
+                .await,
+            "the shared shell is not killed"
+        );
 
         let still = reg
             .get(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID)
@@ -721,7 +794,10 @@ mod wait_tests {
             "and it is the same shell, not a re-created one"
         );
         assert!(
-            reg.list(&TerminalOwner::thread("t-agent")).await.iter().any(|p| p.terminal_id == AGENT_TERMINAL_ID),
+            reg.list(&TerminalOwner::thread("t-agent"))
+                .await
+                .iter()
+                .any(|p| p.terminal_id == AGENT_TERMINAL_ID),
             "the UI still sees a row for the terminal the agent is working in"
         );
     }
@@ -742,16 +818,31 @@ mod wait_tests {
     async fn a_pane_launched_with_env_still_has_a_usable_environment() {
         let reg = registry().await;
         let pane = reg
-            .open(&TerminalOwner::thread("t-env"), "pane-env", None, None, &[("FOO".into(), "bar".into())])
+            .open(
+                &TerminalOwner::thread("t-env"),
+                "pane-env",
+                None,
+                None,
+                &[("FOO".into(), "bar".into())],
+            )
             .await
             .expect("pane opens");
 
         let out = pane
             .runner
-            .run("printf 'FOO=[%s] PATH=[%s]\\n' \"$FOO\" \"$PATH\"", false, Some(20), false)
+            .run(
+                "printf 'FOO=[%s] PATH=[%s]\\n' \"$FOO\" \"$PATH\"",
+                false,
+                Some(20),
+                false,
+            )
             .await;
 
-        assert!(out.output.contains("FOO=[bar]"), "the requested var is set: {:?}", out.output);
+        assert!(
+            out.output.contains("FOO=[bar]"),
+            "the requested var is set: {:?}",
+            out.output
+        );
         assert!(
             !out.output.contains("PATH=[]"),
             "and it did not cost the shell its PATH — a pane with no PATH cannot run \

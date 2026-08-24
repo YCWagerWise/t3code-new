@@ -29,13 +29,16 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use agent_sdk_shell::{
-    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, SessionBinding,
-    Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
+    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, SessionBinding, Shell,
+    ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
 };
 
 use tokio::sync::RwLock;
 
-use t3code_agent::{assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol, terminal, tools, vcs};
+use t3code_agent::{
+    assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol,
+    terminal, tools, vcs,
+};
 
 /// One outbound websocket frame plus an OPTIONAL delivery-confirmation channel.
 /// A sender that cares about delivery (the durable thread tail) passes a
@@ -58,7 +61,9 @@ type OutFrame = (String, Option<tokio::sync::oneshot::Sender<bool>>);
 /// cost silently reads as unpriced forever.
 fn load_usage_rates(data_dir: &str) -> agent_sdk_usage::RateTable {
     let path = std::path::Path::new(data_dir).join("usage-model-rates.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else { return Default::default() };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
     match serde_json::from_str::<Value>(&raw) {
         Ok(doc) => {
             // The cache file wraps the document, matching what the Node server
@@ -210,9 +215,21 @@ struct Store {
 /// billed turn ran Claude/Codex under a different durable session binding, and
 /// nothing on screen would say so. A selection sent with no instance at all is
 /// the one legitimate "use the default" case.
-fn model_from_selection(catalog: &Catalog, sel: &Value, default: &Option<ModelRef>) -> Result<ModelRef, String> {
-    let instance = sel.get("instanceId").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let slug = sel.get("model").and_then(|v| v.as_str()).unwrap_or("").trim();
+fn model_from_selection(
+    catalog: &Catalog,
+    sel: &Value,
+    default: &Option<ModelRef>,
+) -> Result<ModelRef, String> {
+    let instance = sel
+        .get("instanceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let slug = sel
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if instance.is_empty() {
         // "use the default" is only answerable if a default exists; with no
         // routable provider this is a visible refusal, not a guessed slug.
@@ -265,7 +282,13 @@ fn model_from_selection(catalog: &Catalog, sel: &Value, default: &Option<ModelRe
 /// prose, so it is NOT relied on alone: plan mode also gates every mutating
 /// tool, or a model that ignores the instruction edits the tree anyway.
 fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, String) {
-    const MUTATING: &[&str] = &["run_bash", "write_file", "edit_file", "send_keys", "interrupt_shell"];
+    const MUTATING: &[&str] = &[
+        "run_bash",
+        "write_file",
+        "edit_file",
+        "send_keys",
+        "interrupt_shell",
+    ];
     const EDITS: &[&str] = &["write_file", "edit_file"];
     const SHELL: &[&str] = &["run_bash", "send_keys", "interrupt_shell"];
 
@@ -344,9 +367,15 @@ async fn main() {
         .init();
 
     let data = std::env::var("T3CODE_AGENT_DATA").unwrap_or_else(|_| ".t3code-agent".into());
-    let cwd = std::env::var("T3CODE_WORKSPACE")
-        .unwrap_or_else(|_| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into()));
-    let project_name = std::path::Path::new(&cwd).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "workspace".into());
+    let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into())
+    });
+    let project_name = std::path::Path::new(&cwd)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".into());
     // The model CLIs (claude/codex) and our tools inherit this process's cwd —
     // point it at the workspace so agent file edits land in the user's repo
     // (which is exactly what the vcs status/refs panel reads).
@@ -388,7 +417,9 @@ async fn main() {
     // different map and every worktree turn would fall back to the boot shell.
     let tool_roots = tools::ToolRoots::new(ws_root, agent_data, workspace_runner.clone()).await;
     let shell = Arc::new(Shell::new(&data, tool_roots.registry_factory()));
-    let rt = ThreadRuntime::open(shell, &data, "main").await.expect("open thread runtime");
+    let rt = ThreadRuntime::open(shell, &data, "main")
+        .await
+        .expect("open thread runtime");
     // Seed the workspace project into the DURABLE store on first open (#370).
     // A second backend attached to the same isolate will read the same seed
     // rather than synthesizing its own; a subsequent boot skips the write
@@ -427,12 +458,16 @@ async fn main() {
     // server still starts (so settings are reachable and the user can FIX it),
     // and turn admission refuses visibly (#110).
     if providers::default_model(&catalog).is_none() {
-        tracing::warn!("no routable provider configured — turns will be refused until one is added");
+        tracing::warn!(
+            "no routable provider configured — turns will be refused until one is added"
+        );
     }
     let catalog = Arc::new(RwLock::new(catalog));
     // Minted once and persisted: asset URLs a client is already holding must
     // outlive a restart, so this key cannot be per-process.
-    let assets_key = assets::signing_key(rt.store()).await.expect("asset signing key");
+    let assets_key = assets::signing_key(rt.store())
+        .await
+        .expect("asset signing key");
     let state = AppState {
         rt,
         catalog,
@@ -458,7 +493,9 @@ async fn main() {
         assets_key: Arc::new(assets_key),
         usage_rates: load_usage_rates(&data),
         usage_sources: Arc::new(agent_sdk_usage::default_sources()),
-        env, cwd, project_name,
+        env,
+        cwd,
+        project_name,
     };
 
     // external git edits move the panel too, not only our own commands
@@ -466,7 +503,10 @@ async fn main() {
 
     let app = build_app(state);
 
-    let port: u16 = std::env::var("T3CODE_SERVER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(13774);
+    let port: u16 = std::env::var("T3CODE_SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(13774);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!(%addr, "t3code-server (rust) listening — Effect-RPC/WS on /ws, turns via agent-sdk");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
@@ -490,7 +530,10 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/ws", get(ws_upgrade))
         // The redeem half of `assets.createUrl`. Registered BEFORE the fallback
         // so a signed URL is served, not swallowed by the catch-all.
-        .route(&format!("{}/{{token}}/{{name}}", assets::ROUTE_PREFIX), get(asset_http))
+        .route(
+            &format!("{}/{{token}}/{{name}}", assets::ROUTE_PREFIX),
+            get(asset_http),
+        )
         .fallback(capture_http)
         .with_state(state)
 }
@@ -536,18 +579,32 @@ async fn req_cwd(payload: &Value, state: &AppState) -> Result<String, String> {
 /// both go through `vcs::resolve_cwd` first — naming a directory is not
 /// authority to read from it.
 async fn asset_root(resource: &Value, state: &AppState) -> Result<String, String> {
-    let requested = match resource.get("_tag").and_then(Value::as_str).unwrap_or_default() {
+    let requested = match resource
+        .get("_tag")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
         "workspace-file" => {
-            let thread_id = resource.get("threadId").and_then(Value::as_str).unwrap_or_default();
+            let thread_id = resource
+                .get("threadId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             state
                 .rt
                 .threads()
                 .await
                 .into_iter()
                 .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-                .and_then(|t| t.get("worktreePath").and_then(Value::as_str).map(str::to_string))
+                .and_then(|t| {
+                    t.get("worktreePath")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
         }
-        "project-favicon" => resource.get("cwd").and_then(Value::as_str).map(str::to_string),
+        "project-favicon" => resource
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         _ => None,
     };
     let requested = requested
@@ -665,8 +722,14 @@ fn now_iso() -> String {
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
 async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
-    let thread_id = command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    if thread_id.is_empty() { return; }
+    let thread_id = command
+        .get("threadId")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    if thread_id.is_empty() {
+        return;
+    }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
         // derived from the catalog, so the announced thread names the provider
@@ -680,12 +743,19 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // away before the runtime ever started — the thread showed one project
     // while the work happened somewhere else (#137/#78/#79).
     let boot = command.pointer("/bootstrap/createThread");
-    let str_of = |v: Option<&Value>| v.and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let str_of = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     let title = str_of(command.get("titleSeed"))
         .or_else(|| str_of(boot.and_then(|b| b.get("title"))))
         .or_else(|| {
-            command.pointer("/message/text").and_then(|t| t.as_str())
-                .map(|t| t.chars().take(48).collect::<String>()).filter(|s| !s.is_empty())
+            command
+                .pointer("/message/text")
+                .and_then(|t| t.as_str())
+                .map(|t| t.chars().take(48).collect::<String>())
+                .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "New thread".into());
     let now = now_iso();
@@ -699,7 +769,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     let project_id = match str_of(boot.and_then(|b| b.get("projectId"))) {
         Some(p) => p,
         None => match state.rt.projects().await {
-            Ok(ps) => match ps.first().and_then(|p| p.get("id")).and_then(|v| v.as_str()) {
+            Ok(ps) => match ps
+                .first()
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+            {
                 Some(id) => id.to_string(),
                 None => {
                     tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
@@ -751,7 +825,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // "Is this thread already in the durable store?" — answered by asking
     // the store, not a process-local HashSet (#320). A second backend
     // process (or this one after restart) sees the same answer.
-    let existing_row = state.rt.threads().await.into_iter()
+    let existing_row = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
         .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(thread_id.as_str()));
     // For an EXISTING thread, the turn may carry a SWITCHED model selection. That
     // switch must persist durably (#37): otherwise a reload shows the old model
@@ -784,7 +862,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
 /// renamed or re-modelled outside a turn moves in the list exactly as one
 /// created by a turn does.
 async fn upsert_thread_on_shell(state: &AppState, thread: Value) {
-    let thread_id = thread.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // ONE EMISSION SEAM (packet L). The product supplies the frame's wire
     // vocabulary and nothing else: the SDK allocates the durable sequence,
     // stamps it in, RECORDS the frame in the shell replay log, and only then
@@ -807,7 +889,11 @@ async fn upsert_thread_on_shell(state: &AppState, thread: Value) {
 /// A model selection is validated against the live catalog before it is stored:
 /// persisting a selection the runtime cannot route would leave the picker
 /// showing a provider every future turn silently refuses (#73/#50).
-async fn update_thread_meta(state: &AppState, thread_id: &str, patch: &Value) -> Result<(), String> {
+async fn update_thread_meta(
+    state: &AppState,
+    thread_id: &str,
+    patch: &Value,
+) -> Result<(), String> {
     if thread_id.is_empty() {
         return Err("threadId is required".into());
     }
@@ -820,8 +906,12 @@ async fn update_thread_meta(state: &AppState, thread_id: &str, patch: &Value) ->
         .ok_or_else(|| format!("unknown thread {thread_id}"))?;
 
     if let Some(sel) = patch.get("modelSelection") {
-        model_from_selection(&*state.catalog.read().await, sel, &state.default_model().await)
-            .map_err(|e| format!("cannot select this model: {e}"))?;
+        model_from_selection(
+            &*state.catalog.read().await,
+            sel,
+            &state.default_model().await,
+        )
+        .map_err(|e| format!("cannot select this model: {e}"))?;
     }
     if let (Some(o), Some(p)) = (thread.as_object_mut(), patch.as_object()) {
         for (k, v) in p {
@@ -839,9 +929,14 @@ async fn update_thread_meta(state: &AppState, thread_id: &str, patch: &Value) ->
     // went out live is invisible to a client that reconnects with
     // `afterSequence` — it catches up over the gap and keeps showing the old
     // title until something else forces a full refresh.
-    emit_thread_event(&state.rt, thread_id, "thread.meta-updated", json!({
-        "threadId": thread_id, "thread": thread,
-    }))
+    emit_thread_event(
+        &state.rt,
+        thread_id,
+        "thread.meta-updated",
+        json!({
+            "threadId": thread_id, "thread": thread,
+        }),
+    )
     .await
 }
 
@@ -880,7 +975,11 @@ async fn default_model_selection(state: &AppState) -> Value {
         .iter()
         .find(|s| s.status == agent_sdk_provider::ProviderStatus::Ready)
         .map(|s| {
-            let model = s.models.iter().find(|m| m.is_default).or_else(|| s.models.first());
+            let model = s
+                .models
+                .iter()
+                .find(|m| m.is_default)
+                .or_else(|| s.models.first());
             json!({
                 "instanceId": s.instance_id,
                 "model": model.map(|m| m.slug.clone()).unwrap_or_default(),
@@ -891,7 +990,11 @@ async fn default_model_selection(state: &AppState) -> Value {
 
 /// The thread a command targets.
 fn thread_id_of(command: &Value) -> String {
-    command.get("threadId").and_then(Value::as_str).unwrap_or("").to_string()
+    command
+        .get("threadId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Decode a `thread.approval.respond` into allow/deny (#69).
@@ -902,7 +1005,11 @@ fn thread_id_of(command: &Value) -> String {
 /// and the tool is refused. A missing decision falls back to the legacy boolean
 /// so an older client still works, but a present decision is authoritative.
 fn approval_allow(command: &Value) -> bool {
-    match command.get("decision").and_then(Value::as_str).unwrap_or("") {
+    match command
+        .get("decision")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
         "accept" | "acceptForSession" => true,
         "decline" | "cancel" => false,
         _ => command
@@ -924,8 +1031,15 @@ async fn publish_approval_resolved(
     decision: &str,
     allowed: bool,
 ) {
-    let decision =
-        if decision.is_empty() { if allowed { "accept" } else { "decline" } } else { decision };
+    let decision = if decision.is_empty() {
+        if allowed {
+            "accept"
+        } else {
+            "decline"
+        }
+    } else {
+        decision
+    };
     // `thread.approval-resolved` was invented — not in `OrchestrationEventType`,
     // so the reducer fell through its forward-compatible default and the banner
     // stayed up after the user answered (#315/#316).
@@ -1163,7 +1277,9 @@ async fn watch_one_tree(
     baseline: String,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
-    let Some(repo) = cairn::Repo::detect(std::path::Path::new(&cwd)).await else { return };
+    let Some(repo) = cairn::Repo::detect(std::path::Path::new(&cwd)).await else {
+        return;
+    };
     let mut watch = match repo.watch_status_from(baseline).await {
         Ok(Some(start)) => {
             if let Some(status) = start.changed_since_baseline {
@@ -1186,7 +1302,10 @@ async fn watch_one_tree(
     while let Some(status) = watch.changed().await {
         match status {
             Ok(status) => publish_vcs_status_from_cairn(&state, &cwd, &status).await,
-            Err(e) => tracing::warn!(%cwd, %e, "vcs status watch could not read status"),
+            Err(e) => {
+                tracing::warn!(%cwd, %e, "vcs status watch could not read status");
+                publish_vcs_status(&state, &cwd).await;
+            }
         }
     }
 }
@@ -1287,7 +1406,11 @@ impl AppState {
     /// workspace terminal. Keying the lookup by owner is the difference between
     /// addressing a subagent's shell and addressing something that merely
     /// answers.
-    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> terminal::Terminal {
+    async fn pane_runner(
+        &self,
+        owner: &terminal::TerminalOwner,
+        terminal_id: &str,
+    ) -> terminal::Terminal {
         match self.terminals.get(owner, terminal_id).await {
             Some(pane) => pane.runner,
             None => self.terminal.clone(),
@@ -1313,12 +1436,20 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
         tracing::error!(%e, "terminal event publish failed");
     }
 
-    let thread = event.get("threadId").and_then(Value::as_str).unwrap_or("").to_string();
+    let thread = event
+        .get("threadId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // Built ONCE for the thread rather than per subscriber: every watcher of a
     // thread receives the same rows, and each row costs a PTY session lock.
     let now = now_iso();
     let mut rows = Vec::new();
-    for pane in state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
+    for pane in state
+        .terminals
+        .list(&terminal::TerminalOwner::thread(&thread))
+        .await
+    {
         rows.push(terminal::pane_summary(&pane, &now).await);
     }
     let payload = json!({ "type": "snapshot", "terminals": rows });
@@ -1374,12 +1505,22 @@ fn spawn_thread_tail_with_cleanup<F>(
                         }
                         match done_rx.await {
                             Ok(true) => hi = seq,
-                            _ => { tail.close().await; on_close.await; return; }
+                            _ => {
+                                tail.close().await;
+                                on_close.await;
+                                return;
+                            }
                         }
                     }
-                    if hi >= 0 { let _ = tail.ack(hi).await; }
+                    if hi >= 0 {
+                        let _ = tail.ack(hi).await;
+                    }
                 }
-                Err(_) => { tail.close().await; on_close.await; return; }
+                Err(_) => {
+                    tail.close().await;
+                    on_close.await;
+                    return;
+                }
             }
         }
     });
@@ -1387,7 +1528,14 @@ fn spawn_thread_tail_with_cleanup<F>(
 
 /// The provider snapshots the UI renders, from the live catalog.
 async fn provider_entries(state: &AppState) -> Vec<Value> {
-    state.catalog.read().await.snapshots().iter().map(provider_entry).collect()
+    state
+        .catalog
+        .read()
+        .await
+        .snapshots()
+        .iter()
+        .map(provider_entry)
+        .collect()
 }
 
 // Frontend event-shape adaptation lives in its own module (#403): the T3
@@ -1408,8 +1556,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             // Confirm delivery ONLY after the sink accepted the frame — a
             // subscriber that requested confirmation acks on this signal, not on
             // mere enqueue, so an event is never acked before it left the server.
-            if let Some(done) = done { let _ = done.send(ok); }
-            if !ok { break; }
+            if let Some(done) = done {
+                let _ = done.send(ok);
+            }
+            if !ok {
+                break;
+            }
         }
     });
 
@@ -1430,11 +1582,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // that does not understand it can safely ignore, but
                         // one that does can surface a diagnosable failure.
                         tracing::warn!(bytes = text.len(), %e, "ws: dropped a Text frame that is not JSON");
-                        let _ = tx.send((json!({
-                            "_tag": "Error",
-                            "kind": "malformed-json",
-                            "message": format!("frame is not valid JSON: {e}"),
-                        }).to_string(), None));
+                        let _ = tx.send((
+                            json!({
+                                "_tag": "Error",
+                                "kind": "malformed-json",
+                                "message": format!("frame is not valid JSON: {e}"),
+                            })
+                            .to_string(),
+                            None,
+                        ));
                         continue;
                     }
                 };
@@ -1500,10 +1656,7 @@ pub(crate) async fn dispatch_ws_frame(
             // `thread.turn.interrupt` uses. If no threadId is
             // discoverable, we log and drop with a named reason instead
             // of silently.
-            let req_id = frame
-                .get("requestId")
-                .cloned()
-                .unwrap_or(Value::Null);
+            let req_id = frame.get("requestId").cloned().unwrap_or(Value::Null);
             let thread_id = frame
                 .pointer("/payload/input/threadId")
                 .or_else(|| frame.pointer("/payload/threadId"))
@@ -1513,10 +1666,14 @@ pub(crate) async fn dispatch_ws_frame(
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
                 let _ = state.rt.interrupt(&thread_id).await;
-                let _ = state.terminal.interrupt().await;
+                if let Err(e) = terminal::interrupt(&state.terminal).await {
+                    tracing::error!(%thread_id, ?req_id, %e, "ws: terminal interrupt failed");
+                }
             } else {
-                tracing::warn!(?req_id,
-                    "ws: Interrupt with no threadId — cannot route to a specific turn");
+                tracing::warn!(
+                    ?req_id,
+                    "ws: Interrupt with no threadId — cannot route to a specific turn"
+                );
             }
         }
         other => {
@@ -1558,10 +1715,14 @@ fn exit_success(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, value:
 /// failure the client can see, instead of a masking `Success(null)` that lets
 /// the reducer advance past behavior this backend never performed.
 fn exit_failure(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, message: &str) {
-    let _ = tx.send((json!({
-        "_tag": "Exit", "requestId": request_id,
-        "exit": { "_tag": "Failure", "cause": [{ "_tag": "Die", "defect": message }] }
-    }).to_string(), None));
+    let _ = tx.send((
+        json!({
+            "_tag": "Exit", "requestId": request_id,
+            "exit": { "_tag": "Failure", "cause": [{ "_tag": "Die", "defect": message }] }
+        })
+        .to_string(),
+        None,
+    ));
 }
 
 /// Fail a request with a DECLARED, tagged error from the RPC's error channel.
@@ -1570,15 +1731,23 @@ fn exit_failure(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, messag
 /// crash the client has no branch for. A declared error is part of the
 /// contract, so it travels as `Fail` carrying the tagged value intact.
 fn exit_typed_failure(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, error: Value) {
-    let _ = tx.send((json!({
-        "_tag": "Exit", "requestId": request_id,
-        "exit": { "_tag": "Failure", "cause": [{ "_tag": "Fail", "error": error }] }
-    }).to_string(), None));
+    let _ = tx.send((
+        json!({
+            "_tag": "Exit", "requestId": request_id,
+            "exit": { "_tag": "Failure", "cause": [{ "_tag": "Fail", "error": error }] }
+        })
+        .to_string(),
+        None,
+    ));
 }
 
 /// Push one stream value as a Chunk on an open stream request.
 fn chunk(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, value: Value) {
-    let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": request_id, "values": [value] }).to_string(), None));
+    let _ = tx.send((
+        json!({ "_tag": "Chunk", "clientId": 0, "requestId": request_id, "values": [value] })
+            .to_string(),
+        None,
+    ));
 }
 
 /// A bounded excerpt around a search hit, with the match inside it.
@@ -1591,7 +1760,13 @@ fn snippet_around(text: &str, at: usize, len: usize) -> String {
     let lead = 60usize;
     // char boundaries, not byte arithmetic: a snippet that splits a multi-byte
     // character is not a string.
-    let start = text[..at].char_indices().rev().take(lead).last().map(|(i, _)| i).unwrap_or(at);
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take(lead)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(at);
     let mut out: String = text[start..].chars().take(WINDOW).collect();
     if start > 0 {
         out.insert(0, '\u{2026}');
@@ -1609,7 +1784,11 @@ async fn thread_cwd(state: &AppState, thread_id: &str) -> String {
         .await
         .into_iter()
         .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-        .and_then(|t| t.get("worktreePath").and_then(Value::as_str).map(str::to_string))
+        .and_then(|t| {
+            t.get("worktreePath")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| state.cwd.clone())
 }
@@ -1758,13 +1937,13 @@ impl agent_sdk_shell::TurnCheckpointer for WorkspaceCheckpointer {
 fn turn_projector(
     state: &AppState,
     cwd: String,
-) -> agent_sdk_shell::CheckpointingProjector<
-    event_adapter::T3Projector,
-    WorkspaceCheckpointer,
-> {
+) -> agent_sdk_shell::CheckpointingProjector<event_adapter::T3Projector, WorkspaceCheckpointer> {
     agent_sdk_shell::CheckpointingProjector::new(
         event_adapter::t3_projector(state.rt.clone()),
-        WorkspaceCheckpointer { state: state.clone(), cwd },
+        WorkspaceCheckpointer {
+            state: state.clone(),
+            cwd,
+        },
     )
 }
 
@@ -1788,12 +1967,14 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
                     "ready",
                     t.files
                         .into_iter()
-                        .map(|f| json!({
-                            "path": f.path,
-                            "kind": f.kind,
-                            "additions": f.additions,
-                            "deletions": f.deletions,
-                        }))
+                        .map(|f| {
+                            json!({
+                                "path": f.path,
+                                "kind": f.kind,
+                                "additions": f.additions,
+                                "deletions": f.deletions,
+                            })
+                        })
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -1837,8 +2018,10 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
         if turn_count <= 0 {
             return Err(format!("no checkpoint covers {turn_count} turn(s) back"));
         }
-        let checkpointer =
-            WorkspaceCheckpointer { state: state.clone(), cwd: cwd.clone() };
+        let checkpointer = WorkspaceCheckpointer {
+            state: state.clone(),
+            cwd: cwd.clone(),
+        };
         state
             .rt
             .revert_thread_to_turn(thread_id, turn_count as usize, &checkpointer)
@@ -1903,11 +2086,7 @@ async fn open_diag_history(agent_data: &std::path::Path) -> agent_sdk_metrics::R
         .expect("open the resource history")
 }
 
-async fn handle_request(
-    frame: &Value,
-    tx: &mpsc::UnboundedSender<OutFrame>,
-    state: &AppState,
-) {
+async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, state: &AppState) {
     let method = frame.get("tag").and_then(|t| t.as_str()).unwrap_or("");
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     let payload = frame.get("payload").cloned().unwrap_or(json!({}));
@@ -1930,7 +2109,8 @@ async fn handle_request(
         // A sample is taken on each read rather than on a timer: the panel polls
         // while it is open, so history accumulates exactly while someone is
         // looking, and an idle server never forks `ps`.
-        "server.getProcessDiagnostics" | "server.getProcessResourceHistory"
+        "server.getProcessDiagnostics"
+        | "server.getProcessResourceHistory"
         | "server.getResourceTelemetryHistory" => {
             let me = std::process::id() as i64;
             if let Ok(s) = diagnostics::sample(me).await {
@@ -1946,11 +2126,19 @@ async fn handle_request(
             } else {
                 // Defaults match what the panel asks for when it sends nothing:
                 // a 5-minute window in 10s buckets.
-                let window = payload.pointer("/input/windowMs").or_else(|| payload.get("windowMs"))
-                    .and_then(Value::as_i64).unwrap_or(300_000);
-                let bucket = payload.pointer("/input/bucketMs").or_else(|| payload.get("bucketMs"))
-                    .and_then(Value::as_i64).unwrap_or(10_000);
-                match diagnostics::history_wire_durable(&state.diag_history, window, bucket, 2_000).await {
+                let window = payload
+                    .pointer("/input/windowMs")
+                    .or_else(|| payload.get("windowMs"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(300_000);
+                let bucket = payload
+                    .pointer("/input/bucketMs")
+                    .or_else(|| payload.get("bucketMs"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(10_000);
+                match diagnostics::history_wire_durable(&state.diag_history, window, bucket, 2_000)
+                    .await
+                {
                     Ok(wire) => exit_success(tx, &id, wire),
                     // A history read that failed is not an empty history. The
                     // panel must not render "no activity" over a storage fault.
@@ -1961,7 +2149,11 @@ async fn handle_request(
         "server.getTraceDiagnostics" => {
             // Reported against the path `server.getConfig` advertises, so the
             // panel's "trace file" line and this answer name the same file.
-            exit_success(tx, &id, diagnostics::trace_diagnostics("/tmp/t3code-traces.jsonl"));
+            exit_success(
+                tx,
+                &id,
+                diagnostics::trace_diagnostics("/tmp/t3code-traces.jsonl"),
+            );
         }
         "server.getUsageSummary" => {
             // REAL usage (#328), read from the provider CLIs' own transcripts
@@ -2013,15 +2205,22 @@ async fn handle_request(
             let tx_pump = tx.clone();
             let req_id = id.clone();
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(sample_interval_ms as u64));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                    sample_interval_ms as u64,
+                ));
                 ticker.tick().await; // first tick fires immediately; we already sent the snapshot
                 loop {
                     ticker.tick().await;
-                    let snap = diagnostics::resource_telemetry_snapshot(me, sample_interval_ms).await;
+                    let snap =
+                        diagnostics::resource_telemetry_snapshot(me, sample_interval_ms).await;
                     let frame = json!({ "_tag": "Chunk", "clientId": 0, "requestId": req_id, "values": [snap] }).to_string();
                     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                    if tx_pump.send((frame, Some(done_tx))).is_err() { return; }
-                    if !matches!(done_rx.await, Ok(true)) { return; }
+                    if tx_pump.send((frame, Some(done_tx))).is_err() {
+                        return;
+                    }
+                    if !matches!(done_rx.await, Ok(true)) {
+                        return;
+                    }
                 }
             });
         }
@@ -2062,7 +2261,8 @@ async fn handle_request(
         // runtime routes. Each write persists to the do-rs store and reconciles
         // the SAME live catalog, then answers with the shape the UI decodes.
         "server.getSettings" => {
-            let instances = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let instances =
+                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
             let other = settings::load_other(state.rt.store()).await;
             exit_success(tx, &id, settings::settings_wire(&instances, &other));
         }
@@ -2075,7 +2275,8 @@ async fn handle_request(
                 exit_failure(tx, &id, &e);
                 return;
             }
-            let current = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current =
+                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
             let next = settings::apply_patch(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
@@ -2084,7 +2285,8 @@ async fn handle_request(
             // Persist every OTHER settings field the patch carried, so a saved
             // writing style / model selection / observability config round-trips
             // instead of resetting to defaults on the next getSettings (#87).
-            let other = settings::merge_other(&settings::load_other(state.rt.store()).await, &payload);
+            let other =
+                settings::merge_other(&settings::load_other(state.rt.store()).await, &payload);
             if let Err(e) = settings::save_other(state.rt.store(), &other).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
                 return;
@@ -2092,21 +2294,30 @@ async fn handle_request(
             // Reconcile + answer with the EFFECTIVE set (saved re-merged under the
             // boot defaults), so a whole-map replace that removed a custom
             // provider drops it from the catalog while stock providers survive.
-            let effective = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let effective =
+                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
             settings::reconcile(&mut *state.catalog.write().await, &effective);
             let wire = settings::settings_wire(&effective, &other);
             exit_success(tx, &id, wire.clone());
-            publish_config(&state, config_event("settingsUpdated", json!({"settings": wire}))).await;
             publish_config(
                 &state,
-                config_event("providerStatuses", json!({"providers": provider_entries(&state).await})),
+                config_event("settingsUpdated", json!({"settings": wire})),
+            )
+            .await;
+            publish_config(
+                &state,
+                config_event(
+                    "providerStatuses",
+                    json!({"providers": provider_entries(&state).await}),
+                ),
             )
             .await;
         }
         "server.refreshProviders" => {
             // re-reconcile from the durable set (re-probes availability), then
             // answer with the current provider snapshots the UI renders.
-            let instances = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let instances =
+                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
             // A refresh is exactly when to ASK each OpenAI-compatible endpoint
             // what it serves: the user pointed at an Ollama and expects its
             // models to appear without hand-typing slugs (#180).
@@ -2117,13 +2328,21 @@ async fn handle_request(
             let providers = {
                 let mut cat = state.catalog.write().await;
                 settings::reconcile(&mut cat, &instances);
-                cat.snapshots().iter().map(provider_entry).collect::<Vec<_>>()
+                cat.snapshots()
+                    .iter()
+                    .map(provider_entry)
+                    .collect::<Vec<_>>()
             };
             exit_success(tx, &id, json!({ "providers": providers.clone() }));
-            publish_config(&state, config_event("providerStatuses", json!({"providers": providers}))).await;
+            publish_config(
+                &state,
+                config_event("providerStatuses", json!({"providers": providers})),
+            )
+            .await;
         }
         "server.updateProvider" => {
-            let current = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current =
+                settings::load_instances(state.rt.store(), providers::configured_instances()).await;
             let next = settings::apply_provider_update(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist provider failed: {e}"));
@@ -2132,10 +2351,17 @@ async fn handle_request(
             let providers = {
                 let mut cat = state.catalog.write().await;
                 settings::reconcile(&mut cat, &next);
-                cat.snapshots().iter().map(provider_entry).collect::<Vec<_>>()
+                cat.snapshots()
+                    .iter()
+                    .map(provider_entry)
+                    .collect::<Vec<_>>()
             };
             exit_success(tx, &id, json!({ "providers": providers.clone() }));
-            publish_config(&state, config_event("providerStatuses", json!({"providers": providers}))).await;
+            publish_config(
+                &state,
+                config_event("providerStatuses", json!({"providers": providers})),
+            )
+            .await;
         }
 
         // The source-control settings/publish UI reads this to decide whether git
@@ -2178,7 +2404,6 @@ async fn handle_request(
         // every few seconds for a report that changes nothing.
         "server.reportClientActivity" => exit_success(tx, &id, Value::Null),
 
-
         // Stream subscriptions stay OPEN (no Exit). subscribeThread records the
         // requestId so turn events can be routed to it, and emits `synchronized`
         // so the client marks the subscription live.
@@ -2216,7 +2441,11 @@ async fn handle_request(
                     // attaches with `Retained::Deliver` and suppresses by
                     // sequence `<= through`, which is exact: a duplicate is
                     // dropped, a genuinely new event never is.
-                    match state.rt.replay_and_tail(thread_id, after, MAX_CATCHUP).await {
+                    match state
+                        .rt
+                        .replay_and_tail(thread_id, after, MAX_CATCHUP)
+                        .await
+                    {
                         // A tail is offered ONLY when the replay covered the
                         // gap; the SDK returns `None` otherwise, so there is no
                         // way to go live over a truncated catch-up by mistake.
@@ -2227,7 +2456,12 @@ async fn handle_request(
                                 }
                                 chunk(tx, &id, json!({ "kind": "synchronized" }));
                                 let _ = wants_marker;
-                                spawn_thread_tail(tail, tx.clone(), id.clone(), thread_id.to_string());
+                                spawn_thread_tail(
+                                    tail,
+                                    tx.clone(),
+                                    id.clone(),
+                                    thread_id.to_string(),
+                                );
                                 return;
                             }
                             // Replay hit MAX_CATCHUP — "there may be more", and
@@ -2259,8 +2493,12 @@ async fn handle_request(
                     Ok(pair) => pair,
                     Err(e) => {
                         tracing::error!(%e, %thread_id, "subscribeThread: snapshot tail attach failed");
-                        chunk(tx, &id, json!({ "kind": "error",
-                            "error": { "message": format!("subscribe failed: {e}") } }));
+                        chunk(
+                            tx,
+                            &id,
+                            json!({ "kind": "error",
+                            "error": { "message": format!("subscribe failed: {e}") } }),
+                        );
                         return;
                     }
                 };
@@ -2281,7 +2519,11 @@ async fn handle_request(
                     Err(e) => {
                         tracing::error!(%thread_id, %e, "subscribeThread: thread store unreadable");
                         snapshot_tail.close().await;
-                        exit_failure(tx, &id, &format!("subscribeThread: thread store unreadable: {e}"));
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!("subscribeThread: thread store unreadable: {e}"),
+                        );
                         return;
                     }
                 };
@@ -2299,19 +2541,29 @@ async fn handle_request(
                     Some(r) => r,
                     None => {
                         let project0 = match state.rt.projects().await {
-                            Ok(ps) => match ps.first().and_then(|p| p.get("id")).and_then(Value::as_str) {
-                                Some(v) => v.to_string(),
-                                None => {
-                                    tracing::error!(%thread_id, "subscribeThread: no seed project in store; refusing snapshot");
-                                    snapshot_tail.close().await;
-                                    exit_failure(tx, &id, "subscribeThread: no seed project in store");
-                                    return;
+                            Ok(ps) => {
+                                match ps.first().and_then(|p| p.get("id")).and_then(Value::as_str) {
+                                    Some(v) => v.to_string(),
+                                    None => {
+                                        tracing::error!(%thread_id, "subscribeThread: no seed project in store; refusing snapshot");
+                                        snapshot_tail.close().await;
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            "subscribeThread: no seed project in store",
+                                        );
+                                        return;
+                                    }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 tracing::error!(%thread_id, %e, "subscribeThread: project store unreadable");
                                 snapshot_tail.close().await;
-                                exit_failure(tx, &id, &format!("subscribeThread: project store unreadable: {e}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("subscribeThread: project store unreadable: {e}"),
+                                );
                                 return;
                             }
                         };
@@ -2345,8 +2597,12 @@ async fn handle_request(
                         // and nothing acks, so every later event for this
                         // thread piles up in an inbox with no reader.
                         snapshot_tail.close().await;
-                        chunk(tx, &id, json!({ "kind": "error",
-                            "error": { "message": format!("pending approvals unreadable: {e}") } }));
+                        chunk(
+                            tx,
+                            &id,
+                            json!({ "kind": "error",
+                            "error": { "message": format!("pending approvals unreadable: {e}") } }),
+                        );
                         return;
                     }
                 };
@@ -2359,7 +2615,10 @@ async fn handle_request(
                         approval_requested_activity(
                             a["sessionId"].as_str().unwrap_or(""),
                             a["turn"].as_i64().unwrap_or(0),
-                            a["call_id"].as_str().or_else(|| a["callId"].as_str()).unwrap_or(""),
+                            a["call_id"]
+                                .as_str()
+                                .or_else(|| a["callId"].as_str())
+                                .unwrap_or(""),
                             a["tool"].as_str().unwrap_or(""),
                             a.get("args").unwrap_or(&Value::Null),
                             None,
@@ -2400,8 +2659,12 @@ async fn handle_request(
                         // and nothing acks, so every later event for this
                         // thread piles up in an inbox with no reader.
                         snapshot_tail.close().await;
-                        chunk(tx, &id, json!({ "kind": "error",
-                            "error": { "message": format!("pending questions unreadable: {e}") } }));
+                        chunk(
+                            tx,
+                            &id,
+                            json!({ "kind": "error",
+                            "error": { "message": format!("pending questions unreadable: {e}") } }),
+                        );
                         return;
                     }
                 }
@@ -2424,8 +2687,12 @@ async fn handle_request(
                         // marker carries the SAME turn id the live session-set event
                         // used, so the running/stop affordance is fully restored (#92).
                         let active_turn = if live {
-                            state.rt.active_turn_id(thread_id).await
-                                .map(Value::String).unwrap_or(Value::Null)
+                            state
+                                .rt
+                                .active_turn_id(thread_id)
+                                .await
+                                .map(Value::String)
+                                .unwrap_or(Value::Null)
                         } else {
                             Value::Null
                         };
@@ -2437,7 +2704,10 @@ async fn handle_request(
                 // `turnLimit` windows the fallback snapshot to the last N
                 // user-anchored turns and SAYS it is a window; absent means the
                 // full thread, which is what pre-pagination clients expect.
-                let turn_limit = payload.get("turnLimit").and_then(Value::as_u64).map(|v| v as usize);
+                let turn_limit = payload
+                    .get("turnLimit")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
                 let (messages, page) = match turn_limit {
                     None => (messages, Value::Null),
                     Some(limit) => {
@@ -2493,7 +2763,11 @@ async fn handle_request(
                     Err(e) => {
                         tracing::error!(%thread_id, %e, "subscribeThread: invalid thread projection");
                         snapshot_tail.close().await;
-                        exit_failure(tx, &id, &format!("subscribeThread: invalid thread projection: {e}"));
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!("subscribeThread: invalid thread projection: {e}"),
+                        );
                         return;
                     }
                 };
@@ -2514,10 +2788,18 @@ async fn handle_request(
         }
         "subscribeServerLifecycle" => {
             // The client waits for `ready` before advancing to the shell + UI.
-            chunk(tx, &id, json!({ "version": 1, "sequence": 0, "type": "welcome",
-                "payload": { "environment": state.env, "cwd": state.cwd, "projectName": state.project_name } }));
-            chunk(tx, &id, json!({ "version": 1, "sequence": 1, "type": "ready",
-                "payload": { "at": now_iso(), "environment": state.env } }));
+            chunk(
+                tx,
+                &id,
+                json!({ "version": 1, "sequence": 0, "type": "welcome",
+                "payload": { "environment": state.env, "cwd": state.cwd, "projectName": state.project_name } }),
+            );
+            chunk(
+                tx,
+                &id,
+                json!({ "version": 1, "sequence": 1, "type": "ready",
+                "payload": { "at": now_iso(), "environment": state.env } }),
+            );
         }
         "subscribeServerConfig" => {
             // an initial snapshot, so a late subscriber is not stuck with
@@ -2534,7 +2816,9 @@ async fn handle_request(
             // this or a second backend process reaches this subscriber via
             // the same broker.
             match state.rt.config_tail_after(Some(0)).await {
-                Ok(tail) => spawn_thread_tail(tail, tx.clone(), id.clone(), "__config__".to_string()),
+                Ok(tail) => {
+                    spawn_thread_tail(tail, tx.clone(), id.clone(), "__config__".to_string())
+                }
                 Err(e) => {
                     tracing::error!(%e, "config tail attach failed — subscriber will not receive updates");
                     exit_failure(tx, &id, &format!("subscribeServerConfig: {e}"));
@@ -2553,23 +2837,40 @@ async fn handle_request(
         // declared error arm for exactly that difference.
         "orchestration.getTurnDiff" | "orchestration.getFullThreadDiff" => {
             let input = payload.get("input").cloned().unwrap_or(payload.clone());
-            let thread_id = input.get("threadId").and_then(Value::as_str).unwrap_or("").to_string();
-            let to = input.get("toTurnCount").and_then(Value::as_i64).unwrap_or(0);
+            let thread_id = input
+                .get("threadId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let to = input
+                .get("toTurnCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             // A FULL thread diff is the same read with the near boundary pinned
             // to the working tree, so both share one implementation and cannot
             // disagree about which end of the range is which.
             let from = if method == "orchestration.getFullThreadDiff" {
                 0
             } else {
-                input.get("fromTurnCount").and_then(Value::as_i64).unwrap_or(0)
+                input
+                    .get("fromTurnCount")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
             };
-            let ws = input.get("ignoreWhitespace").and_then(Value::as_bool).unwrap_or(false);
+            let ws = input
+                .get("ignoreWhitespace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if from > to {
-                exit_typed_failure(tx, &id, json!({
-                    "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
-                            else { "OrchestrationGetFullThreadDiffError" },
-                    "message": "fromTurnCount must be less than or equal to toTurnCount",
-                }));
+                exit_typed_failure(
+                    tx,
+                    &id,
+                    json!({
+                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                else { "OrchestrationGetFullThreadDiffError" },
+                        "message": "fromTurnCount must be less than or equal to toTurnCount",
+                    }),
+                );
                 return;
             }
             let cwd = thread_cwd(&state, &thread_id).await;
@@ -2592,51 +2893,80 @@ async fn handle_request(
             }
             .await;
             match patch {
-                Ok(Some(diff)) => exit_success(tx, &id, json!({
-                    "threadId": thread_id, "fromTurnCount": from, "toTurnCount": to, "diff": diff,
-                })),
+                Ok(Some(diff)) => exit_success(
+                    tx,
+                    &id,
+                    json!({
+                        "threadId": thread_id, "fromTurnCount": from, "toTurnCount": to, "diff": diff,
+                    }),
+                ),
                 // No checkpoint at that distance, or not a git worktree. Saying
                 // `diff: ""` here would tell the reviewer the turn changed
                 // nothing, which is the one thing this must never claim.
-                Ok(None) => exit_typed_failure(tx, &id, json!({
-                    "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
-                            else { "OrchestrationGetFullThreadDiffError" },
-                    "message": format!(
-                        "no checkpoint covers turns {from}..{to} for this thread \
-                         (the workspace may not be a git repository)"
-                    ),
-                })),
-                Err(e) => exit_typed_failure(tx, &id, json!({
-                    "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
-                            else { "OrchestrationGetFullThreadDiffError" },
-                    "message": format!("diff unavailable: {e}"),
-                })),
+                Ok(None) => exit_typed_failure(
+                    tx,
+                    &id,
+                    json!({
+                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                else { "OrchestrationGetFullThreadDiffError" },
+                        "message": format!(
+                            "no checkpoint covers turns {from}..{to} for this thread \
+                             (the workspace may not be a git repository)"
+                        ),
+                    }),
+                ),
+                Err(e) => exit_typed_failure(
+                    tx,
+                    &id,
+                    json!({
+                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                else { "OrchestrationGetFullThreadDiffError" },
+                        "message": format!("diff unavailable: {e}"),
+                    }),
+                ),
             }
         }
         "orchestration.searchThreads" => {
             let input = payload.get("input").cloned().unwrap_or(payload.clone());
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             // The contract bounds this (2..=200 chars, limit 1..=50) so a scan
             // cannot monopolize the store; the runtime enforces the same bounds
             // rather than trusting a client to have done it.
             if query.chars().count() < 2 {
-                exit_typed_failure(tx, &id, json!({
-                    "_tag": "OrchestrationSearchThreadsError",
-                    "message": "a search needs at least two characters",
-                }));
+                exit_typed_failure(
+                    tx,
+                    &id,
+                    json!({
+                        "_tag": "OrchestrationSearchThreadsError",
+                        "message": "a search needs at least two characters",
+                    }),
+                );
                 return;
             }
-            let limit = input.get("limit").and_then(Value::as_i64).unwrap_or(20).clamp(1, 50) as usize;
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(20)
+                .clamp(1, 50) as usize;
             let needle = query.to_lowercase();
             // The DURABLE store is the corpus — not an in-memory index that
             // would be empty after a restart and disagree with the thread list.
             let threads = match state.rt.try_threads().await {
                 Ok(t) => t,
                 Err(e) => {
-                    exit_typed_failure(tx, &id, json!({
-                        "_tag": "OrchestrationSearchThreadsError",
-                        "message": format!("the thread store is unreadable: {e}"),
-                    }));
+                    exit_typed_failure(
+                        tx,
+                        &id,
+                        json!({
+                            "_tag": "OrchestrationSearchThreadsError",
+                            "message": format!("the thread store is unreadable: {e}"),
+                        }),
+                    );
                     return;
                 }
             };
@@ -2657,16 +2987,22 @@ async fn handle_request(
                 let msgs = match state.rt.try_messages(tid).await {
                     Ok(m) => m,
                     Err(e) => {
-                        exit_typed_failure(tx, &id, json!({
-                            "_tag": "OrchestrationSearchThreadsError",
-                            "message": format!("thread {tid} is unreadable: {e}"),
-                        }));
+                        exit_typed_failure(
+                            tx,
+                            &id,
+                            json!({
+                                "_tag": "OrchestrationSearchThreadsError",
+                                "message": format!("thread {tid} is unreadable: {e}"),
+                            }),
+                        );
                         return;
                     }
                 };
                 for m in &msgs {
                     let text = m.get("text").and_then(Value::as_str).unwrap_or("");
-                    let Some(at) = text.to_lowercase().find(&needle) else { continue };
+                    let Some(at) = text.to_lowercase().find(&needle) else {
+                        continue;
+                    };
                     // The contract enumerates user | assistant on `source`; a
                     // system / tool message that happens to contain the query
                     // must NOT be smuggled out as an assistant hit — the
@@ -2696,17 +3032,24 @@ async fn handle_request(
         }
         "orchestration.getWorkflowScript" => {
             let input = payload.get("input").cloned().unwrap_or(payload.clone());
-            let script_path =
-                input.get("scriptPath").and_then(Value::as_str).unwrap_or("").to_string();
+            let script_path = input
+                .get("scriptPath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             // Containment is re-derived here; the client value is a hint. This
             // runtime has no workflow-scripts root, so the honest answer is the
             // contract's own `root-unavailable`, NOT an empty script body that
             // the panel would render as a workflow with no steps.
-            exit_typed_failure(tx, &id, json!({
-                "_tag": "OrchestrationGetWorkflowScriptError",
-                "reason": "root-unavailable",
-                "scriptPath": script_path,
-            }));
+            exit_typed_failure(
+                tx,
+                &id,
+                json!({
+                    "_tag": "OrchestrationGetWorkflowScriptError",
+                    "reason": "root-unavailable",
+                    "scriptPath": script_path,
+                }),
+            );
         }
         "orchestration.subscribeShell" => {
             // RESUME (packet L). The contract has had `afterSequence` on this
@@ -2729,14 +3072,23 @@ async fn handle_request(
                 // when the replay half fails — every one of those was a way
                 // to announce `synchronized` over a hole or leak a
                 // subscription.
-                match state.rt.shell_replay_and_tail(after, MAX_SHELL_CATCHUP).await {
+                match state
+                    .rt
+                    .shell_replay_and_tail(after, MAX_SHELL_CATCHUP)
+                    .await
+                {
                     Ok(replay) => match replay.tail {
                         Some(tail) => {
                             for item in replay.events {
                                 chunk(tx, &id, item);
                             }
                             chunk(tx, &id, json!({ "kind": "synchronized" }));
-                            spawn_thread_tail(tail, tx.clone(), id.clone(), "__shell__".to_string());
+                            spawn_thread_tail(
+                                tail,
+                                tx.clone(),
+                                id.clone(),
+                                "__shell__".to_string(),
+                            );
                             return;
                         }
                         None => {
@@ -2777,12 +3129,20 @@ async fn handle_request(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(%e, "subscribeShell: project store unreadable");
-                    exit_failure(tx, &id, &format!("subscribeShell: project store unreadable: {e}"));
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("subscribeShell: project store unreadable: {e}"),
+                    );
                     return;
                 }
             };
-            chunk(tx, &id, json!({ "kind": "snapshot", "snapshot": {
-                "snapshotSequence": mark, "projects": projects, "threads": threads, "updatedAt": now_iso() } }));
+            chunk(
+                tx,
+                &id,
+                json!({ "kind": "snapshot", "snapshot": {
+                "snapshotSequence": mark, "projects": projects, "threads": threads, "updatedAt": now_iso() } }),
+            );
             spawn_thread_tail(tail, tx.clone(), id.clone(), "__shell__".to_string());
         }
         // ── source control, entirely over cairn (see `vcs.rs`) ──────────────
@@ -2838,7 +3198,9 @@ async fn handle_request(
                         // a watch task needs starting.
                         let sub_id = tail.sub_id().to_string();
                         match state.rt.watch_claim("vcs", &cwd, &sub_id).await {
-                            Ok(true) => state.vcs_watch_changed.send_modify(|v| *v = v.wrapping_add(1)),
+                            Ok(true) => state
+                                .vcs_watch_changed
+                                .send_modify(|v| *v = v.wrapping_add(1)),
                             Ok(false) => {}
                             Err(e) => {
                                 // A subscription whose claim did not register
@@ -2862,7 +3224,11 @@ async fn handle_request(
                                 // and reports whether it was the last one
                                 // anywhere; it releases the mark itself in that
                                 // case, so the claim and the mark cannot drift.
-                                match state_close.rt.watch_unclaim("vcs", &cwd_close, &sub_id).await {
+                                match state_close
+                                    .rt
+                                    .watch_unclaim("vcs", &cwd_close, &sub_id)
+                                    .await
+                                {
                                     Ok(true) => state_close
                                         .vcs_watch_changed
                                         .send_modify(|v| *v = v.wrapping_add(1)),
@@ -2881,7 +3247,9 @@ async fn handle_request(
                     }
                 }
                 // wake the watcher supervisor: a new tree may need a watch.
-                state.vcs_watch_changed.send_modify(|v| *v = v.wrapping_add(1));
+                state
+                    .vcs_watch_changed
+                    .send_modify(|v| *v = v.wrapping_add(1));
             }
             Err(e) => exit_failure(tx, &id, &e),
         },
@@ -2893,7 +3261,10 @@ async fn handle_request(
         | "vcs.removeWorktree" | "vcs.init" => {
             let cwd = match req_cwd(&payload, &state).await {
                 Ok(c) => c,
-                Err(e) => { exit_failure(tx, &id, &e); return; }
+                Err(e) => {
+                    exit_failure(tx, &id, &e);
+                    return;
+                }
             };
             let out = match method {
                 "vcs.pull" => vcs::pull(&cwd).await,
@@ -2919,7 +3290,10 @@ async fn handle_request(
             // a PROGRESS stream: started → per-step → completed
             let cwd = match req_cwd(&payload, &state).await {
                 Ok(c) => c,
-                Err(e) => { exit_failure(tx, &id, &e); return; }
+                Err(e) => {
+                    exit_failure(tx, &id, &e);
+                    return;
+                }
             };
             // #423: FORWARD EACH FRAME AS IT IS PRODUCED.
             //
@@ -2965,13 +3339,21 @@ async fn handle_request(
             // no `agent_control` table until we say so. Idempotent.
             let _ = agent_sdk_do::Control::ensure_schema(&action_db).await;
             let action_control = agent_sdk_do::Control::new(action_db);
-            let action_id =
-                payload.get("actionId").and_then(Value::as_str).unwrap_or("action").to_string();
+            let action_id = payload
+                .get("actionId")
+                .and_then(Value::as_str)
+                .unwrap_or("action")
+                .to_string();
             // `ensure` before the run so `cancel` has a row to flip even if it
             // lands in the gap before the first phase boundary is reached.
             let _ = action_control.ensure(&action_id).await;
-            match vcs::run_stacked_action_streaming(&cwd, &payload, &mut emit, Some(&action_control))
-                .await
+            match vcs::run_stacked_action_streaming(
+                &cwd,
+                &payload,
+                &mut emit,
+                Some(&action_control),
+            )
+            .await
             {
                 Ok(None) => {
                     exit_success(tx, &id, Value::Null);
@@ -3009,7 +3391,10 @@ async fn handle_request(
         // id nobody recognises, is a no-op rather than an error. A cancel that
         // races the action's completion must not surface as a failure to the user.
         "git.cancelStackedAction" => {
-            let action_id = payload.get("actionId").and_then(Value::as_str).unwrap_or_default();
+            let action_id = payload
+                .get("actionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if action_id.is_empty() {
                 exit_failure(tx, &id, "cancelStackedAction requires an actionId");
                 return;
@@ -3028,37 +3413,45 @@ async fn handle_request(
             //
             // `Control::cancel` only moves running -> cancelling, so the state
             // BEFORE the call is what decides the answer.
-            let was_running = control.state(action_id).await.map(|s| s == "running").unwrap_or(false);
+            let was_running = control
+                .state(action_id)
+                .await
+                .map(|s| s == "running")
+                .unwrap_or(false);
             match control.cancel(action_id).await {
                 // `action: null` — this backend has no snapshot registry to
                 // report. Null is the contract's shape for "no record", and it is
                 // the truth here; fabricating an idle snapshot would be worse.
-                Ok(()) => {
-                    exit_success(tx, &id, json!({ "canceled": was_running, "action": Value::Null }))
-                }
+                Ok(()) => exit_success(
+                    tx,
+                    &id,
+                    json!({ "canceled": was_running, "action": Value::Null }),
+                ),
                 Err(e) => exit_failure(tx, &id, &e),
             }
         }
-        "sourceControl.lookupRepository" => match sourcecontrol::lookup_repository(&payload).await {
-            Ok(v) => exit_success(tx, &id, v),
-            Err(e) => exit_failure(tx, &id, &e),
-        },
-        "sourceControl.cloneRepository" => match sourcecontrol::clone_repository(&payload, &state.cwd).await {
-            Ok(v) => exit_success(tx, &id, v),
-            Err(e) => exit_failure(tx, &id, &e),
-        },
-        "sourceControl.publishRepository" => match sourcecontrol::publish_repository(&payload, &state.cwd).await {
-            Ok(v) => exit_success(tx, &id, v),
-            Err(e) => exit_failure(tx, &id, &e),
-        },
+        "sourceControl.lookupRepository" => {
+            match sourcecontrol::lookup_repository(&payload).await {
+                Ok(v) => exit_success(tx, &id, v),
+                Err(e) => exit_failure(tx, &id, &e),
+            }
+        }
+        "sourceControl.cloneRepository" => {
+            match sourcecontrol::clone_repository(&payload, &state.cwd).await {
+                Ok(v) => exit_success(tx, &id, v),
+                Err(e) => exit_failure(tx, &id, &e),
+            }
+        }
+        "sourceControl.publishRepository" => {
+            match sourcecontrol::publish_repository(&payload, &state.cwd).await {
+                Ok(v) => exit_success(tx, &id, v),
+                Err(e) => exit_failure(tx, &id, &e),
+            }
+        }
 
         "filesystem.browse" => match projects::browse(&payload, &state.cwd) {
             Ok(v) => exit_success(tx, &id, v),
-            Err((failure, message)) => exit_failure(
-                tx,
-                &id,
-                &format!("{message} ({failure})"),
-            ),
+            Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
         },
         // Launching an editor is a HOST process with a path argument, so it
         // takes the same admission as every other path-bearing RPC: without it a
@@ -3082,21 +3475,33 @@ async fn handle_request(
             }
         }
 
-        "projects.listEntries" | "projects.searchEntries" | "projects.readFile"
-        | "projects.writeFile" | "projects.searchContents" => {
+        "projects.listEntries"
+        | "projects.searchEntries"
+        | "projects.readFile"
+        | "projects.writeFile"
+        | "projects.searchContents" => {
             let cwd = match req_cwd(&payload, &state).await {
                 Ok(c) => c,
-                Err(e) => { exit_failure(tx, &id, &e); return; }
+                Err(e) => {
+                    exit_failure(tx, &id, &e);
+                    return;
+                }
             };
             match method {
-                "projects.listEntries" => exit_success(tx, &id, projects::list_entries(&cwd).await),
-                "projects.searchEntries" => {
-                    exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
-                }
-                "projects.searchContents" => match projects::search_contents(&cwd, &payload).await {
+                "projects.listEntries" => match projects::list_entries(&cwd).await {
                     Ok(v) => exit_success(tx, &id, v),
                     Err(e) => exit_failure(tx, &id, &e),
                 },
+                "projects.searchEntries" => match projects::search_entries(&cwd, &payload).await {
+                    Ok(v) => exit_success(tx, &id, v),
+                    Err(e) => exit_failure(tx, &id, &e),
+                },
+                "projects.searchContents" => {
+                    match projects::search_contents(&cwd, &payload).await {
+                        Ok(v) => exit_success(tx, &id, v),
+                        Err(e) => exit_failure(tx, &id, &e),
+                    }
+                }
                 m => {
                     let out = if m == "projects.readFile" {
                         projects::read_file(&cwd, &payload).await
@@ -3123,15 +3528,13 @@ async fn handle_request(
                 Err(e) => exit_failure(tx, &id, &e),
             }
         }
-        "review.getDiffFileContents" => {
-            match req_cwd(&payload, &state).await {
-                Ok(cwd) => match review::diff_file_contents(&cwd, &payload).await {
-                    Ok(v) => exit_success(tx, &id, v),
-                    Err(e) => exit_failure(tx, &id, &e),
-                },
+        "review.getDiffFileContents" => match req_cwd(&payload, &state).await {
+            Ok(cwd) => match review::diff_file_contents(&cwd, &payload).await {
+                Ok(v) => exit_success(tx, &id, v),
                 Err(e) => exit_failure(tx, &id, &e),
-            }
-        }
+            },
+            Err(e) => exit_failure(tx, &id, &e),
+        },
 
         // ── terminal RPCs over the ONE shared workspace PTY (#33) ──────────
         // Every terminalId resolves to the same Hearth Runner the agent's
@@ -3140,14 +3543,21 @@ async fn handle_request(
         // environment. They are different verbs on purpose: aliasing restart to
         // open left a "fresh" pane carrying the previous launch's exports (#98).
         "terminal.open" | "terminal.restart" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
             let (cwd, worktree) = match state
-                .admit_pane_dir(payload.get("cwd").and_then(Value::as_str), terminal::worktree_of(&payload).as_deref())
+                .admit_pane_dir(
+                    payload.get("cwd").and_then(Value::as_str),
+                    terminal::worktree_of(&payload).as_deref(),
+                )
                 .await
             {
                 Ok(v) => v,
@@ -3157,16 +3567,27 @@ async fn handle_request(
             let env = terminal::env_of(&payload);
             let restarting = method == "terminal.restart";
             let opened = if restarting {
-                state.terminals.restart(&owner, &term, cwd, worktree.as_deref(), &env).await
+                state
+                    .terminals
+                    .restart(&owner, &term, cwd, worktree.as_deref(), &env)
+                    .await
             } else {
-                state.terminals.open(&owner, &term, cwd, worktree.as_deref(), &env).await
+                state
+                    .terminals
+                    .open(&owner, &term, cwd, worktree.as_deref(), &env)
+                    .await
             };
             let pane = match opened {
                 Ok(p) => p,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.open: {e}")),
             };
-            if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
-                terminal::resize(&pane.runner, rows as u16, cols as u16).await;
+            if let (Some(cols), Some(rows)) = (
+                payload.get("cols").and_then(Value::as_u64),
+                payload.get("rows").and_then(Value::as_u64),
+            ) {
+                if let Err(e) = terminal::resize(&pane.runner, rows as u16, cols as u16).await {
+                    return exit_failure(tx, &id, &e);
+                }
             }
             let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
             if restarting {
@@ -3181,7 +3602,6 @@ async fn handle_request(
             exit_success(tx, &id, snap);
         }
         "terminal.write" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
@@ -3189,20 +3609,26 @@ async fn handle_request(
             let owner = terminal::TerminalOwner::parse(&payload);
             let runner = state.pane_runner(&owner, &term).await;
             if let Some(data) = payload.get("data").and_then(Value::as_str) {
-                terminal::write(&runner, data).await;
+                if let Err(e) = terminal::write(&runner, data).await {
+                    return exit_failure(tx, &id, &e);
+                }
             }
             exit_success(tx, &id, Value::Null);
         }
         "terminal.resize" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
             let runner = state.pane_runner(&owner, &term).await;
-            if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
-                terminal::resize(&runner, rows as u16, cols as u16).await;
+            if let (Some(cols), Some(rows)) = (
+                payload.get("cols").and_then(Value::as_u64),
+                payload.get("rows").and_then(Value::as_u64),
+            ) {
+                if let Err(e) = terminal::resize(&runner, rows as u16, cols as u16).await {
+                    return exit_failure(tx, &id, &e);
+                }
             }
             exit_success(tx, &id, Value::Null);
         }
@@ -3210,14 +3636,20 @@ async fn handle_request(
         // ends that pane. Neither is a no-op ack any more, and neither kills the
         // agent's shared shell (#105).
         "terminal.clear" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
             let runner = state.pane_runner(&owner, &term).await;
-            terminal::clear(&runner).await;
+            if let Err(e) = terminal::clear(&runner).await {
+                return exit_failure(tx, &id, &e);
+            }
             broadcast_terminal_event(
                 &state,
                 json!({ "type": "output", "threadId": thread, "terminalId": term,
@@ -3227,7 +3659,11 @@ async fn handle_request(
             exit_success(tx, &id, Value::Null);
         }
         "terminal.close" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
@@ -3244,14 +3680,21 @@ async fn handle_request(
         "terminal.attach" => {
             // stream: initial snapshot, then a full-repaint output on every screen
             // change, until the socket closes or the shell dies.
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
             let (cwd, worktree) = match state
-                .admit_pane_dir(payload.get("cwd").and_then(Value::as_str), terminal::worktree_of(&payload).as_deref())
+                .admit_pane_dir(
+                    payload.get("cwd").and_then(Value::as_str),
+                    terminal::worktree_of(&payload).as_deref(),
+                )
                 .await
             {
                 Ok(v) => v,
@@ -3265,14 +3708,24 @@ async fn handle_request(
                 .get("restartIfNotRunning")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let pane = match state.terminals.open(&owner, &term, cwd, worktree.as_deref(), &env).await {
+            let pane = match state
+                .terminals
+                .open(&owner, &term, cwd, worktree.as_deref(), &env)
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.attach: {e}")),
             };
             let pane = if restart_if_dead && terminal::is_dead(&pane.runner).await.is_some() {
-                match state.terminals.restart(&owner, &term, cwd, worktree.as_deref(), &env).await {
+                match state
+                    .terminals
+                    .restart(&owner, &term, cwd, worktree.as_deref(), &env)
+                    .await
+                {
                     Ok(p) => p,
-                    Err(e) => return exit_failure(tx, &id, &format!("terminal.attach restart: {e}")),
+                    Err(e) => {
+                        return exit_failure(tx, &id, &format!("terminal.attach restart: {e}"))
+                    }
                 }
             } else {
                 pane
@@ -3288,7 +3741,11 @@ async fn handle_request(
             // workspace default cwd/env permanently — the UI believes it opened
             // a worktree or subagent shell while the backend already decided
             // otherwise. Identity belongs to whoever supplies cwd/worktree/env.
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
@@ -3298,23 +3755,41 @@ async fn handle_request(
             // seam; the pump below carries every lifecycle frame to this
             // subscriber. Attach BEFORE snapshotting so no frame published
             // between the snapshot and the attach is lost.
-            match state.rt.topic_tail_skip_retained(TERMINAL_EVENTS_TOPIC).await {
-                Ok(tail) => spawn_thread_tail(tail, tx.clone(), id.clone(), TERMINAL_EVENTS_TOPIC.to_string()),
-                Err(e) => tracing::error!(%e, "terminal events tail attach failed"),
-            }
+            let tail = match state
+                .rt
+                .topic_tail_skip_retained(TERMINAL_EVENTS_TOPIC)
+                .await
+            {
+                Ok(tail) => tail,
+                Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalEvents: {e}")),
+            };
+            spawn_thread_tail(
+                tail,
+                tx.clone(),
+                id.clone(),
+                TERMINAL_EVENTS_TOPIC.to_string(),
+            );
             match state.terminals.get(&owner, &term).await {
                 Some(pane) => {
                     let started = terminal::pane_snapshot(&pane, &now_iso()).await;
-                    chunk(tx, &id, json!({ "type": "started", "threadId": thread, "terminalId": term, "snapshot": started }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({ "type": "started", "threadId": thread, "terminalId": term, "snapshot": started }),
+                    );
                     spawn_terminal_tail(pane.runner.clone(), tx.clone(), id.clone(), thread, term);
                 }
                 None => {
                     // Announce the subscription with no snapshot, then WAIT for
                     // the real open rather than manufacturing one.
-                    chunk(tx, &id, json!({
-                        "type": "started", "threadId": thread, "terminalId": term,
-                        "snapshot": Value::Null, "pending": true,
-                    }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "started", "threadId": thread, "terminalId": term,
+                            "snapshot": Value::Null, "pending": true,
+                        }),
+                    );
                     let terminals = state.terminals.clone();
                     let (tx2, id2) = (tx.clone(), id.clone());
                     let (owner2, thread2, term2) = (owner.clone(), thread.clone(), term.clone());
@@ -3324,10 +3799,14 @@ async fn handle_request(
                             .await
                         {
                             let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
-                            chunk(&tx2, &id2, json!({
-                                "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
-                                "snapshot": snap,
-                            }));
+                            chunk(
+                                &tx2,
+                                &id2,
+                                json!({
+                                    "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
+                                    "snapshot": snap,
+                                }),
+                            );
                             spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
                         }
                     });
@@ -3337,7 +3816,11 @@ async fn handle_request(
         "subscribeTerminalMetadata" => {
             // EVERY pane open for this thread, not a hard-coded single id: a
             // multi-pane UI lists what actually exists (#118).
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread = payload
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // the agent's shell is always listed — it is the pane a human most
             // wants to find, and it exists whether or not anyone opened it.
             // This subscription is thread-scoped by contract: it projects the
@@ -3346,23 +3829,27 @@ async fn handle_request(
             // would put them in the parent's drawer, which is the ownership
             // boundary the finding is about.
             let thread_owner = terminal::TerminalOwner::thread(&thread);
-            let _ = state.terminals.open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[]).await;
-            let now = now_iso();
-            let mut rows = Vec::new();
-            for pane in state.terminals.list(&thread_owner).await {
-                rows.push(terminal::pane_summary(&pane, &now).await);
-            }
-            chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
             // Metadata fanout on the SDK's generic named-topic seam, scoped
             // per thread so a subscriber only wakes for its own panes.
             // Suppress the retained frame (the snapshot above already covered
             // it) then follow live pane events through the same pump the
             // shell/config tails use.
             let topic = terminal_meta_topic(&thread);
-            match state.rt.topic_tail_skip_retained(&topic).await {
-                Ok(tail) => spawn_thread_tail(tail, tx.clone(), id.clone(), topic.clone()),
-                Err(e) => tracing::error!(%e, %thread, "terminal metadata tail attach failed"),
+            let tail = match state.rt.topic_tail_skip_retained(&topic).await {
+                Ok(tail) => tail,
+                Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}")),
+            };
+            let _ = state
+                .terminals
+                .open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[])
+                .await;
+            let now = now_iso();
+            let mut rows = Vec::new();
+            for pane in state.terminals.list(&thread_owner).await {
+                rows.push(terminal::pane_summary(&pane, &now).await);
             }
+            chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
+            spawn_thread_tail(tail, tx.clone(), id.clone(), topic.clone());
             spawn_metadata_tail(state.terminals.clone(), tx.clone(), id.clone(), thread);
         }
 
@@ -3398,7 +3885,11 @@ async fn handle_request(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(%e, "getArchivedShellSnapshot: project store unreadable");
-                    exit_failure(tx, &id, &format!("getArchivedShellSnapshot: project store unreadable: {e}"));
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("getArchivedShellSnapshot: project store unreadable: {e}"),
+                    );
                     return;
                 }
             };
@@ -3409,22 +3900,33 @@ async fn handle_request(
                 .into_iter()
                 .filter(|t| !t.get("archivedAt").map(Value::is_null).unwrap_or(true))
                 .collect();
-            exit_success(tx, &id, json!({
-                "snapshotSequence": mark,
-                "projects": projects,
-                "threads": threads,
-                "updatedAt": now_iso(),
-            }));
+            exit_success(
+                tx,
+                &id,
+                json!({
+                    "snapshotSequence": mark,
+                    "projects": projects,
+                    "threads": threads,
+                    "updatedAt": now_iso(),
+                }),
+            );
         }
         "orchestration.dispatchCommand" => {
             let command = payload.get("input").cloned().unwrap_or(payload.clone());
-            tracing::info!(cmd = command.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
-                thread_id = command.get("threadId").and_then(|t| t.as_str()).unwrap_or("-"), "dispatch");
+            tracing::info!(
+                cmd = command.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
+                thread_id = command
+                    .get("threadId")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("-"),
+                "dispatch"
+            );
             // A turn's model is resolved BEFORE the command is acked, because a
             // selection that cannot route must not become a turn at all: acking
             // and then substituting the default is how the thread ends up
             // showing one provider while another one ran (#50).
-            let model = if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start") {
+            let model = if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start")
+            {
                 // #77 / packet EK: attachments in the command must not be
                 // dropped silently. This runtime does not yet forward image
                 // or file bytes to any provider — the ONLY current provider
@@ -3483,7 +3985,11 @@ async fn handle_request(
                     return;
                 }
                 let sel = command.get("modelSelection").cloned().unwrap_or(json!({}));
-                let resolved = model_from_selection(&*state.catalog.read().await, &sel, &state.default_model().await);
+                let resolved = model_from_selection(
+                    &*state.catalog.read().await,
+                    &sel,
+                    &state.default_model().await,
+                );
                 match resolved {
                     Ok(m) => Some(m),
                     Err(e) => {
@@ -3506,7 +4012,11 @@ async fn handle_request(
             let seq = match state.rt.next_command_sequence().await {
                 Ok(s) => s,
                 Err(e) => {
-                    exit_failure(tx, &id, &format!("no durable sequence for this dispatch: {e}"));
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("no durable sequence for this dispatch: {e}"),
+                    );
                     return;
                 }
             };
@@ -3525,7 +4035,8 @@ async fn handle_request(
             //   request, one terminal.
             //
             // So: accepted-ack for the async lane, applied-ack for the rest.
-            let async_lane = command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
+            let async_lane =
+                command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
             if async_lane {
                 exit_success(tx, &id, json!({ "sequence": seq }));
             }
@@ -3543,11 +4054,14 @@ async fn handle_request(
                 // foreground interrupt for a bash command already running in
                 // the shared PTY.
                 Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
-                    let thread_id =
-                        command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let thread_id = command
+                        .get("threadId")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // foreground-only: this never touches the shell itself, so a
                     // stop cannot kill the session's PTY out from under it.
-                    let shell_out = state.terminal.interrupt().await;
+                    let shell_interrupt = terminal::interrupt(&state.terminal).await;
                     let stopped = if kind == "thread.session.stop" {
                         state.rt.stop(&thread_id).await
                     } else {
@@ -3555,7 +4069,7 @@ async fn handle_request(
                     };
                     match stopped {
                         Ok(sessions) => tracing::info!(
-                            %thread_id, %kind, sessions = sessions.len(), %shell_out, "stop dispatched"
+                            %thread_id, %kind, sessions = sessions.len(), shell_interrupt = ?shell_interrupt, "stop dispatched"
                         ),
                         Err(e) => tracing::error!(%thread_id, %kind, %e, "stop failed"),
                     }
@@ -3566,8 +4080,10 @@ async fn handle_request(
                 // every edit the user just rejected.
                 Some("thread.checkpoint.revert") => {
                     let thread_id = thread_id_of(&command);
-                    let turn_count =
-                        command.get("turnCount").and_then(Value::as_i64).unwrap_or(0);
+                    let turn_count = command
+                        .get("turnCount")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     // Tell the thread the revert was REQUESTED before doing it:
                     // restoring a worktree takes git time, and a panel with no
                     // acknowledgement invites a second click.
@@ -3626,9 +4142,10 @@ async fn handle_request(
                             return;
                         }
                     };
-                    let Some(existing) = current.into_iter().find(|p|
-                        p.get("id").and_then(Value::as_str) == Some(project_id.as_str())
-                    ) else {
+                    let Some(existing) = current
+                        .into_iter()
+                        .find(|p| p.get("id").and_then(Value::as_str) == Some(project_id.as_str()))
+                    else {
                         // #400: unknown projectId. Was falling through to the
                         // generic Exit(Success){sequence} — an ack for a
                         // mutation that did NOTHING. That's the same false-
@@ -3695,8 +4212,11 @@ async fn handle_request(
                 // nothing here has to remember which session asked — that map
                 // is what the SDK seam removed.
                 Some("thread.approval.respond") => {
-                    let request_id =
-                        command.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
+                    let request_id = command
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     // `decision` is an ENUM: accept | acceptForSession | decline
                     // | cancel. Reading a boolean `approved` and defaulting to
                     // false turned every real acceptance into a denial, which
@@ -3715,7 +4235,10 @@ async fn handle_request(
                     // looking at, and the turn they answered stays parked. Fail
                     // closed and tell the client, which keeps the banner up
                     // with an error instead of clearing it over a lost answer.
-                    let routed = match (parts.len(), parts.get(1).and_then(|t| t.parse::<i64>().ok())) {
+                    let routed = match (
+                        parts.len(),
+                        parts.get(1).and_then(|t| t.parse::<i64>().ok()),
+                    ) {
                         (3, Some(turn)) => Some((parts[0].to_string(), turn, parts[2].to_string())),
                         _ => None,
                     };
@@ -3723,18 +4246,28 @@ async fn handle_request(
                         None => {
                             tracing::error!(%request_id, "malformed approval requestId — refusing to route");
                             publish_approval_failed(
-                                &state, &thread_id_of(&command), &request_id,
+                                &state,
+                                &thread_id_of(&command),
+                                &request_id,
                                 "this approval could not be routed (malformed request id)",
                             )
                             .await;
                         }
                         Some((session, turn, call_id)) => {
-                            match state.rt.respond_to_approval(&session, turn, &call_id, allow).await {
+                            match state
+                                .rt
+                                .respond_to_approval(&session, turn, &call_id, allow)
+                                .await
+                            {
                                 Ok(_) => {
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     publish_approval_resolved(
-                                        &state, &thread_id_of(&command), &request_id, &decision, allow,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
+                                        &decision,
+                                        allow,
                                     )
                                     .await;
                                 }
@@ -3745,7 +4278,9 @@ async fn handle_request(
                                     // request stays pending and carries why.
                                     tracing::error!(%request_id, %e, "approval response failed");
                                     publish_approval_failed(
-                                        &state, &thread_id_of(&command), &request_id,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
                                         &format!("the approval could not be delivered: {e}"),
                                     )
                                     .await;
@@ -3755,8 +4290,11 @@ async fn handle_request(
                     }
                 }
                 Some("thread.user-input.respond") => {
-                    let request_id =
-                        command.get("requestId").and_then(Value::as_str).unwrap_or("").to_string();
+                    let request_id = command
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     // the contract sends an ANSWERS MAP, not a `text` field.
                     // Reading `text` meant every normal UI submission steered
                     // the run with an empty string.
@@ -3769,17 +4307,38 @@ async fn handle_request(
                             keys.iter()
                                 .map(|k| {
                                     let v = &m[*k];
-                                    let text = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                                    if keys.len() == 1 { text } else { format!("{k}: {text}") }
+                                    let text = v
+                                        .as_str()
+                                        .map(String::from)
+                                        .unwrap_or_else(|| v.to_string());
+                                    if keys.len() == 1 {
+                                        text
+                                    } else {
+                                        format!("{k}: {text}")
+                                    }
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         })
-                        .or_else(|| command.get("text").and_then(Value::as_str).map(String::from))
-                        .or_else(|| command.pointer("/message/text").and_then(Value::as_str).map(String::from))
+                        .or_else(|| {
+                            command
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(String::from)
+                        })
+                        .or_else(|| {
+                            command
+                                .pointer("/message/text")
+                                .and_then(Value::as_str)
+                                .map(String::from)
+                        })
                         .unwrap_or_default();
                     // The requestId for user input is the session id itself.
-                    let session = request_id.split('|').next().unwrap_or(&request_id).to_string();
+                    let session = request_id
+                        .split('|')
+                        .next()
+                        .unwrap_or(&request_id)
+                        .to_string();
                     match state.rt.respond_to_user_input(&session, &text).await {
                         Ok(()) => {
                             // Close the composer's pending state (#317). Only on
@@ -3796,7 +4355,9 @@ async fn handle_request(
                             // an answer the agent never received.
                             tracing::error!(%request_id, %e, "user-input response failed");
                             publish_user_input_failed(
-                                &state, &thread_id_of(&command), &session,
+                                &state,
+                                &thread_id_of(&command),
+                                &session,
                                 &format!("your answer could not be delivered: {e}"),
                             )
                             .await;
@@ -3811,7 +4372,6 @@ async fn handle_request(
                 exit_success(tx, &id, json!({ "sequence": seq }));
             }
         }
-
 
         // Pull-request surface (#111 / packet AB capability rule). This
         // runtime has no PR CLI wired (no gh/glab/az/bb, no host
@@ -3830,11 +4390,13 @@ async fn handle_request(
                 "_tag": "PullRequestUnavailableError",
                 "reason": "provider-unsupported",
             });
-            let op_failure = |op: &str| json!({
-                "_tag": "PullRequestOperationError",
-                "operation": op,
-                "detail": "This runtime does not have a pull-request provider configured.",
-            });
+            let op_failure = |op: &str| {
+                json!({
+                    "_tag": "PullRequestOperationError",
+                    "operation": op,
+                    "detail": "This runtime does not have a pull-request provider configured.",
+                })
+            };
             match m {
                 "pullRequests.list"
                 | "pullRequests.listStats"
@@ -3863,7 +4425,10 @@ async fn handle_request(
         // masking Success(null): a missing mutation/subscription surfaces as a
         // visible defect instead of a silent reducer inconsistency later.
         other => {
-            tracing::warn!(method = other, "ws: unsupported RPC — returning explicit failure");
+            tracing::warn!(
+                method = other,
+                "ws: unsupported RPC — returning explicit failure"
+            );
             exit_failure(tx, &id, &format!("unsupported method: {other}"));
         }
     }
@@ -3877,14 +4442,22 @@ async fn handle_request(
 /// (including a guaranteed `TurnEnded`) on the durable bus (#5/#14/#15/#16/#17).
 fn run_turn(command: Value, model: ModelRef, state: AppState) {
     tokio::spawn(async move {
-        let thread_id = command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let thread_id = command
+            .get("threadId")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         // Turn admission is NOT held here. `ThreadRuntime::run_turn_*` takes a
         // durable per-thread claim, so a second dispatch is refused whether it
         // comes from this process, another process on the same data dir, or a
         // re-dispatch after this one crashed mid-turn (#300). A process-local
         // mutex map enforced none of those, and keeping one as a "fast path"
         // would just be a second admission mechanism to disagree with the first.
-        let text = command.pointer("/message/text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let text = command
+            .pointer("/message/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         // The id the client already rendered optimistically. Handing it to the
         // runtime is what makes the durable prompt row RECONCILE with what the
         // UI is showing instead of appearing beside it as a second message.
@@ -3943,7 +4516,12 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
             command
                 .get(key)
                 .and_then(Value::as_str)
-                .or_else(|| stored.as_ref().and_then(|t| t.get(key)).and_then(Value::as_str))
+                .or_else(|| {
+                    stored
+                        .as_ref()
+                        .and_then(|t| t.get(key))
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or(fallback)
                 .to_string()
         };
@@ -3974,7 +4552,11 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
             use agent_sdk_provider::instance::decode_option_selections;
             command
                 .pointer("/modelSelection/options")
-                .or_else(|| stored.as_ref().and_then(|t| t.pointer("/modelSelection/options")))
+                .or_else(|| {
+                    stored
+                        .as_ref()
+                        .and_then(|t| t.pointer("/modelSelection/options"))
+                })
                 .filter(|v| !v.is_null())
                 .map(decode_option_selections)
                 .unwrap_or_default()
@@ -3983,7 +4565,11 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
             name: "t3code".into(),
             instructions,
             model,
-            tools: vec![], ask_tools, subagents: vec![], mcp_servers: vec![], labels: Default::default(),
+            tools: vec![],
+            ask_tools,
+            subagents: vec![],
+            mcp_servers: vec![],
+            labels: Default::default(),
             options,
             cwd: worktree,
         };
@@ -4028,7 +4614,11 @@ fn spawn_terminal_tail(
 ) {
     tokio::spawn(async move {
         let send = |v: Value| {
-            tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [v] }).to_string(), None))
+            tx.send((
+                json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [v] })
+                    .to_string(),
+                None,
+            ))
         };
         // Subscribe BEFORE the first read, so an edge landing between the two is
         // still pending on the watch and wakes the first `changed()` instead of
@@ -4042,13 +4632,21 @@ fn spawn_terminal_tail(
             // repaints it cannot see.
             if cur != last {
                 last = cur.clone();
-                if send(terminal::output_event(&thread_id, &term, terminal::repaint(&cur))).is_err() {
+                if send(terminal::output_event(
+                    &thread_id,
+                    &term,
+                    terminal::repaint(&cur),
+                ))
+                .is_err()
+                {
                     return;
                 }
             }
             if let Some(code) = terminal::is_dead(&runner).await {
-                let _ = send(json!({ "type": "exited", "threadId": thread_id, "terminalId": term,
-                    "exitCode": code, "exitSignal": Value::Null }));
+                let _ = send(
+                    json!({ "type": "exited", "threadId": thread_id, "terminalId": term,
+                    "exitCode": code, "exitSignal": Value::Null }),
+                );
                 return;
             }
         }
@@ -4090,7 +4688,9 @@ fn spawn_metadata_tail(
             // Holding `panes` for the length of the iteration also keeps each
             // runner alive across the wait, so a watch cannot end underneath us
             // and turn one closed pane into a terminated stream.
-            let panes = terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await;
+            let panes = terminals
+                .list(&terminal::TerminalOwner::thread(&thread_id))
+                .await;
             let mut watches: Vec<hearth::ScreenWatch> =
                 panes.iter().map(|p| terminal::watch(&p.runner)).collect();
 
@@ -4106,13 +4706,22 @@ fn spawn_metadata_tail(
             // only emit when something a client renders actually moved.
             let key: Value = rows
                 .iter()
-                .map(|s| json!({ "id": s["terminalId"], "status": s["status"],
-                    "sub": s["hasRunningSubprocess"], "label": s["label"], "exit": s["exitCode"] }))
+                .map(|s| {
+                    json!({ "id": s["terminalId"], "status": s["status"],
+                    "sub": s["hasRunningSubprocess"], "label": s["label"], "exit": s["exitCode"] })
+                })
                 .collect();
             if last.as_ref() != Some(&key) {
                 last = Some(key);
                 let ev = json!({ "type": "snapshot", "terminals": rows });
-                if tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None)).is_err() {
+                if tx
+                    .send((
+                        json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] })
+                            .to_string(),
+                        None,
+                    ))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -4122,9 +4731,8 @@ fn spawn_metadata_tail(
                 // client is still attached and a pane may yet open.
                 membership.await;
             } else {
-                let edges = futures::future::select_all(
-                    watches.iter_mut().map(|w| Box::pin(w.changed())),
-                );
+                let edges =
+                    futures::future::select_all(watches.iter_mut().map(|w| Box::pin(w.changed())));
                 tokio::select! {
                     _ = membership => {}
                     _ = edges => {}
@@ -4141,8 +4749,11 @@ fn spawn_metadata_tail(
 /// rather than read here because this is called while the catalog lock is held
 /// and the store read is `async`.
 fn server_config(catalog: &Catalog, custom: &[keybindings::Rule]) -> Value {
-    let cwd = std::env::var("T3CODE_WORKSPACE")
-        .unwrap_or_else(|_| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into()));
+    let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into())
+    });
     json!({
         "environment": { "environmentId": "local", "label": "Local (Rust)", "platform": { "os": "darwin", "arch": "arm64" }, "serverVersion": "0.0.0", "capabilities": {} },
         "auth": { "policy": "unsafe-no-auth", "bootstrapMethods": [], "sessionMethods": [], "sessionCookieName": "t3_session" },
@@ -4168,19 +4779,30 @@ async fn asset_http(
     State(state): State<AppState>,
     axum::extract::Path((token, _name)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    let path = match assets::verify(&token, &state.assets_key, chrono::Utc::now().timestamp_millis())
-    {
+    let path = match assets::verify(
+        &token,
+        &state.assets_key,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(%e, "asset: refused");
-            return (axum::http::StatusCode::FORBIDDEN, [(axum::http::header::CONTENT_TYPE, "text/plain")], Vec::from(e)).into_response();
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                Vec::from(e),
+            )
+                .into_response();
         }
     };
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             axum::http::StatusCode::OK,
             [
-                (axum::http::header::CONTENT_TYPE, assets::content_type(&path)),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    assets::content_type(&path),
+                ),
                 // The URL is already single-use-ish (it expires); caching it for
                 // its own lifetime is what keeps a scrolling chat from refetching
                 // every image on every repaint.
@@ -4191,7 +4813,12 @@ async fn asset_http(
             .into_response(),
         Err(e) => {
             tracing::warn!(%e, ?path, "asset: read failed");
-            (axum::http::StatusCode::NOT_FOUND, [(axum::http::header::CONTENT_TYPE, "text/plain")], Vec::from("asset not found")).into_response()
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                Vec::from("asset not found"),
+            )
+                .into_response()
         }
     }
 }
@@ -4211,7 +4838,6 @@ async fn capture_http(method: Method, uri: Uri, body: Bytes) -> impl IntoRespons
     };
     Json(json)
 }
-
 
 // Tests live in their own files (#403). `server_main.rs` was 9,977 lines,
 // 5,720 of them test code — which is what made it impossible to review the
