@@ -258,6 +258,7 @@ fn checkpoint_thread(id: &str) -> Value {
         "id": id,
         "projectId": "p-workspace",
         "title": id,
+        "runtimeMode": "full-access",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     })
@@ -1934,7 +1935,22 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
 #[tokio::test]
 async fn asset_urls_are_minted_signed_and_confined() {
     let (state, dir) = test_state().await;
-    std::fs::write(dir.join("logo.png"), b"\x89PNG").unwrap();
+    let worktree = dir.join("asset-worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("logo.png"), b"\x89PNG").unwrap();
+    let worktree_s = worktree.to_string_lossy().into_owned();
+    let row = agent_sdk_shell::ThreadRecord::new(
+        "t-1",
+        "p-workspace",
+        "asset thread",
+        json!({"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"}),
+        agent_sdk_shell::RuntimeMode::FullAccess,
+        &now_iso(),
+    )
+    .on_worktree(Some(worktree_s.clone()), Some("asset-thread".into()))
+    .project(json!({ "session": Value::Null }))
+    .unwrap();
+    state.rt.save_thread(&row).await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "assets.createUrl", json!({
@@ -1951,6 +1967,26 @@ async fn asset_urls_are_minted_signed_and_confined() {
     let served = assets::verify(token, &state.assets_key, chrono::Utc::now().timestamp_millis())
         .expect("the URL this server minted verifies against its own key");
     assert_eq!(std::fs::read(served).unwrap(), b"\x89PNG");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "assets.createUrl", json!({
+        "resource": {"_tag": "workspace-file", "path": "logo.png"},
+    })).await;
+    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a workspace-file asset without threadId must not fall back to cwd: {exit}"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "assets.createUrl", json!({
+        "resource": {"_tag": "workspace-file", "threadId": "stale-or-other-thread", "path": "logo.png"},
+    })).await;
+    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a workspace-file asset for an unknown thread must not fall back to cwd: {exit}"
+    );
 
     // and an escape is refused, so no signature is ever issued for it
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5037,7 +5073,9 @@ async fn a_settled_approval_is_a_replayable_resolved_activity() {
     state.rt.save_thread(&thread).await.unwrap();
     let before = state.rt.current_sequence().await;
 
-    publish_approval_resolved(&state, "t-appr", "sess|0|call-1", "accept", true).await;
+    publish_approval_resolved(&state, "t-appr", "sess|0|call-1", "accept", true)
+        .await
+        .unwrap();
 
     let replayed = state.rt.events_after("t-appr", before, 100).await.unwrap();
     let ev = replayed
@@ -5080,7 +5118,7 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
     state.rt.save_thread(&thread).await.unwrap();
     let before = state.rt.current_sequence().await;
 
-    publish_user_input_resolved(&state, "t-ui", "sess-9").await;
+    publish_user_input_resolved(&state, "t-ui", "sess-9").await.unwrap();
 
     let replayed = state.rt.events_after("t-ui", before, 100).await.unwrap();
     let ev = replayed
@@ -5096,6 +5134,143 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
     assert_eq!(
         activity["id"], "user-input:sess-9",
         "same row id as the request activity: {activity}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn drop_thread_event_log(dir: &std::path::Path) {
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE thread_event", vec![]).await.unwrap();
+}
+
+/// PROOF (#103): settlement projection is part of applying the command.
+///
+/// A malformed approval response takes the failure-mirror branch. That mirror
+/// is not optional telemetry: if the durable thread event cannot be recorded,
+/// the client must NOT receive the generic applied `Success { sequence }`.
+#[tokio::test]
+async fn approval_failure_projection_failure_is_not_reported_as_applied() {
+    let (state, dir) = test_state().await;
+    state
+        .rt
+        .save_thread(&json!({
+            "runtimeMode": "full-access",
+            "id": "t-appr-fail",
+            "projectId": "p-workspace",
+            "title": "approval fail",
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    drop_thread_event_log(&dir).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.approval.respond",
+            "threadId": "t-appr-fail",
+            "requestId": "not-a-session-turn-call",
+            "decision": "accept",
+        }}),
+    )
+    .await;
+
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "failed approval projection must not fall through to applied success: {exit}"
+    );
+    let msg = exit["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("projection") || msg.contains("thread_event"),
+        "failure names the lifecycle projection/storage failure: {exit}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PROOF (#103): a successfully delivered answer is still not "applied" until
+/// the resolved lifecycle activity is durably recorded for replay.
+#[tokio::test]
+async fn user_input_resolved_projection_failure_is_not_reported_as_applied() {
+    let (state, dir) = test_state().await;
+    state
+        .rt
+        .save_thread(&json!({
+            "runtimeMode": "full-access",
+            "id": "t-ui-fail",
+            "projectId": "p-workspace",
+            "title": "ui fail",
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    let binding = SessionBinding {
+        thread_id: "t-ui-fail".into(),
+        provider_instance_id: "claude_resume:test".into(),
+        model_key: "k".into(),
+    };
+    let def = AgentDefinition {
+        name: "t3code".into(),
+        instructions: "".into(),
+        model: ModelRef::ClaudeResume { model: "test".into() },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
+        cwd: None,
+    };
+    let session = state.rt.session_for(&binding, def).await.unwrap();
+    state
+        .rt
+        .record_user_input_request(
+            "t-ui-fail",
+            &session,
+            "turn-1",
+            "answer me",
+            None,
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    drop_thread_event_log(&dir).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.user-input.respond",
+            "threadId": "t-ui-fail",
+            "requestId": session,
+            "answers": { "answer": "yes" },
+        }}),
+    )
+    .await;
+
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "resolved user-input projection must not fall through to applied success: {exit}"
+    );
+    let msg = exit["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("lifecycle projection") || msg.contains("thread_event"),
+        "failure names the lifecycle projection/storage failure: {exit}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5476,7 +5651,7 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     // "v2" — not "v0". Under the inversion this restored v0 and threw away
     // two turns of work.
     state.rt.save_thread(&thread_row_ck("t-order")).await.unwrap();
-    revert_checkpoint(&state, "t-order", 1).await;
+    revert_checkpoint(&state, "t-order", 1).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap().trim(),
         "v2",
@@ -5669,15 +5844,16 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
             .expect("checkpoint at the turn boundary");
     }
 
-    // OUT OF BAND: a real `sed -i`, not a runtime write. Nothing told the
-    // backend this happened.
-    let out = std::process::Command::new("sed")
-        .args(["-i", "", "s/before/after/"])
-        .arg(&file)
+    // OUT OF BAND: a real shell edit, not a runtime write. Nothing told the
+    // backend this happened. Avoid `sed -i`: BSD and GNU sed disagree on its
+    // backup-extension syntax.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sed 's/before/after/' oob.txt > oob.next && mv oob.next oob.txt")
         .current_dir(&state.cwd)
         .output()
-        .expect("sed");
-    assert!(out.status.success(), "sed failed: {out:?}");
+        .expect("out-of-band edit");
+    assert!(out.status.success(), "out-of-band edit failed: {out:?}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
 
     // It is in the summary, because cairn diffs the WORKTREE and not a
@@ -5698,7 +5874,7 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     );
 
     // And the revert round-trips from the new process.
-    revert_checkpoint(&state2, "t-oob", 1).await;
+    revert_checkpoint(&state2, "t-oob", 1).await.unwrap();
     for _ in 0..50 {
         if std::fs::read_to_string(&file).unwrap_or_default() == "before\n" {
             break;
@@ -5772,7 +5948,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 
     // ...AND the revert leaves them alone. This is the assertion a display
     // filter cannot pass.
-    revert_checkpoint(&state, "t-scope", 1).await;
+    revert_checkpoint(&state, "t-scope", 1).await.unwrap();
     for _ in 0..50 {
         if std::fs::read_to_string(&src).unwrap_or_default() == "v1\n" {
             break;
@@ -5793,6 +5969,131 @@ fn thread_row_ck(id: &str) -> Value {
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
+}
+
+async fn root_checkpointed_thread(state: &AppState, thread_id: &str, filename: &str) -> std::path::PathBuf {
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        std::process::Command::new("git").args(&args).current_dir(&state.cwd).output().unwrap();
+    }
+    let file = std::path::Path::new(&state.cwd).join(filename);
+    std::fs::write(&file, "before\n").unwrap();
+    state.rt.save_thread(&thread_row_ck(thread_id)).await.unwrap();
+    checkpoint_turn_start(state, &state.cwd, "turn-1").await;
+    std::fs::write(&file, "after\n").unwrap();
+    file
+}
+
+async fn get_turn_diff_exit(state: &AppState, thread_id: &str) -> Value {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        state,
+        &tx,
+        "orchestration.getTurnDiff",
+        json!({ "input": { "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1 } }),
+    )
+    .await;
+    drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("getTurnDiff exit")
+}
+
+async fn revert_dispatch_exit(state: &AppState, thread_id: &str) -> Value {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.checkpoint.revert",
+            "threadId": thread_id,
+            "turnCount": 1,
+        }}),
+    )
+    .await;
+    drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("dispatch exit")
+}
+
+#[tokio::test]
+async fn diff_and_revert_refuse_corrupt_thread_mapping_without_touching_workspace() {
+    let (state, _d) = test_state().await;
+    let file = root_checkpointed_thread(&state, "t-corrupt-map", "corrupt-map.txt").await;
+    state
+        .rt
+        .store()
+        .db()
+        .execute(
+            "UPDATE threads SET json = ? WHERE id = ?",
+            vec![json!("{not-json"), json!("t-corrupt-map")],
+        )
+        .await
+        .unwrap();
+
+    let diff = get_turn_diff_exit(&state, "t-corrupt-map").await;
+    assert_eq!(diff["exit"]["_tag"], "Failure", "corrupt mapping must fail diff: {diff}");
+    assert_eq!(
+        diff["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationGetTurnDiffError"
+    );
+    assert!(
+        diff["exit"]["cause"][0]["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("thread worktree unavailable"),
+        "{diff}"
+    );
+
+    let reverted = revert_dispatch_exit(&state, "t-corrupt-map").await;
+    assert_eq!(reverted["exit"]["_tag"], "Failure", "corrupt mapping must fail revert: {reverted}");
+    assert_eq!(
+        reverted["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationDispatchCommandError"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "after\n",
+        "revert must not fall back to state.cwd when the thread mapping is corrupt"
+    );
+}
+
+#[tokio::test]
+async fn diff_and_revert_refuse_stale_thread_id_without_touching_workspace() {
+    let (state, _d) = test_state().await;
+    let file = root_checkpointed_thread(&state, "t-stale-map", "stale-map.txt").await;
+    state
+        .rt
+        .store()
+        .db()
+        .execute("DELETE FROM threads WHERE id = ?", vec![json!("t-stale-map")])
+        .await
+        .unwrap();
+
+    let diff = get_turn_diff_exit(&state, "t-stale-map").await;
+    assert_eq!(diff["exit"]["_tag"], "Failure", "stale thread must fail diff: {diff}");
+    assert_eq!(
+        diff["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationGetTurnDiffError"
+    );
+    assert!(
+        diff["exit"]["cause"][0]["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown thread"),
+        "{diff}"
+    );
+
+    let reverted = revert_dispatch_exit(&state, "t-stale-map").await;
+    assert_eq!(reverted["exit"]["_tag"], "Failure", "stale thread must fail revert: {reverted}");
+    assert_eq!(
+        reverted["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationDispatchCommandError"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "after\n",
+        "revert must not fall back to state.cwd for a stale thread id"
+    );
 }
 
 /// #349: a thread whose `worktreePath` is NOT `state.cwd` must checkpoint
@@ -5854,7 +6155,8 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
         revert_checkpoint(&state, "t-wt", 1),
     )
     .await
-    .expect("revert_checkpoint must not hang");
+    .expect("revert_checkpoint must not hang")
+    .unwrap();
 
     let workspace_after = std::fs::read_to_string(&workspace_file).unwrap();
     let worktree_after = std::fs::read_to_string(&worktree_file).unwrap();
@@ -6620,7 +6922,8 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
         revert_checkpoint(&state, "t-rev", 1),
     )
     .await
-    .expect("revert_checkpoint must not hang");
+    .expect("revert_checkpoint must not hang")
+    .unwrap();
 
     // 1. FILES — the half that already worked.
     assert_eq!(
