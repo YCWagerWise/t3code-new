@@ -180,8 +180,8 @@ pub async fn resize(runner: &Runner, rows: u16, cols: u16) {
 /// agent has a bash command running (Ctrl-C to the foreground, never the harness
 /// itself, since hearth owns the process group). This is what a stop control
 /// reaches (#52), distinct from `terminal.close` which only closes a pane.
-pub async fn interrupt(runner: &Runner) {
-    let _ = runner.interrupt().await;
+pub async fn interrupt(runner: &Runner) -> String {
+    runner.interrupt().await
 }
 
 /// `terminal.clear` → empty the pane's screen, keeping its shell (cwd, env and
@@ -287,6 +287,21 @@ pub enum TerminalOwner {
     ChildSession { session_id: String, worktree_path: Option<String> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalOwnerError {
+    MissingOwner,
+}
+
+impl std::fmt::Display for TerminalOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TerminalOwnerError::MissingOwner => {
+                write!(f, "terminal owner requires a non-empty sessionId or threadId")
+            }
+        }
+    }
+}
+
 impl TerminalOwner {
     /// Read the owner out of a request.
     ///
@@ -295,21 +310,33 @@ impl TerminalOwner {
     /// thread as authoritative there would silently hand it the parent's pane —
     /// the exact "wrong ownership boundary" #149 describes, and it would look
     /// like it worked.
-    pub fn parse(input: &Value) -> TerminalOwner {
+    pub fn parse(input: &Value) -> Result<TerminalOwner, TerminalOwnerError> {
         let session = input.get("sessionId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         match session {
-            Some(session_id) => TerminalOwner::ChildSession {
+            Some(session_id) => Ok(TerminalOwner::ChildSession {
                 session_id: session_id.to_string(),
                 worktree_path: worktree_of(input),
-            },
-            None => TerminalOwner::Thread {
-                thread_id: input
+            }),
+            None => {
+                let thread_id = input
                     .get("threadId")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            },
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or(TerminalOwnerError::MissingOwner)?;
+                Ok(TerminalOwner::Thread { thread_id: thread_id.to_string() })
+            }
         }
+    }
+
+    pub fn parse_thread(input: &Value) -> Result<TerminalOwner, TerminalOwnerError> {
+        let thread_id = input
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or(TerminalOwnerError::MissingOwner)?;
+        Ok(TerminalOwner::Thread { thread_id: thread_id.to_string() })
     }
 
     pub fn thread(thread_id: &str) -> TerminalOwner {

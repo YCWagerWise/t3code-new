@@ -562,7 +562,11 @@ fn on_path(binary: &str) -> bool {
 /// The error distinguishes "this environment has no such editor installed" from
 /// "the launch itself failed" — a user who is told only "could not open" cannot
 /// tell whether to install something or to look at their config.
-pub fn open_in_editor(input: &Value, default_cwd: &str) -> Result<(), String> {
+pub async fn open_in_editor(
+    input: &Value,
+    default_cwd: &str,
+    runner: &hearth::Runner,
+) -> Result<String, String> {
     let cwd = input.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(default_cwd);
     let editor = input.get("editor").and_then(Value::as_str).unwrap_or("");
     let candidates = editor_commands(editor);
@@ -575,14 +579,8 @@ pub fn open_in_editor(input: &Value, default_cwd: &str) -> Result<(), String> {
             candidates.join(", ")
         ));
     };
-    std::process::Command::new(binary)
-        .arg(cwd)
-        // Detached: the editor outlives this request, and its output is not ours.
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
+    agent_sdk_exec::launch_host_process(runner, binary, &[cwd])
+        .await
         .map_err(|e| format!("failed to launch {binary}: {e}"))
 }
 

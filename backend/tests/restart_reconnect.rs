@@ -135,7 +135,7 @@ async fn a_restart_rehydrates_the_thread_list_history_and_session() {
         rt.save_thread(&thread_row("thread-1")).await.unwrap();
         rt.append_message("thread-1", &json!({"role": "user", "content": "hi"})).await.unwrap();
         let sid = rt.session_for(&b, definition()).await.unwrap();
-        (sid, rt.current_sequence().await)
+        (sid, rt.current_sequence().await.unwrap())
     };
 
     // the process is gone; boot a new one over the same directory.
@@ -156,7 +156,7 @@ async fn a_restart_rehydrates_the_thread_list_history_and_session() {
          next turn talks to a provider session that has never seen this thread"
     );
     assert!(
-        rt.current_sequence().await >= seq_before,
+        rt.current_sequence().await.unwrap() >= seq_before,
         "the event sequence did not rewind across the restart"
     );
 }
@@ -185,13 +185,13 @@ async fn a_reconnecting_client_resumes_above_its_snapshot_sequence() {
         tail.ack(items[0].0).await.unwrap();
         tail.close().await;
 
-        rt.current_sequence().await
+        rt.current_sequence().await.unwrap()
     };
 
     // ── the server restarts; work continues while the client is disconnected ─
     let rt = boot(&data).await;
     assert_eq!(
-        rt.current_sequence().await,
+        rt.current_sequence().await.unwrap(),
         client_mark,
         "reading the current sequence does not CONSUME one — a snapshot that \
          burned a number would leave a hole the client waits on forever"
@@ -291,18 +291,18 @@ async fn turns_before_and_after_a_restart_are_one_conversation() {
             .run_turn_with_prompt_id(&b, definition(), "first", Some("umsg-first"), &projector(&rt))
             .await;
         assert_eq!(out, TurnOutcome::Completed, "the pre-restart turn completed");
-        rt.cursor(&b).await
+        rt.cursor(&b).await.unwrap()
     };
     assert!(cursor_before >= 0, "the first turn advanced the durable cursor");
 
     let rt = boot(&data).await;
-    assert_eq!(rt.cursor(&b).await, cursor_before, "the cursor came back with the process");
+    assert_eq!(rt.cursor(&b).await.unwrap(), cursor_before, "the cursor came back with the process");
 
     let out = rt
         .run_turn_with_prompt_id(&b, definition(), "second", Some("umsg-second"), &projector(&rt))
         .await;
     assert_eq!(out, TurnOutcome::Completed, "the post-restart turn completed");
-    assert!(rt.cursor(&b).await > cursor_before, "and moved the cursor further");
+    assert!(rt.cursor(&b).await.unwrap() > cursor_before, "and moved the cursor further");
 
     let msgs = rt.messages("thread-1").await;
     let assistants = msgs.iter().filter(|m| m["role"] == "assistant").count();
@@ -427,7 +427,7 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
         for _ in 0..5 {
             rt.next_sequence().await.unwrap();
         }
-        let mark = rt.current_sequence().await;
+        let mark = rt.current_sequence().await.unwrap();
         assert!(mark >= 5, "the pre-restart stream really did advance: {mark}");
         mark
     };
@@ -435,7 +435,7 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     // the process dies and comes back over the same data dir.
     let rt = boot(&data).await;
     assert_eq!(
-        rt.current_sequence().await,
+        rt.current_sequence().await.unwrap(),
         client_mark,
         "the snapshot mark a reconnecting client is handed did not rewind"
     );
@@ -471,7 +471,7 @@ async fn shell_frames_published_while_a_client_was_away_replay_after_a_restart()
             .await
             .unwrap();
         // what the client's snapshot advertised before it went away
-        let mark = rt.current_sequence().await;
+        let mark = rt.current_sequence().await.unwrap();
         // three upserts it never saw
         for i in 1..=3 {
             rt.emit_shell_event(serde_json::json!({
