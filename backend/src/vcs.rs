@@ -650,6 +650,16 @@ pub async fn run_stacked_action_with(
     Ok(out)
 }
 
+fn stacked_action_id(input: &Value) -> Result<String, String> {
+    input
+        .get("actionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "runStackedAction requires an actionId".to_string())
+}
+
 /// Is a durable cancel pending for this action? (#278)
 ///
 /// The flag lives in `agent_control`, the SAME row `agent_sdk_do::Control`
@@ -687,7 +697,7 @@ pub async fn run_stacked_action_streaming_with(
     cancel: Option<&Control>,
 ) -> Result<ActionVerdict, String> {
     let action = input.get("action").and_then(Value::as_str).unwrap_or("").to_string();
-    let action_id = input.get("actionId").and_then(Value::as_str).unwrap_or("action").to_string();
+    let action_id = stacked_action_id(input)?;
     let message = input.get("commitMessage").and_then(Value::as_str).unwrap_or("");
 
     let (do_commit, do_push, do_pr) = match action.as_str() {
@@ -1039,6 +1049,50 @@ mod tests {
         let kinds: Vec<&str> = frames.iter().filter_map(|f| f["kind"].as_str()).collect();
         assert!(kinds.contains(&"phase_started"), "frames: {frames:?}");
         assert!(!kinds.contains(&"action_cancelled"), "frames: {frames:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_generation_reuses_a_cancelled_action_id_without_poison() {
+        let dir = scratch_repo().await;
+        let cwd = dir.to_str().unwrap();
+        let control = scratch_control("reuse").await;
+
+        control.cancel("reuse-me").await.unwrap();
+        assert!(action_cancelled(Some(&control), "reuse-me").await);
+        control.start_fresh("reuse-me").await.unwrap();
+
+        let mut frames = Vec::new();
+        let verdict = run_stacked_action_streaming(
+            cwd,
+            &json!({
+                "actionId": "reuse-me", "cwd": cwd,
+                "action": "commit", "commitMessage": "fresh generation lands",
+            }),
+            &mut |f| frames.push(f),
+            Some(&control),
+        )
+        .await
+        .unwrap();
+
+        assert!(verdict.is_none(), "fresh action id generation must run: {verdict:?}");
+        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["kind"].as_str()).collect();
+        assert!(!kinds.contains(&"action_cancelled"), "stale cancel poisoned fresh run: {frames:?}");
+        assert!(kinds.contains(&"action_finished"), "fresh action finished: {frames:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stacked_action_requires_an_action_id() {
+        let dir = scratch_repo().await;
+        let cwd = dir.to_str().unwrap();
+
+        let err = run_stacked_action(
+            cwd,
+            &json!({"cwd": cwd, "action": "commit", "commitMessage": "no id"}),
+        )
+        .await
+        .expect_err("missing actionId must not silently share the durable `action` row");
+
+        assert!(err.contains("actionId"), "error should name the missing action id: {err}");
     }
 
     async fn scratch_repo() -> std::path::PathBuf {

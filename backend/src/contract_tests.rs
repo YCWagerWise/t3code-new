@@ -1010,6 +1010,60 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
     );
 }
 
+#[tokio::test]
+async fn unreadable_terminal_pane_store_is_not_a_valid_empty_metadata_snapshot() {
+    let (state, _d) = test_state().await;
+    state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-pane-corrupt"),
+            "pane-real",
+            Some(&state.cwd),
+            None,
+            &[],
+        )
+        .await
+        .expect("pane opens before durable store corruption");
+    state
+        .tool_roots
+        .session_db()
+        .execute("DROP TABLE exec_pane", vec![])
+        .await
+        .expect("corrupt pane store");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-pane-corrupt" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let events: Vec<Value> = frames
+        .iter()
+        .filter_map(|f| f["values"].get(0).cloned())
+        .collect();
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "store_unavailable"
+                && e["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("terminal pane store unavailable"))
+        }),
+        "unreadable durable pane state must be explicit, not an empty terminal list: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| {
+            e["type"] == "snapshot"
+                && e["terminals"]
+                    .as_array()
+                    .is_some_and(|rows| rows.is_empty())
+        }),
+        "corrupt pane state was reported as a valid empty snapshot: {events:?}"
+    );
+}
+
 /// Subscriber lists must SHRINK when clients go away.
 ///
 /// Every `subscribe*` pushed and nothing ever removed, so each reconnect —
@@ -3279,6 +3333,102 @@ async fn a_stacked_action_that_fails_exits_failure_and_says_which_phase() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn cancel_stacked_action_fails_when_control_state_is_unreadable() {
+    let (state, dir) = test_state().await;
+    let db = state.rt.store().db().clone();
+    db.execute("DROP TABLE IF EXISTS agent_control", vec![])
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE agent_control (run_id TEXT PRIMARY KEY)", vec![])
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "git.cancelStackedAction",
+        json!({ "actionId": "locked-action" }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("cancel request exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "unreadable action-control state must not become canceled:false: {exit}"
+    );
+    let defect = exit["exit"]["cause"][0]["defect"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        defect.contains("action control state unreadable") || defect.contains("no such column"),
+        "failure should name the unreadable durable control state, got {defect:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cancelling_an_unknown_stacked_action_id_does_not_poison_a_later_run() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &cancel_tx,
+        "git.cancelStackedAction",
+        json!({ "actionId": "reuse-me" }),
+    )
+    .await;
+    let cancel_exit = drain(&mut cancel_rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("cancel request exits");
+    assert_eq!(cancel_exit["exit"]["_tag"], "Success", "{cancel_exit}");
+    assert_eq!(
+        cancel_exit["exit"]["value"]["canceled"],
+        json!(false),
+        "an unknown action id must not be reported as stopped: {cancel_exit}"
+    );
+
+    let (run_tx, mut run_rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &run_tx,
+        "git.runStackedAction",
+        json!({
+            "cwd": cwd,
+            "actionId": "reuse-me",
+            "action": "commit",
+            "commitMessage": "fresh action",
+        }),
+    )
+    .await;
+    let frames = drain(&mut run_rx);
+    assert!(
+        !frames.iter().any(|f| {
+            f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_cancelled"
+        }),
+        "stale cancel row poisoned the later action: {frames:?}"
+    );
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("run exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "the later action should run normally with the reused id: {frames:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// #423: `git.runStackedAction` must STREAM progress, not replay a transcript.
 ///
 /// The old arm awaited `vcs::run_stacked_action(..)` to completion and then
@@ -3894,16 +4044,16 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
         session_id: SAME.to_string(),
         worktree_path: None,
     };
-    let a = state.terminals.get(&thread_owner, "pane-1").await.expect("thread pane");
-    let b = state.terminals.get(&child_owner, "pane-1").await.expect("child pane");
+    let a = state.terminals.get(&thread_owner, "pane-1").await.unwrap().expect("thread pane");
+    let b = state.terminals.get(&child_owner, "pane-1").await.unwrap().expect("child pane");
     assert!(
         !std::sync::Arc::ptr_eq(&a.runner, &b.runner),
         "the child session joined the thread's shell instead of getting its own"
     );
 
     // They list independently: a thread's drawer must not show a child's PTYs.
-    assert_eq!(state.terminals.list(&thread_owner).await.len(), 1);
-    assert_eq!(state.terminals.list(&child_owner).await.len(), 1);
+    assert_eq!(state.terminals.list(&thread_owner).await.unwrap().len(), 1);
+    assert_eq!(state.terminals.list(&child_owner).await.unwrap().len(), 1);
 
     // And closing the CHILD leaves the thread's pane alone.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3912,11 +4062,11 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
     })).await;
     let _ = drain(&mut rx);
     assert!(
-        state.terminals.get(&child_owner, "pane-1").await.is_none(),
+        state.terminals.get(&child_owner, "pane-1").await.unwrap().is_none(),
         "the child pane did not close"
     );
     assert!(
-        state.terminals.get(&thread_owner, "pane-1").await.is_some(),
+        state.terminals.get(&thread_owner, "pane-1").await.unwrap().is_some(),
         "closing the child session's PTY tore down the THREAD's pane — the two \
          lifecycles are still fused"
     );
@@ -3945,7 +4095,7 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "the pane reports where it really is"
     );
 
-    let pane_a = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.expect("registered");
+    let pane_a = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap().expect("registered");
     let where_a = pane_a.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
     assert!(where_a.output.contains("sub"), "the shell started in the requested cwd: {where_a:?}");
     assert!(where_a.output.contains("[a]"), "the launch env reached the shell: {where_a:?}");
@@ -3957,7 +4107,7 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "env": { "PANE": "b" },
     })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let pane_b = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.expect("registered");
+    let pane_b = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.unwrap().expect("registered");
     let where_b = pane_b.runner.run("echo [$PANE]", false, Some(10), false).await;
     assert!(where_b.output.contains("[b]"), "pane B has its OWN env: {where_b:?}");
     let recheck_a = pane_a.runner.run("echo [$PANE]", false, Some(10), false).await;
@@ -3988,7 +4138,7 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "env": { "PANE": "restarted" },
     })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let after = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap();
+    let after = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap().unwrap();
     let env_after = after.runner.run("echo [$PANE][$LEAKED]", false, Some(10), false).await;
     assert!(
         env_after.output.contains("[restarted][]"),
@@ -4023,8 +4173,8 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "terminal.close", json!({ "threadId": "t-1", "terminalId": "pane-a" })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.is_none(), "pane A is gone");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.is_some(), "pane B is untouched");
+    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap().is_none(), "pane A is gone");
+    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.unwrap().is_some(), "pane B is untouched");
     // The process is really gone, checked ONCE, immediately.
     //
     // This used to poll for a second and it was hiding a real defect: `close`
@@ -4503,7 +4653,7 @@ async fn terminal_metadata_updates_report_the_real_panes() {
     assert!(ids.contains(&"pane-x".to_string()), "the snapshot lists the real pane: {ids:?}");
 
     // move the pane's lifecycle — the live path must speak about pane-x
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-x").await.unwrap();
+    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-x").await.unwrap().unwrap();
     pane.runner.run("echo moving", false, Some(10), false).await;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4653,7 +4803,7 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
     })).await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure", "a PTY obeys the same boundary: {:?}", f[0]);
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "escape").await.is_none(), "no pane was registered");
+    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "escape").await.unwrap().is_none(), "no pane was registered");
 
     // …nor attached to one
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4717,7 +4867,7 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
         json!({ "threadId": "t-1", "terminalId": terminal_id })).await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["values"][0]["type"], "snapshot", "attach opened: {f:?}");
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), terminal_id).await.expect("registered");
+    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), terminal_id).await.unwrap().expect("registered");
     assert!(pane.shared, "it is the AGENT's shell, not a fresh pane");
 
     // a non-shell tool advertises no terminal rather than a misleading one
@@ -4765,7 +4915,7 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
     let f = drain(&mut rx);
     assert_eq!(f[0]["values"][0]["pending"], json!(true), "no pane exists yet: {f:?}");
     assert!(
-        state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.is_none(),
+        state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.unwrap().is_none(),
         "the subscription created a pane and pinned its identity"
     );
 
@@ -4777,7 +4927,7 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
     })).await;
     assert_eq!(drain(&mut rx2)[0]["exit"]["_tag"], "Success");
 
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.expect("opened");
+    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.unwrap().expect("opened");
     let where_x = pane.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
     assert!(where_x.output.contains("wt"), "the pane landed in the requested worktree: {where_x:?}");
     assert!(where_x.output.contains("[x]"), "the requested env reached the shell: {where_x:?}");
@@ -5460,7 +5610,7 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     checkpoint_turn_start(&state, &state.cwd, "turn-3").await;
     std::fs::write(&file, "v3\n").unwrap();
 
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd).await.unwrap();
     assert_eq!(summaries.len(), 3, "three turns, three checkpoints: {summaries:#?}");
 
     // ORDER: newest first, and turnCount counts from 1 at the newest.
@@ -5681,7 +5831,7 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
 
     // It is in the summary, because cairn diffs the WORKTREE and not a
     // journal of what the runtime believes it wrote.
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd).await.unwrap();
     let cp = summaries.iter().find(|c| c["turnId"] == "turn-oob").expect("the turn's checkpoint");
     let named: Vec<&str> = cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
     assert!(named.contains(&"oob.txt"), "an out-of-band edit must be reviewable: {named:?}");
@@ -5690,7 +5840,7 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     // would see it. The stack is in the repository, so it is still there.
     drop(state);
     let state2 = state_at(&dir).await;
-    let after_restart = checkpoint_summaries(&state2, &state2.cwd).await;
+    let after_restart = checkpoint_summaries(&state2, &state2.cwd).await.unwrap();
     assert!(
         after_restart.iter().any(|c| c["turnId"] == "turn-oob"),
         "the checkpoint must survive the process that took it: {after_restart:?}"
@@ -5759,7 +5909,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
     std::fs::write(&marker, "advanced-since\n").unwrap();
 
     // The review does not mention the runtime's files...
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd).await.unwrap();
     let cp = summaries.iter().find(|c| c["turnId"] == "turn-scope").expect("the checkpoint");
     let named: Vec<&str> =
         cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
@@ -6146,7 +6296,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
     for _ in 0..200 {
         if matches!(
             state.rt.session_status("t-int-live").await,
-            Some((_, agent_sdk_shell::TurnState::Running))
+            Ok(Some((_, agent_sdk_shell::TurnState::Running)))
         ) {
             running = true;
             break;
@@ -6418,7 +6568,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     for _ in 0..200 {
         if matches!(
             state.rt.session_status("t-int-neg").await,
-            Some((_, agent_sdk_shell::TurnState::Running))
+            Ok(Some((_, agent_sdk_shell::TurnState::Running)))
         ) {
             running = true;
             break;

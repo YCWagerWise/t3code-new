@@ -1287,10 +1287,15 @@ impl AppState {
     /// workspace terminal. Keying the lookup by owner is the difference between
     /// addressing a subagent's shell and addressing something that merely
     /// answers.
-    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> terminal::Terminal {
+    async fn pane_runner(
+        &self,
+        owner: &terminal::TerminalOwner,
+        terminal_id: &str,
+    ) -> Result<terminal::Terminal, String> {
         match self.terminals.get(owner, terminal_id).await {
-            Some(pane) => pane.runner,
-            None => self.terminal.clone(),
+            Ok(Some(pane)) => Ok(pane.runner),
+            Ok(None) => Ok(self.terminal.clone()),
+            Err(e) => Err(format!("terminal pane store unavailable: {e}")),
         }
     }
 }
@@ -1318,10 +1323,20 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
     // thread receives the same rows, and each row costs a PTY session lock.
     let now = now_iso();
     let mut rows = Vec::new();
-    for pane in state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
-        rows.push(terminal::pane_summary(&pane, &now).await);
-    }
-    let payload = json!({ "type": "snapshot", "terminals": rows });
+    let payload = match state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
+        Ok(panes) => {
+            for pane in panes {
+                rows.push(terminal::pane_summary(&pane, &now).await);
+            }
+            json!({ "type": "snapshot", "terminals": rows })
+        }
+        Err(e) => json!({
+            "type": "store_unavailable",
+            "threadId": thread,
+            "terminals": Value::Null,
+            "error": format!("terminal pane store unavailable: {e}"),
+        }),
+    };
     let topic = terminal_meta_topic(&thread);
     if let Err(e) = state.rt.topic_publish(&topic, &payload).await {
         tracing::error!(%e, %thread, "terminal metadata publish failed");
@@ -1739,6 +1754,7 @@ impl agent_sdk_shell::TurnCheckpointer for WorkspaceCheckpointer {
         let doomed: Vec<String> = cp
             .turn_summaries()
             .await
+            .map_err(|e| format!("checkpoint summaries unavailable: {e}"))?
             .into_iter()
             .filter(|t| t.turn_count <= turn_count)
             .map(|t| t.turn_id)
@@ -1774,13 +1790,13 @@ fn turn_projector(
 /// counting, which snapshots count as turns, and how the count round-trips a
 /// revert — lives in `agent_sdk_branch::Checkpoints::turn_summaries` (#376).
 /// This function is pure wire-shape marshalling onto the T3 contract.
-async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
-    let Ok(Some(checkpoints)) = checkpoint_stack(state, cwd).await else {
-        return Vec::new();
+async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Result<Vec<Value>, String> {
+    let Some(checkpoints) = checkpoint_stack(state, cwd).await? else {
+        return Ok(Vec::new());
     };
-    checkpoints
+    Ok(checkpoints
         .turn_summaries()
-        .await
+        .await?
         .into_iter()
         .map(|t| {
             let (status, files) = if t.readable {
@@ -1816,7 +1832,7 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
                 "completedAt": iso_ms(t.ts),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Revert the worktree `turn_count` turns back and tell the thread.
@@ -2410,7 +2426,7 @@ async fn handle_request(
                 // running/idle/error affordance — not a spinner inferred from
                 // stale messages that the user could never clear (#92).
                 let session = match state.rt.session_status(thread_id).await {
-                    Some((_sid, st)) => {
+                    Ok(Some((_sid, st))) => {
                         use agent_sdk_shell::TurnState;
                         let live = matches!(st, TurnState::Running | TurnState::AwaitingApproval);
                         let status = match st {
@@ -2432,7 +2448,14 @@ async fn handle_request(
                         json!({ "threadId": thread_id, "status": status, "providerName": null,
                             "activeTurnId": active_turn, "lastError": Value::Null, "updatedAt": now })
                     }
-                    None => Value::Null,
+                    Ok(None) => Value::Null,
+                    Err(e) => {
+                        tracing::error!(%e, %thread_id, "session status unreadable");
+                        snapshot_tail.close().await;
+                        chunk(tx, &id, json!({ "kind": "error",
+                            "error": { "message": format!("session status unreadable: {e}") } }));
+                        return;
+                    }
                 };
                 // `turnLimit` windows the fallback snapshot to the last N
                 // user-anchored turns and SAYS it is a window; absent means the
@@ -2472,11 +2495,21 @@ async fn handle_request(
                         )
                     }
                 };
-                let checkpoints = checkpoint_summaries(
+                let checkpoints = match checkpoint_summaries(
                     &state,
                     record.worktree_path.as_deref().unwrap_or(&state.cwd),
                 )
-                .await;
+                .await
+                {
+                    Ok(checkpoints) => checkpoints,
+                    Err(e) => {
+                        tracing::error!(%e, %thread_id, "checkpoint summaries unreadable");
+                        snapshot_tail.close().await;
+                        chunk(tx, &id, json!({ "kind": "error",
+                            "error": { "message": format!("checkpoint summaries unreadable: {e}") } }));
+                        return;
+                    }
+                };
                 // The product-owned parts only. Everything a reducer reads as
                 // thread IDENTITY/LIFECYCLE comes from the record.
                 let parts = json!({
@@ -2586,9 +2619,9 @@ async fn handle_request(
                 if to <= 0 {
                     return Ok(None);
                 }
-                Ok(checkpoints
+                checkpoints
                     .diff_turns(from.max(0) as usize, to as usize, ws)
-                    .await)
+                    .await
             }
             .await;
             match patch {
@@ -2963,21 +2996,43 @@ async fn handle_request(
             let action_db = state.rt.store().db().clone();
             // The orchestration isolate never ran an agent's BOOT_DDL, so it has
             // no `agent_control` table until we say so. Idempotent.
-            let _ = agent_sdk_do::Control::ensure_schema(&action_db).await;
+            if let Err(e) = agent_sdk_do::Control::ensure_schema(&action_db).await {
+                exit_failure(tx, &id, &format!("action control schema unavailable: {e}"));
+                return;
+            }
             let action_control = agent_sdk_do::Control::new(action_db);
-            let action_id =
-                payload.get("actionId").and_then(Value::as_str).unwrap_or("action").to_string();
-            // `ensure` before the run so `cancel` has a row to flip even if it
-            // lands in the gap before the first phase boundary is reached.
-            let _ = action_control.ensure(&action_id).await;
+            let action_id = match payload
+                .get("actionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(action_id) => action_id.to_string(),
+                None => {
+                    exit_failure(tx, &id, "runStackedAction requires an actionId");
+                    return;
+                }
+            };
+            // A new user action is a fresh control-row generation. `ensure`
+            // preserves stale cancel bits by design; reusable action ids need
+            // an explicit reset before phase boundaries start checking.
+            if let Err(e) = action_control.start_fresh(&action_id).await {
+                exit_failure(tx, &id, &format!("could not start action control: {e}"));
+                return;
+            }
             match vcs::run_stacked_action_streaming(&cwd, &payload, &mut emit, Some(&action_control))
                 .await
             {
                 Ok(None) => {
+                    let _ = action_control.clear(&action_id).await;
                     exit_success(tx, &id, Value::Null);
                     publish_vcs_status(&state, &cwd).await;
                 }
                 Ok(Some((phase, message))) => {
+                    if message.contains("cancelled") {
+                        let _ = action_control.finish(&action_id, agent_sdk_do::Checkpoint::Cancel).await;
+                    }
+                    let _ = action_control.clear(&action_id).await;
                     // A refused phase can still have mutated the repository —
                     // `commit` may have landed before `push` was refused — so
                     // the status is republished on this path too. Leaving it
@@ -2986,7 +3041,10 @@ async fn handle_request(
                     let phase = phase.as_str().unwrap_or("action").to_string();
                     exit_failure(tx, &id, &format!("{phase}: {message}"));
                 }
-                Err(e) => exit_failure(tx, &id, &e),
+                Err(e) => {
+                    let _ = action_control.clear(&action_id).await;
+                    exit_failure(tx, &id, &e);
+                }
             }
         }
         // ── project files: browse / search / preview / write (#64) ─────────
@@ -3015,7 +3073,10 @@ async fn handle_request(
                 return;
             }
             let cancel_db = state.rt.store().db().clone();
-            let _ = agent_sdk_do::Control::ensure_schema(&cancel_db).await;
+            if let Err(e) = agent_sdk_do::Control::ensure_schema(&cancel_db).await {
+                exit_failure(tx, &id, &format!("action control schema unavailable: {e}"));
+                return;
+            }
             let control = agent_sdk_do::Control::new(cancel_db);
             // `canceled` is TRUE ONLY IF THERE WAS A RUNNING ACTION TO STOP.
             //
@@ -3028,8 +3089,19 @@ async fn handle_request(
             //
             // `Control::cancel` only moves running -> cancelling, so the state
             // BEFORE the call is what decides the answer.
-            let was_running = control.state(action_id).await.map(|s| s == "running").unwrap_or(false);
-            match control.cancel(action_id).await {
+            let was_running = match control.state_opt(action_id).await {
+                Ok(state) => state.as_deref() == Some("running"),
+                Err(e) => {
+                    exit_failure(tx, &id, &format!("action control state unreadable: {e}"));
+                    return;
+                }
+            };
+            let cancel = if was_running {
+                control.cancel(action_id).await
+            } else {
+                Ok(())
+            };
+            match cancel {
                 // `action: null` — this backend has no snapshot registry to
                 // report. Null is the contract's shape for "no record", and it is
                 // the truth here; fabricating an idle snapshot would be worse.
@@ -3187,7 +3259,10 @@ async fn handle_request(
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(r) => r,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
+            };
             if let Some(data) = payload.get("data").and_then(Value::as_str) {
                 terminal::write(&runner, data).await;
             }
@@ -3200,7 +3275,10 @@ async fn handle_request(
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(r) => r,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
+            };
             if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
                 terminal::resize(&runner, rows as u16, cols as u16).await;
             }
@@ -3216,7 +3294,10 @@ async fn handle_request(
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
             let owner = terminal::TerminalOwner::parse(&payload);
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(r) => r,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
+            };
             terminal::clear(&runner).await;
             broadcast_terminal_event(
                 &state,
@@ -3303,12 +3384,12 @@ async fn handle_request(
                 Err(e) => tracing::error!(%e, "terminal events tail attach failed"),
             }
             match state.terminals.get(&owner, &term).await {
-                Some(pane) => {
+                Ok(Some(pane)) => {
                     let started = terminal::pane_snapshot(&pane, &now_iso()).await;
                     chunk(tx, &id, json!({ "type": "started", "threadId": thread, "terminalId": term, "snapshot": started }));
                     spawn_terminal_tail(pane.runner.clone(), tx.clone(), id.clone(), thread, term);
                 }
-                None => {
+                Ok(None) => {
                     // Announce the subscription with no snapshot, then WAIT for
                     // the real open rather than manufacturing one.
                     chunk(tx, &id, json!({
@@ -3319,19 +3400,30 @@ async fn handle_request(
                     let (tx2, id2) = (tx.clone(), id.clone());
                     let (owner2, thread2, term2) = (owner.clone(), thread.clone(), term.clone());
                     tokio::spawn(async move {
-                        if let Some(pane) = terminals
+                        match terminals
                             .wait_for(&owner2, &term2, std::time::Duration::from_secs(300))
                             .await
                         {
-                            let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
-                            chunk(&tx2, &id2, json!({
-                                "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
-                                "snapshot": snap,
-                            }));
-                            spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
+                            Ok(Some(pane)) => {
+                                let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
+                                chunk(&tx2, &id2, json!({
+                                    "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
+                                    "snapshot": snap,
+                                }));
+                                spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
+                            }
+                            Ok(None) => {}
+                            Err(e) => chunk(&tx2, &id2, json!({
+                                "type": "store_unavailable", "threadId": thread2, "terminalId": term2,
+                                "error": format!("terminal pane store unavailable: {e}"),
+                            })),
                         }
                     });
                 }
+                Err(e) => chunk(tx, &id, json!({
+                    "type": "store_unavailable", "threadId": thread, "terminalId": term,
+                    "error": format!("terminal pane store unavailable: {e}"),
+                })),
             }
         }
         "subscribeTerminalMetadata" => {
@@ -3346,11 +3438,30 @@ async fn handle_request(
             // would put them in the parent's drawer, which is the ownership
             // boundary the finding is about.
             let thread_owner = terminal::TerminalOwner::thread(&thread);
-            let _ = state.terminals.open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[]).await;
+            if let Err(e) = state.terminals.open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[]).await {
+                chunk(tx, &id, json!({
+                    "type": "store_unavailable", "threadId": thread,
+                    "terminals": Value::Null,
+                    "error": format!("terminal pane store unavailable: {e}"),
+                }));
+                return;
+            }
             let now = now_iso();
             let mut rows = Vec::new();
-            for pane in state.terminals.list(&thread_owner).await {
-                rows.push(terminal::pane_summary(&pane, &now).await);
+            match state.terminals.list(&thread_owner).await {
+                Ok(panes) => {
+                    for pane in panes {
+                        rows.push(terminal::pane_summary(&pane, &now).await);
+                    }
+                }
+                Err(e) => {
+                    chunk(tx, &id, json!({
+                        "type": "store_unavailable", "threadId": thread,
+                        "terminals": Value::Null,
+                        "error": format!("terminal pane store unavailable: {e}"),
+                    }));
+                    return;
+                }
             }
             chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
             // Metadata fanout on the SDK's generic named-topic seam, scoped
@@ -4090,7 +4201,19 @@ fn spawn_metadata_tail(
             // Holding `panes` for the length of the iteration also keeps each
             // runner alive across the wait, so a watch cannot end underneath us
             // and turn one closed pane into a terminated stream.
-            let panes = terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await;
+            let panes = match terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await {
+                Ok(panes) => panes,
+                Err(e) => {
+                    let ev = json!({
+                        "type": "store_unavailable",
+                        "threadId": thread_id,
+                        "terminals": Value::Null,
+                        "error": format!("terminal pane store unavailable: {e}"),
+                    });
+                    let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None));
+                    return;
+                }
+            };
             let mut watches: Vec<hearth::ScreenWatch> =
                 panes.iter().map(|p| terminal::watch(&p.runner)).collect();
 
