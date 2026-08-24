@@ -39,6 +39,7 @@ fn source(
     diff: String,
 ) -> Value {
     let truncated = diff.len() > MAX_DIFF_BYTES;
+    let diff_hash = diff_hash(&diff);
     let diff = if truncated {
         // cut on a line boundary so the client never renders half a hunk header
         let cut = diff[..MAX_DIFF_BYTES].rfind('\n').unwrap_or(MAX_DIFF_BYTES);
@@ -52,7 +53,7 @@ fn source(
         "title": title,
         "baseRef": base,
         "headRef": head,
-        "diffHash": diff_hash(&diff),
+        "diffHash": diff_hash,
         "diff": diff,
         "truncated": truncated,
     })
@@ -336,6 +337,35 @@ mod tests {
             .expect("previews");
         assert_ne!(changed["sources"][0]["diffHash"], s["diffHash"], "moves when the diff does");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_preview_hashes_the_hidden_tail_too() {
+        let visible_prefix = "same visible line\n".repeat((MAX_DIFF_BYTES / 18) + 10);
+        let one = source(
+            "working-tree",
+            "working-tree",
+            "Uncommitted changes",
+            Some("HEAD"),
+            Some("main"),
+            format!("{visible_prefix}hidden tail one\n"),
+        );
+        let two = source(
+            "working-tree",
+            "working-tree",
+            "Uncommitted changes",
+            Some("HEAD"),
+            Some("main"),
+            format!("{visible_prefix}hidden tail two\n"),
+        );
+
+        assert_eq!(one["truncated"], json!(true));
+        assert_eq!(two["truncated"], json!(true));
+        assert_eq!(one["diff"], two["diff"], "display stays bounded to the shared prefix");
+        assert_ne!(
+            one["diffHash"], two["diffHash"],
+            "identity must move when only the hidden tail changes"
+        );
     }
 
     /// Both sides of a file, with the missing side of an add/delete EMPTY

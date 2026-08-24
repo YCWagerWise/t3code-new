@@ -279,15 +279,16 @@ fn remote_status(s: &Status) -> Value {
     }
 }
 
-/// `vcs.refreshStatus` — the whole status, local + remote.
-pub async fn status(cwd: &str) -> Value {
-    let Some(repo) = repo(cwd).await else { return not_a_repo() };
-    let s = match repo.status().await {
-        Ok(s) => s,
-        Err(e) => return status_unavailable(&e.to_string()),
-    };
-    let mut out = local_status(&s);
-    if let (Some(o), Some(r)) = (out.as_object_mut(), remote_status(&s).as_object()) {
+/// Canonical cursor for "the status this subscriber has already seen".
+pub async fn status_fingerprint(cwd: &str) -> Option<String> {
+    let repo = repo(cwd).await?;
+    repo.status().await.ok().map(|s| s.fingerprint())
+}
+
+/// Map cairn's typed status into the local update payload.
+pub fn status_from(s: &Status) -> Value {
+    let mut out = local_status(s);
+    if let (Some(o), Some(r)) = (out.as_object_mut(), remote_status(s).as_object()) {
         for (k, v) in r {
             o.insert(k.clone(), v.clone());
         }
@@ -298,6 +299,21 @@ pub async fn status(cwd: &str) -> Value {
         o.insert("pr".into(), Value::Null);
     }
     out
+}
+
+/// Map cairn's typed status into the subscription snapshot payload.
+pub fn status_snapshot_from(s: &Status) -> Value {
+    json!({"_tag": "snapshot", "local": local_status(s), "remote": remote_status(s)})
+}
+
+/// `vcs.refreshStatus` — the whole status, local + remote.
+pub async fn status(cwd: &str) -> Value {
+    let Some(repo) = repo(cwd).await else { return not_a_repo() };
+    let s = match repo.status().await {
+        Ok(s) => s,
+        Err(e) => return status_unavailable(&e.to_string()),
+    };
+    status_from(&s)
 }
 
 /// `subscribeVcsStatus` — the initial snapshot frame.
@@ -313,7 +329,7 @@ pub async fn status_snapshot(cwd: &str) -> Value {
             })
         }
     };
-    json!({"_tag": "snapshot", "local": local_status(&s), "remote": remote_status(&s)})
+    status_snapshot_from(&s)
 }
 
 /// `vcs.listRefs`.
