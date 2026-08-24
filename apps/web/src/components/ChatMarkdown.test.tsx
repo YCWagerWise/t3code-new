@@ -88,6 +88,23 @@ describe("ChatMarkdown Windows file links", () => {
     expect(html).toContain("chat-markdown-file-link");
   });
 
+  it.each([true, false])(
+    "distinguishes same-named backslash paths with parseRawHtml=%s",
+    (parseRawHtml) => {
+      const html = renderToStaticMarkup(
+        <ChatMarkdown
+          cwd="C:/Users/shawn/project"
+          text={String.raw`[Source](C:\Users\shawn\project\src\index.ts) and [Test](C:\Users\shawn\project\test\index.ts)`}
+          lineBreaks={!parseRawHtml}
+          parseRawHtml={parseRawHtml}
+        />,
+      );
+
+      expect(html).toContain("index.ts · project/src");
+      expect(html).toContain("index.ts · project/test");
+    },
+  );
+
   it.each([true, false])("preserves reference links with parseRawHtml=%s", (parseRawHtml) => {
     const html = renderToStaticMarkup(
       <ChatMarkdown
