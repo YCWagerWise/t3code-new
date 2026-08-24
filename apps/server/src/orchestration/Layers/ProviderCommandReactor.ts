@@ -679,9 +679,21 @@ const make = Effect.gen(function* () {
         return existingSessionThreadId;
       }
 
-      const resumeCursor = shouldRestartForModelChange
-        ? undefined
-        : (activeSession?.resumeCursor ?? undefined);
+      // A restart is NOT a context reset. This used to drop the resume cursor
+      // exactly when the restart was caused by a model change, which is the one
+      // case where the user explicitly did not ask to start over — they asked
+      // to keep talking to a different model. The dropped cursor made the
+      // frontend show a model switch while the runtime silently threw the
+      // conversation away (#244).
+      //
+      // `sessionModelSwitch: "unsupported"` means the provider cannot mutate
+      // the model of a LIVE session. It does not mean the provider cannot
+      // RESUME a conversation under a different model — that is a fresh session
+      // start carrying a native resume handle, which is the normal shape for
+      // CLI-backed providers. So the cursor is carried through on every restart
+      // path, and the restart reason no longer changes what continuity the user
+      // gets.
+      const resumeCursor = activeSession?.resumeCursor ?? undefined;
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
@@ -1168,9 +1180,48 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    // #202: THE MODEL SWITCH IS COMMITTED HERE, and nowhere earlier.
+    //
+    // The web client used to write `thread.modelSelection` into durable
+    // metadata as soon as the picker changed, before the turn was ever sent.
+    // That made a UI intention outlive a rejected runtime change: the switch
+    // can still fail inside `applyRequestedSessionConfiguration` (model absent
+    // from the live catalog, stale slug, `session/set_config_option` refused),
+    // and the thread would keep advertising a model no session ever accepted.
+    //
+    // `sendTurn` succeeding is the first moment the new selection is a fact
+    // rather than a request, so that is when it becomes durable. On failure we
+    // dispatch nothing and the previous model stays visible — which is the
+    // honest answer, and specifically NOT a silent fallback to the default,
+    // because that would hide which model actually saw the retained context.
+    const committedModelSelection = sendTurnRequest.value.modelSelection;
+    yield* providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.tap(() =>
+        Effect.gen(function* () {
+          if (
+            committedModelSelection === undefined ||
+            Equal.equals(committedModelSelection, thread.modelSelection)
+          ) {
+            return;
+          }
+          yield* orchestrationEngine.dispatch({
+            type: "thread.meta.update",
+            commandId: yield* serverCommandId("model-switch-accepted"),
+            threadId: event.payload.threadId,
+            modelSelection: committedModelSelection,
+          });
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning(
+              "provider command reactor failed to commit an accepted model switch",
+              { threadId: event.payload.threadId, cause: Cause.pretty(cause) },
+            ),
+          ),
+        ),
+      ),
+      Effect.catchCause(recoverTurnStartFailure),
+      Effect.forkScoped,
+    );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (

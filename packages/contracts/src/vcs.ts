@@ -269,6 +269,17 @@ export class VcsUnsupportedOperationError extends Schema.TaggedErrorClass<VcsUns
   }
 }
 
+export class VcsPathNotAdmittedError extends Schema.TaggedErrorClass<VcsPathNotAdmittedError>()(
+  "VcsPathNotAdmittedError",
+  {
+    cwd: Schema.String,
+  },
+) {
+  override get message() {
+    return `Refused: ${this.cwd} is outside every project and worktree this environment owns`;
+  }
+}
+
 export const VcsError = Schema.Union([
   VcsProcessSpawnError,
   VcsProcessExitError,

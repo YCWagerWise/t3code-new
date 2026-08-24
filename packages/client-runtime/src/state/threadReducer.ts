@@ -295,19 +295,46 @@ export function applyThreadDetailEvent(
         updatedAt: event.payload.updatedAt,
       };
 
-      const existingMessage = thread.messages.find((entry) => entry.id === message.id);
+      // A merge never crosses roles: an id shared by a user and an assistant
+      // message is two messages, not one bubble. Matching on id alone glued the
+      // user's text onto the assistant's reply.
+      const existingMessage = thread.messages.find(
+        (entry) => entry.id === message.id && entry.role === message.role,
+      );
       const messages = existingMessage
         ? Arr.map(thread.messages, (entry) =>
-            entry.id !== message.id
+            entry.id !== message.id || entry.role !== message.role
               ? entry
               : {
                   ...entry,
+                  // Append only while the entry is still STREAMING; once it has
+                  // settled, a streaming frame is replay and is IGNORED.
+                  //
+                  // Replacing instead of ignoring looked equivalent and was not.
+                  // Messages carry no sequence or delta id, so a settled entry
+                  // that accepts a replayed delta first truncates to that
+                  // delta's text and then un-settles itself, which makes the
+                  // NEXT replayed delta append again. The 2026-08-19 capture's
+                  // full in-order replay happened to rebuild the same string by
+                  // luck; a replay that is partial, reordered, or cut short
+                  // leaves the bubble holding one delta instead of the reply.
+                  // Trading duplicated text for truncated text is not a fix.
+                  //
+                  // A settled entry already has its FINAL text, so there is
+                  // nothing a streaming frame can add. Keeping it is also the
+                  // safe direction: the worst case is a re-streamed id whose
+                  // update we drop, versus silently losing the answer.
                   text: message.streaming
-                    ? `${entry.text}${message.text}`
+                    ? entry.streaming
+                      ? `${entry.text}${message.text}`
+                      : entry.text
                     : message.text.length > 0
                       ? message.text
                       : entry.text,
-                  streaming: message.streaming,
+                  // Never let replay drag a settled message back to streaming —
+                  // that is what re-armed the append path above, and it also
+                  // puts a finished bubble back into the typing state in the UI.
+                  streaming: entry.streaming ? message.streaming : false,
                   ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
                   ...(message.streaming ? {} : { updatedAt: message.updatedAt }),
                   ...(message.attachments !== undefined

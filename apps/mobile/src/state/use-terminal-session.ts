@@ -63,20 +63,33 @@ export function useKnownTerminalSessions(input: {
     if (input.environmentId === null) {
       return [];
     }
-    return (metadata.data ?? [])
-      .filter((summary) => input.threadId === null || summary.threadId === input.threadId)
-      .map((summary) => ({
-        target: {
-          environmentId: input.environmentId!,
-          threadId: ThreadId.make(summary.threadId),
-          terminalId: summary.terminalId,
-        },
-        state: combineTerminalSessionState(summary, EMPTY_TERMINAL_BUFFER_STATE),
-      }))
-      .sort((left, right) =>
-        left.target.terminalId.localeCompare(right.target.terminalId, undefined, {
-          numeric: true,
-        }),
-      );
+    return (
+      (metadata.data ?? [])
+        // A pane has exactly one owner: a thread OR a child session, so
+        // `summary.threadId` is null for a subagent's PTY (#149,
+        // backend/src/terminal.rs:352-357). This hook addresses panes as
+        // `{threadId, terminalId}` and has no expression for a session-owned
+        // pane; the session-addressed mounting path is the remaining half of
+        // #149. Before `threadId` became nullable this called
+        // `ThreadId.make(null)` on every such pane.
+        .filter(
+          (summary): summary is typeof summary & { readonly threadId: string } =>
+            summary.threadId !== null,
+        )
+        .filter((summary) => input.threadId === null || summary.threadId === input.threadId)
+        .map((summary) => ({
+          target: {
+            environmentId: input.environmentId!,
+            threadId: ThreadId.make(summary.threadId),
+            terminalId: summary.terminalId,
+          },
+          state: combineTerminalSessionState(summary, EMPTY_TERMINAL_BUFFER_STATE),
+        }))
+        .sort((left, right) =>
+          left.target.terminalId.localeCompare(right.target.terminalId, undefined, {
+            numeric: true,
+          }),
+        )
+    );
   }, [input.environmentId, input.threadId, metadata.data]);
 }

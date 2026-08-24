@@ -1619,6 +1619,9 @@ export const make = Effect.gen(function* () {
     const { commitSha } = yield* gitCore.commit(cwd, suggestion.subject, suggestion.body, {
       timeoutMs: COMMIT_TIMEOUT_MS,
       ...(commitProgress ? { progress: commitProgress } : {}),
+      // The selection travels with the commit rather than being pre-staged into
+      // the user's index (#268).
+      ...(filePaths && filePaths.length > 0 ? { filePaths } : {}),
     });
     if (currentHookName !== null) {
       yield* emit({

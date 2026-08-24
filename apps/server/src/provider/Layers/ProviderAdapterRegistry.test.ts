@@ -10,10 +10,7 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 
-import type * as ClaudeAdapter from "../Services/ClaudeAdapter.ts";
-import type * as CodexAdapter from "../Services/CodexAdapter.ts";
-import type * as CursorAdapter from "../Services/CursorAdapter.ts";
-import type * as OpenCodeAdapter from "../Services/OpenCodeAdapter.ts";
+import type * as AgentSdkAdapter from "../Services/AgentSdkAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderInstanceRegistry from "../Services/ProviderInstanceRegistry.ts";
 import type { ProviderInstance } from "../ProviderDriver.ts";
@@ -25,9 +22,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
-const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
-const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
+const fakeCodexAdapter: AgentSdkAdapter.AgentSdkAdapterShape = {
   provider: CODEX_DRIVER,
   capabilities: { sessionModelSwitch: "in-session" },
   startSession: vi.fn(),
@@ -44,7 +40,7 @@ const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
   streamEvents: Stream.empty,
 };
 
-const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
+const fakeClaudeAdapter: AgentSdkAdapter.AgentSdkAdapterShape = {
   provider: CLAUDE_AGENT_DRIVER,
   capabilities: { sessionModelSwitch: "in-session" },
   startSession: vi.fn(),
@@ -61,25 +57,8 @@ const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
   streamEvents: Stream.empty,
 };
 
-const fakeOpenCodeAdapter: OpenCodeAdapter.OpenCodeAdapterShape = {
+const fakeOpenCodeAdapter: AgentSdkAdapter.AgentSdkAdapterShape = {
   provider: OPENCODE_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session" },
-  startSession: vi.fn(),
-  sendTurn: vi.fn(),
-  interruptTurn: vi.fn(),
-  respondToRequest: vi.fn(),
-  respondToUserInput: vi.fn(),
-  stopSession: vi.fn(),
-  listSessions: vi.fn(),
-  hasSession: vi.fn(),
-  readThread: vi.fn(),
-  rollbackThread: vi.fn(),
-  stopAll: vi.fn(),
-  streamEvents: Stream.empty,
-};
-
-const fakeCursorAdapter: CursorAdapter.CursorAdapterShape = {
-  provider: CURSOR_DRIVER,
   capabilities: { sessionModelSwitch: "in-session" },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
@@ -101,7 +80,7 @@ const fakeCursorAdapter: CursorAdapter.CursorAdapterShape = {
 // instances whose `instanceId === defaultInstanceIdForDriver(driverKind)` so
 // they pass the default-instance filter.
 const makeFakeInstance = (
-  driverKindString: "codex" | "claudeAgent" | "cursor" | "opencode",
+  driverKindString: "codex" | "claudeAgent" | "opencode",
   adapter: ProviderInstance["adapter"],
 ): ProviderInstance => {
   const driverKind = ProviderDriverKind.make(driverKindString);
@@ -132,7 +111,6 @@ const fakeInstances: ReadonlyArray<ProviderInstance> = [
   makeFakeInstance("codex", fakeCodexAdapter),
   makeFakeInstance("claudeAgent", fakeClaudeAdapter),
   makeFakeInstance("opencode", fakeOpenCodeAdapter),
-  makeFakeInstance("cursor", fakeCursorAdapter),
 ];
 
 const fakeInstanceRegistryLayer = Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
@@ -181,15 +159,9 @@ it.layer(layer)("ProviderAdapterRegistryLive", (it) => {
         defaultInstanceIdForDriver(CODEX_DRIVER),
         claudeInstanceId,
         defaultInstanceIdForDriver(OPENCODE_DRIVER),
-        defaultInstanceIdForDriver(CURSOR_DRIVER),
       ]);
 
       const providers = yield* registry.listProviders();
-      assert.deepStrictEqual(providers, [
-        CODEX_DRIVER,
-        CLAUDE_AGENT_DRIVER,
-        OPENCODE_DRIVER,
-        CURSOR_DRIVER,
-      ]);
+      assert.deepStrictEqual(providers, [CODEX_DRIVER, CLAUDE_AGENT_DRIVER, OPENCODE_DRIVER]);
     }));
 });

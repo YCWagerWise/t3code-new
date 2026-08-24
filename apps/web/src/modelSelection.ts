@@ -22,7 +22,11 @@ import {
   resolveSelectableProvider,
 } from "./providerModels";
 import { ModelEsque } from "./components/chat/providerIconUtils";
-import { type ProviderInstanceEntry, deriveProviderInstanceEntries } from "./providerInstances";
+import {
+  type ProviderInstanceEntry,
+  deriveProviderInstanceEntries,
+  isProviderInstancePickerReady,
+} from "./providerInstances";
 import { sortModelsForProviderInstance } from "./modelOrdering";
 
 const MAX_CUSTOM_MODEL_COUNT = 32;
@@ -286,11 +290,24 @@ export function resolveAppModelSelectionState(
     model: DEFAULT_TEXT_GENERATION_MODEL,
   };
   const entries = deriveProviderInstanceEntries(providers);
+  // Readiness here must match the canonical picker predicate (#246). Checking
+  // only `enabled && isAvailable` admits an instance whose probe reported
+  // `error`/`warning`, so the app's text-generation model resolves to a
+  // provider that cannot start — and because this value is written back into
+  // settings, the unready choice is then persisted as the user's preference.
+  //
+  // `isAvailable` is derived from `availability !== "unavailable"`, which is a
+  // strictly weaker signal than the probe status; both are needed.
   const selectedEntry = entries.find(
-    (entry) => entry.instanceId === selection.instanceId && entry.enabled && entry.isAvailable,
+    (entry) => entry.instanceId === selection.instanceId && isProviderInstancePickerReady(entry),
   );
   const entry =
-    selectedEntry ?? entries.find((candidate) => candidate.enabled && candidate.isAvailable);
+    selectedEntry ??
+    // Prefer a genuinely ready instance; fall back to a merely-available one
+    // only when nothing is ready, so an unready provider is a last resort
+    // rather than an equal candidate.
+    entries.find(isProviderInstancePickerReady) ??
+    entries.find((candidate) => candidate.enabled && candidate.isAvailable);
   if (entry) {
     // When the instance changed due to fallback (e.g. selected instance was disabled),
     // don't carry over the old instance's model — use the fallback instance's default.

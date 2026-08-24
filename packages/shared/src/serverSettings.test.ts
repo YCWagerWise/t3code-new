@@ -264,6 +264,67 @@ describe("serverSettings helpers", () => {
     expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
   });
 
+  it("falls back when the selected model is not one the provider actually serves (#195)", () => {
+    // A stale settings file: the user's Ollama instance was reconfigured
+    // and the `llama3.5-latest` model is no longer served, but the
+    // sourceControlWriterModelSelection still names it. The writer
+    // must NOT route through a slug the provider does not serve —
+    // that silently ships commit messages / PR bodies / branch names
+    // through the wrong model with the picker still displaying the
+    // stale slug.
+    const instanceId = ProviderInstanceId.make("ollama_writer");
+    const staleSelection = createModelSelection(instanceId, "llama3.5-latest");
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: {
+          driver: ProviderDriverKind.make("openai-compat"),
+          enabled: true,
+          config: { baseUrl: "http://localhost:11434/v1" },
+        },
+      },
+      sourceControlWriterModelSelection: staleSelection,
+    };
+    // Provider is available, enabled — but only serves `llama3.2`.
+    // The picker's older `llama3.5-latest` selection is now a phantom.
+    const providerWithoutStaleModel = {
+      instanceId,
+      driver: ProviderDriverKind.make("openai-compat"),
+      enabled: true,
+      installed: true,
+      version: null,
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-08-23T00:00:00.000Z",
+      availability: "available",
+      unavailableReason: undefined,
+      models: [
+        {
+          slug: "llama3.2",
+          name: "Llama 3.2",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+      slashCommands: [],
+      skills: [],
+    } satisfies ServerProvider;
+    expect(resolveSourceControlWriterModelSelection(settings, [providerWithoutStaleModel])).toBe(
+      settings.textGenerationModelSelection,
+    );
+
+    // Contrast: same provider, but the selection names a model it DOES
+    // serve — the writer resolves to the source-control selection.
+    const routableSelection = createModelSelection(instanceId, "llama3.2");
+    const settingsRoutable = {
+      ...settings,
+      sourceControlWriterModelSelection: routableSelection,
+    };
+    expect(
+      resolveSourceControlWriterModelSelection(settingsRoutable, [providerWithoutStaleModel]),
+    ).toBe(routableSelection);
+  });
+
   it("replaces providerInstances maps so omitted instance fields are cleared", () => {
     const codexId = ProviderInstanceId.make("codex");
     const current = {

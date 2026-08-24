@@ -66,6 +66,29 @@ describe("isProviderInstancePickerReady", () => {
 
     expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
   });
+
+  // #243: this predicate now gates the composer's SEND path as well as the
+  // picker, so the exact snapshots the runtime uses to say "I cannot run" must
+  // each be rejected. Previously the composer asked only whether a snapshot
+  // existed, so every one of these still allowed a turn to be dispatched.
+  it.each([
+    ["an errored probe", { status: "error" as const }],
+    ["a provider reported unavailable", { availability: "unavailable" as const }],
+    ["a disabled instance", { enabled: false }],
+  ])("rejects %s", (_label, overrides) => {
+    const [entry] = deriveProviderInstanceEntries([
+      provider({
+        provider: ProviderDriverKind.make("codex"),
+        instanceId: "codex",
+        ...overrides,
+      }),
+    ]);
+
+    expect(entry).toBeDefined();
+    // The snapshot still EXISTS — which is precisely why existence was never a
+    // safe gate — but it must not be treated as ready.
+    expect(entry && isProviderInstancePickerReady(entry)).toBe(false);
+  });
 });
 
 describe("isProviderInstancePickerVisible", () => {

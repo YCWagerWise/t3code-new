@@ -223,7 +223,11 @@ import { appendPreviewAnnotationPrompt } from "../lib/previewAnnotation";
 import { appendReviewCommentsToPrompt, type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
-import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
+import {
+  ownerThreadId,
+  useKnownTerminalSessions,
+  useThreadRunningTerminalIds,
+} from "../state/terminalSessions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
 import {
@@ -1569,8 +1573,11 @@ function ChatViewContent(props: ChatViewProps) {
     if (activeThreadId === null) {
       return [];
     }
+    // Owner-addressed since #149: a pane belongs to a thread OR to a child
+    // session, so this compares against the thread owner instead of a field
+    // every pane was once assumed to have.
     return activeThreadKnownSessionsRaw.filter(
-      (session) => session.target.threadId === activeThreadId,
+      (session) => ownerThreadId(session.target) === activeThreadId,
     );
   }, [activeThreadId, activeThreadKnownSessionsRaw]);
   const activeServerOrderedTerminalIds = useMemo(

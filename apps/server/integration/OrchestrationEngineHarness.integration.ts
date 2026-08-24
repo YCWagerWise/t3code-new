@@ -38,7 +38,7 @@ import { makeProviderRegistryLayer } from "../src/provider/testUtils/providerReg
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
 import { ServerSettingsService } from "../src/serverSettings.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
-import { makeCodexAdapter } from "../src/provider/Layers/CodexAdapter.ts";
+import { makeAgentSdkAdapter } from "../src/provider/Layers/AgentSdkAdapter.ts";
 import {
   NoOpProviderEventLoggers,
   ProviderEventLoggers,
@@ -274,8 +274,11 @@ export const makeOrchestrationIntegrationHarness = (
     const realCodexRegistry = Layer.effect(
       ProviderAdapterRegistry,
       Effect.gen(function* () {
-        const codexSettings = yield* decodeCodexSettings({});
-        const codexAdapter = yield* makeCodexAdapter(codexSettings);
+        const codexAdapter = yield* makeAgentSdkAdapter({
+          provider: ProviderDriverKind.make("codex"),
+          defaultModelSlug: "codex-default",
+          resolveAgentModel: () => "codex-resume:",
+        });
         return makeAdapterRegistryMock({
           [ProviderDriverKind.make("codex")]: codexAdapter,
         });

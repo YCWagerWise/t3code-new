@@ -2,6 +2,7 @@ import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
@@ -43,13 +44,16 @@ function makeProvider(
   };
 }
 
-function processOutput(): GitVcsDriver.ExecuteGitResult {
+function processOutput(
+  overrides: Partial<GitVcsDriver.ExecuteGitResult> = {},
+): GitVcsDriver.ExecuteGitResult {
   return {
     exitCode: ChildProcessSpawner.ExitCode(0),
     stdout: "",
     stderr: "",
     stdoutTruncated: false,
     stderrTruncated: false,
+    ...overrides,
   };
 }
 
@@ -357,17 +361,27 @@ it.effect("publish succeeds with status remote_added when the local repo has no 
     Effect.provide(
       makeLayer({
         git: {
-          execute: (input) =>
-            input.args[0] === "rev-parse"
-              ? Effect.fail(
-                  new GitCommandError({
-                    operation: input.operation,
-                    command: "git rev-parse --verify HEAD",
-                    cwd: input.cwd,
-                    detail: "fatal: Needed a single revision",
-                  }),
-                )
-              : Effect.succeed(processOutput()),
+          execute: (input) => {
+            if (input.args[0] === "rev-parse" && input.args[1] === "--is-inside-work-tree") {
+              // #251: work-tree preflight — this call must succeed for
+              // a valid git repo (even one with no commits).
+              return Effect.succeed(processOutput({ stdout: "true\n" }));
+            }
+            if (input.args[0] === "rev-parse") {
+              // The HEAD-check case the finding named: repo exists but
+              // has no commits, so `rev-parse --verify HEAD` fails and
+              // the flow settles as `remote_added` without a push.
+              return Effect.fail(
+                new GitCommandError({
+                  operation: input.operation,
+                  command: "git rev-parse --verify HEAD",
+                  cwd: input.cwd,
+                  detail: "fatal: Needed a single revision",
+                }),
+              );
+            }
+            return Effect.succeed(processOutput());
+          },
           statusDetails: () =>
             Effect.succeed({
               isRepo: true,
@@ -397,3 +411,61 @@ it.effect("publish succeeds with status remote_added when the local repo has no 
     ),
   );
 });
+
+it.effect(
+  "publish refuses BEFORE creating the remote when the local directory is not a git repo (#251)",
+  () => {
+    let createRepoCalls = 0;
+    return Effect.gen(function* () {
+      const service = yield* SourceControlRepositoryService.SourceControlRepositoryService;
+      const exit = yield* Effect.exit(
+        service.publishRepository({
+          cwd: "/not-a-repo",
+          provider: "github",
+          repository: "octocat/t3code",
+          visibility: "private",
+          remoteName: "origin",
+          protocol: "ssh",
+        }),
+      );
+      assert.isTrue(
+        Exit.isFailure(exit),
+        "publishRepository must refuse when the local dir is not a git repo",
+      );
+      assert.strictEqual(
+        createRepoCalls,
+        0,
+        "no remote was created — the preflight fires BEFORE provider.createRepository",
+      );
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          provider: makeProvider({
+            createRepository: () => {
+              createRepoCalls += 1;
+              return Effect.succeed(CLONE_URLS);
+            },
+          }),
+          git: {
+            execute: (input) => {
+              if (input.args[0] === "rev-parse" && input.args[1] === "--is-inside-work-tree") {
+                // The bug the finding named: the cwd is not a git repo,
+                // so the preflight fails and the flow refuses before
+                // provider.createRepository can orphan a remote.
+                return Effect.fail(
+                  new GitCommandError({
+                    operation: input.operation,
+                    command: "git rev-parse --is-inside-work-tree",
+                    cwd: input.cwd,
+                    detail: "fatal: not a git repository",
+                  }),
+                );
+              }
+              return Effect.succeed(processOutput());
+            },
+          },
+        }),
+      ),
+    );
+  },
+);

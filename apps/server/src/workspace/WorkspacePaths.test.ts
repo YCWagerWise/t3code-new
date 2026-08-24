@@ -204,4 +204,114 @@ it.layer(TestLayer)("WorkspacePathsLive", (it) => {
       }),
     );
   });
+
+  describe("admitPathWithinRoots", () => {
+    it.effect("admits a path inside an owned root, and the root itself", () =>
+      Effect.gen(function* () {
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* makeTempDir();
+        yield* fileSystem.makeDirectory(path.join(root, "a/b"), { recursive: true });
+        const canonicalRoot = yield* fileSystem.realPath(root);
+
+        expect(
+          yield* workspacePaths.admitPathWithinRoots({
+            candidate: path.join(root, "a/b"),
+            roots: [root],
+          }),
+        ).toBe(path.join(canonicalRoot, "a/b"));
+
+        // The root itself is admitted — opening a terminal at the project root
+        // is the ordinary case, not an escape.
+        expect(yield* workspacePaths.admitPathWithinRoots({ candidate: root, roots: [root] })).toBe(
+          canonicalRoot,
+        );
+      }),
+    );
+
+    it.effect("refuses a path outside every root", () =>
+      Effect.gen(function* () {
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const root = yield* makeTempDir();
+        const outside = yield* makeTempDir();
+
+        const result = yield* Effect.result(
+          workspacePaths.admitPathWithinRoots({ candidate: outside, roots: [root] }),
+        );
+        expect(result._tag).toBe("Failure");
+      }),
+    );
+
+    it.effect("refuses traversal that climbs out of a root", () =>
+      Effect.gen(function* () {
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const path = yield* Path.Path;
+        const root = yield* makeTempDir();
+
+        const result = yield* Effect.result(
+          workspacePaths.admitPathWithinRoots({
+            candidate: path.join(root, "..", "elsewhere"),
+            roots: [root],
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+      }),
+    );
+
+    it.effect("refuses a SYMLINK inside a root that points outside it", () =>
+      Effect.gen(function* () {
+        // The reason admission canonicalizes instead of comparing prefixes: a
+        // lexical check sees `<root>/escape` and admits it, then the shell (or
+        // `git worktree remove`) follows the link and operates on the target.
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* makeTempDir();
+        const outside = yield* makeTempDir();
+        const link = path.join(root, "escape");
+        yield* fileSystem.symlink(outside, link).pipe(Effect.orDie);
+
+        const result = yield* Effect.result(
+          workspacePaths.admitPathWithinRoots({ candidate: link, roots: [root] }),
+        );
+        expect(result._tag).toBe("Failure");
+      }),
+    );
+
+    it.effect("a root that does not resolve admits NOTHING", () =>
+      Effect.gen(function* () {
+        // Fail closed: an environment whose worktree directory is missing must
+        // admit nothing, rather than skipping the check and admitting anything.
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const path = yield* Path.Path;
+        const anywhere = yield* makeTempDir();
+
+        const result = yield* Effect.result(
+          workspacePaths.admitPathWithinRoots({
+            candidate: anywhere,
+            roots: [path.join(anywhere, "does-not-exist")],
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+      }),
+    );
+
+    it.effect("admits against ANY of several roots", () =>
+      Effect.gen(function* () {
+        const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const projects = yield* makeTempDir();
+        const worktrees = yield* makeTempDir();
+        const canonicalWorktrees = yield* fileSystem.realPath(worktrees);
+
+        expect(
+          yield* workspacePaths.admitPathWithinRoots({
+            candidate: worktrees,
+            roots: [projects, worktrees],
+          }),
+        ).toBe(canonicalWorktrees);
+      }),
+    );
+  });
 });

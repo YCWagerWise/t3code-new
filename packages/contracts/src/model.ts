@@ -129,8 +129,6 @@ export type ModelCapabilities = typeof ModelCapabilities.Type;
 
 const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
-const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
-const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 
 export const DEFAULT_MODEL = "gpt-5.6-sol";
@@ -150,8 +148,6 @@ export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "low";
 export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-sonnet-5",
-  [CURSOR_DRIVER_KIND]: "auto",
-  [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };
 
@@ -161,9 +157,67 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
 > = {
   [CODEX_DRIVER_KIND]: DEFAULT_TEXT_GENERATION_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
-  [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };
+
+/**
+ * The canonical model catalog, per provider — ONE seam (#221).
+ *
+ * Provider drivers advertise their model list from here instead of carrying
+ * their own hard-coded rows. Two registries always drift: the contracts side
+ * kept naming defaults, preferred models and alias targets (`gpt-5.6-sol`,
+ * `claude-sonnet-5`) that the driver never advertised, so a stored selection
+ * pointing at one of them silently became unroutable while the picker showed a
+ * shorter, different list. Anything the rest of the registry NAMES has to be
+ * listed here — `modelCatalogGaps` below is the check that keeps that true.
+ */
+export const MODEL_CATALOG_BY_PROVIDER: Partial<
+  Record<ProviderDriverKind, ReadonlyArray<{ readonly slug: string; readonly name: string }>>
+> = {
+  [CODEX_DRIVER_KIND]: [
+    { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+    { slug: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
+    { slug: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+    { slug: "gpt-5.4", name: "GPT-5.4" },
+    { slug: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+    { slug: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark" },
+  ],
+  [CLAUDE_DRIVER_KIND]: [
+    { slug: "claude-opus-5", name: "Claude Opus 5" },
+    { slug: "claude-sonnet-5", name: "Claude Sonnet 5" },
+    { slug: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+    { slug: "claude-opus-4-8", name: "Claude Opus 4.8" },
+    { slug: "claude-opus-4-7", name: "Claude Opus 4.7" },
+    { slug: "claude-opus-4-6", name: "Claude Opus 4.6" },
+    { slug: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+  ],
+  [OPENCODE_DRIVER_KIND]: [{ slug: "openai/gpt-5", name: "OpenAI GPT-5" }],
+};
+
+/**
+ * Slugs this registry NAMES somewhere but the catalog does not list — i.e. the
+ * drift that makes a stored selection unroutable. Empty is the invariant.
+ */
+export function modelCatalogGaps(provider: ProviderDriverKind): ReadonlyArray<string> {
+  const listed = new Set((MODEL_CATALOG_BY_PROVIDER[provider] ?? []).map((m) => m.slug));
+  const named = new Set<string>();
+  const add = (slug: string | undefined) => {
+    if (slug !== undefined && slug.trim() !== "") {
+      named.add(slug);
+    }
+  };
+  add(DEFAULT_MODEL_BY_PROVIDER[provider]);
+  add(DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[provider]);
+  if (provider === CODEX_DRIVER_KIND) {
+    for (const slug of PREFERRED_DEFAULT_CODEX_MODELS) {
+      add(slug);
+    }
+  }
+  for (const target of Object.values(MODEL_SLUG_ALIASES_BY_PROVIDER[provider] ?? {})) {
+    add(target);
+  }
+  return [...named].filter((slug) => !listed.has(slug)).sort();
+}
 
 export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
   Record<ProviderDriverKind, Record<string, string>>
@@ -200,17 +254,6 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "claude-haiku-4.5": "claude-haiku-4-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5",
   },
-  [CURSOR_DRIVER_KIND]: {
-    composer: "composer-2",
-    "composer-1.5": "composer-1.5",
-    "composer-1": "composer-1.5",
-    "opus-4.6-thinking": "claude-opus-4-6",
-    "opus-4.6": "claude-opus-4-6",
-    "sonnet-4.6-thinking": "claude-sonnet-4-6",
-    "sonnet-4.6": "claude-sonnet-4-6",
-    "opus-4.5-thinking": "claude-opus-4-5",
-    "opus-4.5": "claude-opus-4-5",
-  },
   [OPENCODE_DRIVER_KIND]: {},
 };
 
@@ -219,7 +262,11 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
 export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: "Codex",
   [CLAUDE_DRIVER_KIND]: "Claude",
-  [CURSOR_DRIVER_KIND]: "Cursor",
-  [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
+  // Cursor and Grok were REMOVED from this build on purpose (#150). They had
+  // labels here long after their drivers were deleted, so the picker could
+  // render a provider the server registry has nothing to instantiate — the
+  // failure moved from "not offered" to "offered, accepted, then broken".
+  // A slug that arrives from an older client still decodes; it just falls back
+  // to the generic slug name instead of being advertised as supported.
 };

@@ -186,6 +186,43 @@ describe("resolveThreadMetadataUpdateForNextTurn", () => {
     ).toEqual({ branch: "feature/checkout", worktreePath: null });
   });
 
+  // #202: a model switch is a RUNTIME ADMISSION DECISION, not client metadata.
+  //
+  // This helper used to return `{ modelSelection }` the moment the picker
+  // differed, and the caller committed it durably before `thread.turn.start`
+  // ran. A runtime that then refused the switch left the thread advertising a
+  // model no session ever accepted. The selection still travels WITH the turn;
+  // the server commits it once `sendTurn` succeeds.
+  it("never commits a model switch ahead of the turn that has to be accepted", () => {
+    expect(
+      resolveThreadMetadataUpdateForNextTurn({
+        currentModelSelection: modelSelection,
+        nextModelSelection: {
+          instanceId: ProviderInstanceId.make("ollama"),
+          model: "a-model-the-runtime-may-refuse",
+        },
+        currentBranch: "feature/thread",
+      }),
+    ).toBeNull();
+  });
+
+  // The two fields are not symmetric and the fix must not flatten them: a
+  // branch change is a checkout fact the client already observed, so it still
+  // rides along even when the model changed in the same submit.
+  it("still writes a branch change, and still writes only the branch", () => {
+    expect(
+      resolveThreadMetadataUpdateForNextTurn({
+        currentModelSelection: modelSelection,
+        nextModelSelection: {
+          instanceId: ProviderInstanceId.make("ollama"),
+          model: "some-other-model",
+        },
+        currentBranch: "feature/thread",
+        nextBranch: "feature/checkout",
+      }),
+    ).toEqual({ branch: "feature/checkout", worktreePath: null });
+  });
+
   it("does not write metadata when the model and branch are unchanged", () => {
     expect(
       resolveThreadMetadataUpdateForNextTurn({

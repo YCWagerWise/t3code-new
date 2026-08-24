@@ -1,0 +1,22 @@
+# #408: keep the `[patch."https://github.com/YCWagerWise/turso"]` redirect ALIVE.
+#
+# The patch points turso at the local ../turso checkout. Cargo can only honour
+# it if it can still RESOLVE the git URL the patch replaces — and this fork is
+# reachable over https but not over cargo's built-in ssh transport:
+#
+#   $ cargo update -p turso
+#   failed to authenticate when downloading repository: git@github.com:YCWagerWise/turso
+#   * attempted ssh-agent authentication, but no usernames succeeded: `git`
+#
+# When that fetch fails, cargo does NOT error — it falls back to the git source
+# already pinned in Cargo.lock and silently re-resolves turso away from the
+# local path. That is how the patch sat in Cargo.toml looking correct while
+# `cargo metadata` still reported
+#   turso 0.7.0-pre.18 (git+...YCWagerWise/turso?branch=main#51d9ac69)
+# and cargo printed `warning: patch ... was not used in the crate graph`.
+#
+# Delegating the fetch to the git CLI uses the credentials that already work
+# (`git ls-remote <fork> main` succeeds), so the redirect holds on every
+# invocation instead of only the ones run with the env var set by hand.
+[net]
+git-fetch-with-cli = true

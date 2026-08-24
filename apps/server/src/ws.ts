@@ -50,6 +50,8 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  TerminalCwdNotAdmittedError,
+  VcsPathNotAdmittedError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -95,6 +97,7 @@ import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
+import * as GitActionRegistry from "./git/GitActionRegistry.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
@@ -364,6 +367,7 @@ const makeWsRpcLayer = (
       const externalLauncher = yield* ExternalLauncher.ExternalLauncher;
       const remoteOpenTargets = yield* RemoteOpenTargets.RemoteOpenTargets;
       const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
+      const gitActions = yield* GitActionRegistry.GitActionRegistry;
       const review = yield* ReviewService.ReviewService;
       const vcsProvisioning = yield* VcsProvisioningService.VcsProvisioningService;
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
@@ -378,6 +382,7 @@ const makeWsRpcLayer = (
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+      const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
@@ -1038,6 +1043,36 @@ const makeWsRpcLayer = (
         vcsStatusBroadcaster
           .refreshStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+
+      /**
+       * The directories this environment owns: every registered project's
+       * workspace root, plus the worktrees the server itself creates.
+       *
+       * Read fresh per call rather than cached — a project added mid-session must
+       * become admissible immediately, and a stale list would refuse legitimate
+       * work while pretending to be a security boundary.
+       */
+      const ownedRoots = Effect.fn("ws.ownedRoots")(function* () {
+        const snapshot = yield* projectionSnapshotQuery.getSnapshot();
+        return [...snapshot.projects.map((project) => project.workspaceRoot), config.worktreesDir];
+      });
+
+      /**
+       * Admit a client-supplied absolute path against those roots, or fail.
+       *
+       * Existence is not authority: a path that resolves outside every owned
+       * root is refused even though it is a perfectly real directory.
+       */
+      const admitWorkspacePath = Effect.fn("ws.admitWorkspacePath")(function* (candidate: string) {
+        const roots = yield* ownedRoots();
+        return yield* workspacePaths.admitPathWithinRoots({ candidate, roots });
+      });
+
+      /** The same admission, in the terminal contract's vocabulary. */
+      const admitTerminalCwd = (candidate: string) =>
+        admitWorkspacePath(candidate).pipe(
+          Effect.mapError(() => new TerminalCwdNotAdmittedError({ cwd: candidate })),
+        );
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -1957,24 +1992,149 @@ const makeWsRpcLayer = (
         [WS_METHODS.gitRunStackedAction]: (input) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
+            // #278: the action is REGISTERED for its whole life, then run on its
+            // own forked fiber, and this stream is just one attached viewer.
+            //
+            // It used to be the other way round: the stream WAS the action, so
+            // the only reference to running work was the socket that started it.
+            // A route refresh dropped it and the work continued invisibly, with
+            // nothing on the server able to report on it or stop it. Forking is
+            // what gives cancel something to interrupt — and because
+            // processRunner spawns git under `Effect.scoped`, interrupting that
+            // fiber kills the child rather than orphaning it.
             Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
+              Effect.gen(function* () {
+                yield* gitActions.register({
                   actionId: input.actionId,
-                  progressReporter: {
-                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                  cwd: input.cwd,
+                  action: input.action,
+                });
+                // Every frame lands in the registry FIRST, so a client that
+                // reconnects can replay it, and only then goes to this socket.
+                const unsubscribe = yield* gitActions.subscribe(input.actionId, {
+                  onEvent: (event) => {
+                    Queue.offerUnsafe(queue, event);
                   },
-                })
-                .pipe(
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) => Queue.failCause(queue, cause),
-                    onSuccess: () =>
-                      refreshGitStatus(input.cwd).pipe(
-                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
-                      ),
-                  }),
-                ),
+                  onEnd: () => {
+                    Queue.endUnsafe(queue);
+                  },
+                });
+                // Released when the stream's scope closes — i.e. when this
+                // socket goes away. Returning the function instead would leak a
+                // subscriber per disconnect, which on a reconnecting client is
+                // an unbounded set of dead callbacks holding the record alive.
+                yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+                const fiber = yield* gitWorkflow
+                  .runStackedAction(input, {
+                    actionId: input.actionId,
+                    progressReporter: {
+                      publish: (event) => gitActions.publish(input.actionId, event),
+                    },
+                  })
+                  .pipe(
+                    Effect.matchCauseEffect({
+                      // FAIL THE CALLER'S STREAM FIRST, then record it.
+                      //
+                      // Order is load-bearing: `finish` notifies subscribers,
+                      // and this stream is one of them — its `onEnd` ENDS the
+                      // queue. End it first and the failCause afterwards lands
+                      // on an already-terminated queue, so the caller sees a
+                      // clean end instead of the error. That is exactly the
+                      // fail-open shape #427 was about, reintroduced one layer
+                      // over, and it is what the server-router seam test caught.
+                      onFailure: (cause) =>
+                        Queue.failCause(queue, cause).pipe(
+                          Effect.andThen(
+                            gitActions.finish(input.actionId, {
+                              status: "failed",
+                              failure: Cause.pretty(cause),
+                            }),
+                          ),
+                        ),
+                      onSuccess: () =>
+                        refreshGitStatus(input.cwd).pipe(
+                          Effect.andThen(
+                            gitActions.finish(input.actionId, { status: "completed" }),
+                          ),
+                        ),
+                    }),
+                    // Detached from THIS request's scope on purpose: the action
+                    // must outlive the socket that started it, which is the
+                    // whole point of a reattachable job.
+                    Effect.forkDetach,
+                  );
+                yield* gitActions.bindFiber(input.actionId, fiber);
+              }),
             ),
+            { "rpc.aggregate": "vcs" },
+          ),
+
+        /** #278: "is something running in this repo, and where is it?" */
+        [WS_METHODS.gitInspectStackedAction]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitInspectStackedAction,
+            Effect.gen(function* () {
+              const action = yield* gitActions.inspect(input.actionId);
+              const events = yield* gitActions.eventsSince(input.actionId, 0);
+              return { action, events };
+            }),
+            { "rpc.aggregate": "vcs" },
+          ),
+
+        /**
+         * #278: re-attach to work already in flight. Replays from the caller's
+         * cursor, then follows live. Starts nothing.
+         */
+        [WS_METHODS.gitAttachStackedAction]: (input) =>
+          observeRpcStream(
+            WS_METHODS.gitAttachStackedAction,
+            Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
+              Effect.gen(function* () {
+                // Replay BEFORE subscribing, so the gap the client missed and
+                // the live tail arrive in one ordered sequence.
+                const missed = yield* gitActions.eventsSince(input.actionId, input.cursor ?? 0);
+                for (const event of missed) Queue.offerUnsafe(queue, event);
+                const snapshot = yield* gitActions.inspect(input.actionId);
+                if (snapshot === null || snapshot.status !== "running") {
+                  // Unknown or already finished: end the stream instead of
+                  // leaving the caller parked on an end that already happened.
+                  Queue.endUnsafe(queue);
+                  return;
+                }
+                const unsubscribe = yield* gitActions.subscribe(input.actionId, {
+                  onEvent: (event) => {
+                    Queue.offerUnsafe(queue, event);
+                  },
+                  onEnd: () => {
+                    Queue.endUnsafe(queue);
+                  },
+                });
+                yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+              }),
+            ),
+            { "rpc.aggregate": "vcs" },
+          ),
+
+        /**
+         * #278: stop it for real. Interrupts the server-side fiber, which closes
+         * the scope the git child runs in. Not a cleared toast.
+         */
+        [WS_METHODS.gitCancelStackedAction]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitCancelStackedAction,
+            Effect.gen(function* () {
+              const canceled = yield* gitActions.cancel(input.actionId, input.reason);
+              const action = yield* gitActions.inspect(input.actionId);
+              // The tree may have been half-mutated (commit landed, push
+              // refused), so the status is republished — leaving it stale would
+              // show a tree that does not match disk. The cwd comes from the
+              // ACTION, not the request: the caller cancelling is often not the
+              // one that started it and has no reason to know the path.
+              if (action !== null) {
+                yield* refreshGitStatus(action.cwd).pipe(Effect.ignore);
+              }
+              return { canceled, action };
+            }),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.gitResolvePullRequest]: (input) =>
@@ -2024,9 +2184,25 @@ const makeWsRpcLayer = (
         [WS_METHODS.vcsInit]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsInit,
-            vcsProvisioning
-              .initRepository(input)
-              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            // ADMIT THE TARGET BEFORE CREATING A REPOSITORY IN IT (#277).
+            //
+            // `vcs.init` takes a client-supplied `cwd` and runs `git init` there.
+            // Without an admission seam that is a write primitive pointed at any
+            // directory the server process can reach — the frontend could plant a
+            // `.git` outside every project and worktree this environment owns.
+            // The roots are the registered projects plus the environment's own
+            // worktree directory, canonicalized, so a symlink out of one is
+            // refused rather than followed.
+            admitWorkspacePath(input.cwd).pipe(
+              // Surface the refusal in the RPC's own vocabulary: a client must be
+              // able to tell "outside your projects" from a git failure.
+              Effect.mapError(() => new VcsPathNotAdmittedError({ cwd: input.cwd })),
+              Effect.flatMap(() =>
+                vcsProvisioning
+                  .initRepository(input)
+                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             { "rpc.aggregate": "vcs" },
           ),
         [WS_METHODS.reviewGetDiffPreview]: (input) =>
@@ -2040,9 +2216,16 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "review" },
           ),
         [WS_METHODS.terminalOpen]: (input) =>
-          observeRpcEffect(WS_METHODS.terminalOpen, terminalManager.open(input), {
-            "rpc.aggregate": "terminal",
-          }),
+          observeRpcEffect(
+            WS_METHODS.terminalOpen,
+            // A terminal is a SHELL. Admitting its cwd by stat alone only proves
+            // the directory exists, never that it is ours (#290) — so the same
+            // ownership seam `vcs.init` crosses is crossed here, before a PTY is
+            // rooted anywhere. Manager still enforces cwd-inside-worktreePath;
+            // this is the half that binds an unclaimed cwd to the environment.
+            admitTerminalCwd(input.cwd).pipe(Effect.flatMap(() => terminalManager.open(input))),
+            { "rpc.aggregate": "terminal" },
+          ),
         [WS_METHODS.terminalAttach]: (input) =>
           observeRpcStream(
             WS_METHODS.terminalAttach,
@@ -2067,9 +2250,12 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "terminal",
           }),
         [WS_METHODS.terminalRestart]: (input) =>
-          observeRpcEffect(WS_METHODS.terminalRestart, terminalManager.restart(input), {
-            "rpc.aggregate": "terminal",
-          }),
+          observeRpcEffect(
+            WS_METHODS.terminalRestart,
+            // Restart re-roots the shell, so it is the same decision as open.
+            admitTerminalCwd(input.cwd).pipe(Effect.flatMap(() => terminalManager.restart(input))),
+            { "rpc.aggregate": "terminal" },
+          ),
         [WS_METHODS.terminalClose]: (input) =>
           observeRpcEffect(WS_METHODS.terminalClose, terminalManager.close(input), {
             "rpc.aggregate": "terminal",

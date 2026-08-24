@@ -25,10 +25,101 @@ export interface TerminalBufferState {
   readonly version: number;
 }
 
+/**
+ * WHO OWNS A PTY. Mirrors the backend's `TerminalOwner`
+ * (`backend/src/terminal.rs:287`) and the wire union
+ * `TerminalTargetInput` (`contracts/src/terminal.ts:72`).
+ *
+ * A union rather than `{ threadId, sessionId }` with one of them null, for the
+ * reason the contract file already gives: two nullable fields make the
+ * disagreeing state representable, and every reader then has to know which one
+ * wins. Here the compiler decides instead — a pane has exactly one owner, and
+ * `kind` is the only way to read it.
+ *
+ * This is the half of #149 the frontend was missing. It was not a missing
+ * feature, it was a missing TYPE: `KnownTerminalSessionTarget` hardcoded
+ * `threadId`, so a subagent's PTY was UNREPRESENTABLE and
+ * `useKnownTerminalSessions` had no honest option but to filter it out.
+ */
+export type KnownTerminalSessionOwner =
+  | { readonly kind: "thread"; readonly threadId: ThreadId }
+  | {
+      readonly kind: "session";
+      readonly sessionId: string;
+      /** Where the child is running, when the backend knows it. */
+      readonly worktreePath: string | null;
+    };
+
 export interface KnownTerminalSessionTarget {
   readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
+  readonly owner: KnownTerminalSessionOwner;
   readonly terminalId: string;
+}
+
+/**
+ * Read a pane's owner off the wire, exactly as `TerminalOwner::wire` writes it
+ * (`backend/src/terminal.rs`): `threadId` set means a thread pane, `sessionId`
+ * set means a child session. Returns `null` for a summary that names neither,
+ * which is not addressable and must be skipped rather than guessed at.
+ *
+ * Lives HERE, beside the type, rather than inline in a React hook: it is the
+ * rule for decoding an owner, and a second call site that re-derived it would
+ * be free to get the precedence wrong. `sessionId` is `optional` in the
+ * contract because the TypeScript server does not emit the key yet, so absent
+ * and null both have to mean "not a child session".
+ */
+export function terminalOwnerOfSummary(summary: {
+  readonly threadId: string | null;
+  readonly sessionId?: string | null | undefined;
+  readonly worktreePath?: string | null | undefined;
+}): KnownTerminalSessionOwner | null {
+  if (summary.threadId !== null && summary.threadId !== undefined) {
+    return { kind: "thread", threadId: summary.threadId as ThreadId };
+  }
+  if (summary.sessionId !== null && summary.sessionId !== undefined) {
+    return {
+      kind: "session",
+      sessionId: summary.sessionId,
+      worktreePath: summary.worktreePath ?? null,
+    };
+  }
+  return null;
+}
+
+/** Whether two owners name the same pane owner. */
+export function sameTerminalOwner(
+  a: KnownTerminalSessionOwner,
+  b: KnownTerminalSessionOwner,
+): boolean {
+  if (a.kind === "thread" && b.kind === "thread") {
+    return a.threadId === b.threadId;
+  }
+  if (a.kind === "session" && b.kind === "session") {
+    return a.sessionId === b.sessionId;
+  }
+  return false;
+}
+
+/** The thread that owns this pane, or `null` when a child session does. */
+export function ownerThreadId(target: KnownTerminalSessionTarget): ThreadId | null {
+  return target.owner.kind === "thread" ? target.owner.threadId : null;
+}
+
+/** The child session that owns this pane, or `null` when a thread does. */
+export function ownerSessionId(target: KnownTerminalSessionTarget): string | null {
+  return target.owner.kind === "session" ? target.owner.sessionId : null;
+}
+
+/**
+ * Stable identity for a pane, for React keys and focus tracking. Namespaced by
+ * `kind` so a thread and a session that happen to share an id cannot collide.
+ */
+export function terminalTargetKey(target: KnownTerminalSessionTarget): string {
+  const owner =
+    target.owner.kind === "thread"
+      ? `thread:${target.owner.threadId}`
+      : `session:${target.owner.sessionId}`;
+  return `${target.environmentId}|${owner}|${target.terminalId}`;
 }
 
 export interface KnownTerminalSession {

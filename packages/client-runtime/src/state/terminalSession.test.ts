@@ -16,6 +16,13 @@ const TARGET = {
   terminalId: "term-1",
 } as const;
 
+/** The same pane as an owner-addressed target (#149). */
+const OWNED_TARGET = {
+  environmentId: TARGET.environmentId,
+  owner: { kind: "thread", threadId: TARGET.threadId },
+  terminalId: TARGET.terminalId,
+} as const;
+
 const BASE_SNAPSHOT: TerminalSessionSnapshot = {
   threadId: TARGET.threadId,
   terminalId: TARGET.terminalId,
@@ -91,7 +98,7 @@ describe("terminal session reducers", () => {
 
   it("does not treat an idle running shell as a running subprocess", () => {
     const idleSession = {
-      target: TARGET,
+      target: OWNED_TARGET,
       state: {
         ...combineTerminalSessionState(null, EMPTY_TERMINAL_BUFFER_STATE),
         status: "running" as const,
@@ -99,7 +106,7 @@ describe("terminal session reducers", () => {
       },
     };
     const activeSession = {
-      target: { ...TARGET, terminalId: "term-2" },
+      target: { ...OWNED_TARGET, terminalId: "term-2" },
       state: {
         ...idleSession.state,
         hasRunningSubprocess: true,

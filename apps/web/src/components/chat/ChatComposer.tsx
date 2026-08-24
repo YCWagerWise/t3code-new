@@ -215,6 +215,7 @@ import { getProviderInteractionModeToggle } from "../../providerModels";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
+  isProviderInstancePickerReady,
   NO_PROVIDER_MODEL_SELECTION,
   resolveProviderDriverKindForInstanceSelection,
   resolveSelectableProviderInstanceEntry,
@@ -835,7 +836,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => providerInstanceEntries.find((entry) => entry.instanceId === selectedInstanceId),
     [providerInstanceEntries, selectedInstanceId],
   );
-  const noProviderAvailable = selectedProviderEntry === undefined;
+  // Existence is not readiness (#243). Gating on `=== undefined` alone lets a
+  // persisted thread/default selection resolve a snapshot the runtime has
+  // already reported as `status: "error"`, `installed: false`, or
+  // `availability: "unavailable"` — the picker hides its models, but send stays
+  // enabled and the turn is dispatched into a provider that cannot run it.
+  //
+  // Route this through the SAME predicate the picker uses, so "can I choose
+  // this?" and "can I send to this?" cannot drift apart. The snapshot lookup
+  // above deliberately stays unfiltered: slash commands, skills, and the model
+  // list still need the selected instance's data even while it is unready.
+  const noProviderAvailable =
+    selectedProviderEntry === undefined || !isProviderInstancePickerReady(selectedProviderEntry);
   // The driver kind follows the instance that will actually run the turn,
   // which can differ from the persisted selection when that selection is
   // disabled.

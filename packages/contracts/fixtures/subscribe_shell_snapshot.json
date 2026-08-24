@@ -1,0 +1,19 @@
+{
+  "kind": "snapshot",
+  "snapshot": {
+    "projects": [
+      {
+        "createdAt": "2026-08-23T16:02:43.173Z",
+        "defaultModelSelection": null,
+        "id": "p-workspace",
+        "scripts": [],
+        "title": "workspace",
+        "updatedAt": "2026-08-23T16:02:43.173Z",
+        "workspaceRoot": "/var/folders/yh/v46kvtbj7fvc1xprn04c53qh0000gn/T/t3ct-6f3ca230-8d2d-45a3-b262-0a523ec6e177"
+      }
+    ],
+    "snapshotSequence": 0,
+    "threads": [],
+    "updatedAt": "2026-08-23T16:02:43.190Z"
+  }
+}

@@ -30,10 +30,8 @@ import {
 const isServerProviderUpdateError = Schema.is(ServerProviderUpdateError);
 
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
-const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
 const CODEX_INSTANCE_ID = ProviderInstanceId.make("codex");
-const CURSOR_INSTANCE_ID = ProviderInstanceId.make("cursor");
 const OPENCODE_INSTANCE_ID = ProviderInstanceId.make("opencode");
 const encoder = new TextEncoder();
 
@@ -44,13 +42,13 @@ const encoder = new TextEncoder();
 const NonWindowsPlatform = Layer.succeed(HostProcessPlatform, "linux");
 
 function lifecycleFor(provider: ProviderDriverKind): ProviderMaintenanceCapabilities {
-  if (provider === CURSOR_DRIVER) {
+  if (provider === OPENCODE_DRIVER) {
     return makeProviderMaintenanceCapabilities({
       provider,
       packageName: null,
-      updateExecutable: "cursor-agent",
+      updateExecutable: "opencode",
       updateArgs: ["update"],
-      updateLockKey: "cursor-agent",
+      updateLockKey: "opencode",
     });
   }
   return makeProviderMaintenanceCapabilities({
@@ -77,12 +75,6 @@ const baseProvider: ServerProvider = {
   models: [],
   slashCommands: [],
   skills: [],
-};
-
-const baseCursorProvider: ServerProvider = {
-  ...baseProvider,
-  instanceId: CURSOR_INSTANCE_ID,
-  driver: CURSOR_DRIVER,
 };
 
 const baseOpenCodeProvider: ServerProvider = {
@@ -220,13 +212,13 @@ describe("providerMaintenanceRunner", () => {
   it.effect("runs the allowlisted provider update command and records success", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     return Effect.gen(function* () {
-      const { registry, updateStatesRef } = yield* makeRegistry(baseCursorProvider);
+      const { registry, updateStatesRef } = yield* makeRegistry(baseOpenCodeProvider);
       const updater = yield* makeTestRunner(registry);
 
-      const result = yield* updater.updateProvider(CURSOR_DRIVER);
+      const result = yield* updater.updateProvider(OPENCODE_DRIVER);
       assert.deepStrictEqual(calls, [
         {
-          command: "cursor-agent",
+          command: "opencode",
           args: ["update"],
         },
       ]);

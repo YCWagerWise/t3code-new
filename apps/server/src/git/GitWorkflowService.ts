@@ -1,6 +1,7 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as GitActionRegistry from "./GitActionRegistry.ts";
 
 import {
   GitManagerError,
@@ -334,4 +335,15 @@ export const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(GitWorkflowService, make);
+/**
+ * The workflow, plus the durable registry for the actions it runs (#278).
+ *
+ * Merged here rather than wired separately at every call site because they are
+ * one concern: a stacked action is only inspectable/attachable/cancellable
+ * because something outlives the request that started it. Provide the workflow
+ * and you get the handle for its actions — no consumer can end up with a
+ * workflow whose actions are invisible again.
+ */
+export const layer = Layer.effect(GitWorkflowService, make).pipe(
+  Layer.provideMerge(GitActionRegistry.layer),
+);

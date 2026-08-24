@@ -10,6 +10,8 @@ import {
   TerminalOpenInput,
   TerminalResizeInput,
   TerminalSessionSnapshot,
+  TerminalSummary,
+  TerminalTargetInput,
   TerminalThreadInput,
   TerminalWriteInput,
 } from "./terminal.ts";
@@ -300,5 +302,89 @@ describe("TerminalEvent", () => {
         },
       }),
     ).toBe(true);
+  });
+});
+
+// #149: a subagent's PTY must be addressable. The Rust runtime already resolves
+// a pane by `sessionId` in preference to `threadId`, carries a ChildSession
+// pane kind with its own worktree, and emits `sessionId` on every snapshot
+// (backend/src/terminal.rs:287, :293-307, :88-94). The contract could not ASK
+// for any of it, which is the whole reason #149 reads as a missing UI path —
+// the UI was unwritable.
+describe("TerminalTargetInput (#149)", () => {
+  it("still accepts a thread-addressed pane unchanged", () => {
+    expect(decodeSync(TerminalTargetInput, { threadId: "t-1" })).toEqual({ threadId: "t-1" });
+  });
+
+  it("accepts a child session, with and without its own worktree", () => {
+    expect(decodeSync(TerminalTargetInput, { sessionId: "s-1" })).toEqual({ sessionId: "s-1" });
+    expect(decodeSync(TerminalTargetInput, { sessionId: "s-1", worktreePath: "/w/sub" })).toEqual({
+      sessionId: "s-1",
+      worktreePath: "/w/sub",
+    });
+  });
+
+  // The two assertions that make the union worth being a union. With one struct
+  // carrying both ids as optionals, BOTH of these would decode: a request
+  // naming no pane at all, and a request naming two that disagree.
+  it("rejects a target that names no pane", () => {
+    expect(decodes(TerminalTargetInput, {})).toBe(false);
+  });
+
+  it("rejects a target that names both a thread and a session", () => {
+    expect(decodes(TerminalTargetInput, { threadId: "t-1", sessionId: "s-1" })).toBe(false);
+  });
+
+  it("rejects blank ids rather than addressing a pane with an empty string", () => {
+    expect(decodes(TerminalTargetInput, { sessionId: "   " })).toBe(false);
+    expect(decodes(TerminalTargetInput, { threadId: "" })).toBe(false);
+  });
+});
+
+describe("terminal snapshots carry the child session (#149)", () => {
+  const snapshot = {
+    threadId: "t-1",
+    terminalId: "term-1",
+    cwd: "/w",
+    worktreePath: null,
+    status: "running",
+    pid: 42,
+    history: "",
+    exitCode: null,
+    exitSignal: null,
+    label: "zsh",
+    updatedAt: "2026-08-24T00:00:00.000Z",
+  };
+
+  // The TypeScript server does not emit `sessionId` yet. If the field were
+  // required-but-nullable rather than optional, every one of its snapshots
+  // would fail to decode — and a snapshot that fails to decode is a terminal
+  // the user cannot see. That is why this is `optional(NullOr(...))`.
+  it("decodes a snapshot with no sessionId at all", () => {
+    expect(decodes(TerminalSessionSnapshot, snapshot)).toBe(true);
+  });
+
+  it("decodes an explicit null sessionId as a thread pane", () => {
+    expect(decodes(TerminalSessionSnapshot, { ...snapshot, sessionId: null })).toBe(true);
+  });
+
+  it("carries the sessionId through when the pane is a child session", () => {
+    const decoded = decodeSync(TerminalSessionSnapshot, {
+      ...snapshot,
+      sessionId: "s-1",
+      worktreePath: "/w/sub",
+    });
+    expect(decoded.sessionId).toBe("s-1");
+    expect(decoded.worktreePath).toBe("/w/sub");
+  });
+
+  it("applies the same shape to the metadata summary, so a list and a snapshot agree", () => {
+    const { history: _history, ...summaryFields } = snapshot;
+    const decoded = decodeSync(TerminalSummary, {
+      ...summaryFields,
+      hasRunningSubprocess: false,
+      sessionId: "s-1",
+    });
+    expect(decoded.sessionId).toBe("s-1");
   });
 });

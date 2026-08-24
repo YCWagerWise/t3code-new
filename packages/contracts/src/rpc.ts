@@ -21,6 +21,11 @@ import {
 import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
 import {
   GitActionProgressEvent,
+  GitAttachStackedActionInput,
+  GitCancelStackedActionInput,
+  GitCancelStackedActionResult,
+  GitInspectStackedActionInput,
+  GitInspectStackedActionResult,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
   GitCommandError,
@@ -191,7 +196,7 @@ import {
   SourceControlRepositoryInfo,
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
-import { VcsError } from "./vcs.ts";
+import { VcsError, VcsPathNotAdmittedError } from "./vcs.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -223,6 +228,11 @@ export const WS_METHODS = {
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
+  // #278: a stacked action is a durable, runtime-visible job — these are the
+  // controls that survive a frontend reconnect.
+  gitInspectStackedAction: "git.inspectStackedAction",
+  gitAttachStackedAction: "git.attachStackedAction",
+  gitCancelStackedAction: "git.cancelStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
 
@@ -691,6 +701,33 @@ export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction,
   stream: true,
 });
 
+export const WsGitInspectStackedActionRpc = Rpc.make(WS_METHODS.gitInspectStackedAction, {
+  payload: GitInspectStackedActionInput,
+  success: GitInspectStackedActionResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
+/**
+ * Re-attach to an action already in flight (#278).
+ *
+ * Streams like `git.runStackedAction` does, but does NOT start anything: it
+ * replays from the caller's cursor and then follows live. That is what makes a
+ * route refresh survivable — the old shape could only start a new action or
+ * watch nothing.
+ */
+export const WsGitAttachStackedActionRpc = Rpc.make(WS_METHODS.gitAttachStackedAction, {
+  payload: GitAttachStackedActionInput,
+  success: GitActionProgressEvent,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsGitCancelStackedActionRpc = Rpc.make(WS_METHODS.gitCancelStackedAction, {
+  payload: GitCancelStackedActionInput,
+  success: GitCancelStackedActionResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
 export const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequest, {
   payload: GitPullRequestRefInput,
   success: GitResolvePullRequestResult,
@@ -734,7 +771,11 @@ export const WsVcsSwitchRefRpc = Rpc.make(WS_METHODS.vcsSwitchRef, {
 
 export const WsVcsInitRpc = Rpc.make(WS_METHODS.vcsInit, {
   payload: VcsInitInput,
-  error: Schema.Union([VcsError, EnvironmentAuthorizationError]),
+  // `VcsPathNotAdmittedError` is a REFUSAL, not a driver failure, so it belongs
+  // here rather than in `VcsError`: the git process never ran. Folding it into
+  // the driver union would force every `catchTags` over a git command to handle
+  // a case that command can never produce.
+  error: Schema.Union([VcsError, EnvironmentAuthorizationError, VcsPathNotAdmittedError]),
 });
 
 /**
@@ -1038,6 +1079,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,
+  WsGitInspectStackedActionRpc,
+  WsGitAttachStackedActionRpc,
+  WsGitCancelStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
   WsVcsListRefsRpc,

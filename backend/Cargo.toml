@@ -1,0 +1,73 @@
+[package]
+name = "t3code-agent"
+version = "0.1.0"
+edition = "2021"
+description = "The Rust agent backend t3code spawns as a provider: serves the durable agent-sdk runtime over stdio ACP. Keeps agent-sdk-rs a pure library."
+
+[lib]
+name = "t3code_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "t3code-agent"
+path = "src/main.rs"
+
+# The Rust backend that REPLACES t3code's Node server: serves the web UI + the
+# Effect-RPC-over-WS protocol the frontend speaks, calling agent-sdk-rs in
+# process (no stdio ACP hop). Built milestone-by-milestone against the live UI.
+[[bin]]
+name = "t3code-server"
+path = "src/server_main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# NON-BLOCKING log writer (#404). A synchronous write to stdout parks the
+# thread that emits it; on tokio worker threads that wedges the whole server
+# whenever the parent process does not drain the pipe.
+tracing-appender = "0.2"
+futures = "0.3"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+# the substrate, as a LIBRARY (path dep — never vendored into the product)
+agent-sdk-core = { path = "../../agent-sdk-rs/crates/agent-sdk-core" }
+agent-sdk-do = { path = "../../agent-sdk-rs/crates/agent-sdk-do" }
+agent-sdk-runtime = { path = "../../agent-sdk-rs/crates/agent-sdk-runtime" }
+agent-sdk-provider = { path = "../../agent-sdk-rs/crates/agent-sdk-provider" }
+agent-sdk-acp = { path = "../../agent-sdk-rs/crates/agent-sdk-acp" }
+agent-sdk-shell = { path = "../../agent-sdk-rs/crates/agent-sdk-shell" }
+agent-sdk-usage = { path = "../../agent-sdk-rs/crates/agent-sdk-usage" }
+agent-sdk-metrics = { path = "../../agent-sdk-rs/crates/agent-sdk-metrics" }
+agent-sdk-branch = { path = "../../agent-sdk-rs/crates/agent-sdk-branch" }
+agent-sdk-exec = { path = "../../agent-sdk-rs/crates/agent-sdk-exec" }
+# the coding tools — libraries the product adapts into agent-sdk Actions
+hearth = { path = "../../hearth" }
+# cairn: git-backed file tools + checkpoints (every write/edit is a commit)
+cairn = { path = "../../cairn", features = ["stack"] }
+do-storage = { path = "../../do-rs/crates/do-storage" }
+async-trait = "0.1"
+schemars = { version = "1.0", features = ["chrono04"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+serde_json = "1"
+# content search honours the contract's useRegex/wholeWord options
+regex = "1"
+# signed, expiring asset URLs (assets.createUrl + the /api/assets route)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# This crate is the HOST: it redirects the do-rs + turso git deps (that hearth,
+# do-storage etc. reference) to the local forks, so the whole graph links ONE
+# copy — exactly as the tool libraries' comments instruct a host to do.
+[patch."https://github.com/YCWagerWise/do-rs"]
+do-core = { path = "../../do-rs/crates/do-core" }
+do-storage = { path = "../../do-rs/crates/do-storage" }
+
+[patch."https://github.com/YCWagerWise/turso"]
+turso = { path = "../../turso/bindings/rust" }
+
+[dev-dependencies]
+tempfile = "3"

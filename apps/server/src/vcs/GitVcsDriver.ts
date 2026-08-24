@@ -113,6 +113,16 @@ export interface GitCommitProgress {
 export interface GitCommitOptions {
   readonly timeoutMs?: number;
   readonly progress?: GitCommitProgress;
+  /**
+   * Commit only these paths, leaving the user's index untouched.
+   *
+   * A selected-file commit used to be staged by mutating the real index
+   * (`git reset` then `git add` the selection), which silently discarded
+   * whatever the user had staged themselves and never put it back. Naming the
+   * paths on the commit instead keeps the index out of the protocol between
+   * `prepareCommitContext` and `commit`.
+   */
+  readonly filePaths?: readonly string[];
 }
 
 export interface GitPushResult {

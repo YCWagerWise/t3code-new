@@ -9,7 +9,6 @@ import type {
   GitRunStackedActionResult,
   GitStackedAction,
   SourceControlCloneProtocol,
-  SourceControlProviderDiscoveryItem,
   SourceControlProviderKind,
   SourceControlPublishRepositoryResult,
   SourceControlRepositoryVisibility,
@@ -43,6 +42,8 @@ import {
   type GitActionMenuItem,
   type GitQuickAction,
   type DefaultBranchConfirmableAction,
+  getPublishProviderReadiness,
+  type PublishProviderKind,
   requiresDefaultBranchConfirmation,
   resolveDefaultBranchActionDialogCopy,
   resolveLiveThreadBranchUpdate,
@@ -112,11 +113,6 @@ interface PendingDefaultBranchAction {
   onConfirmed?: () => void;
   filePaths?: string[];
 }
-
-type PublishProviderKind = Extract<
-  SourceControlProviderKind,
-  "github" | "gitlab" | "bitbucket" | "azure-devops"
->;
 
 type GitActionToastId = ReturnType<typeof toastManager.add>;
 
@@ -215,33 +211,6 @@ function isPublishProviderKind(
   provider: SourceControlProviderKind,
 ): provider is PublishProviderKind {
   return PUBLISH_PROVIDER_OPTIONS.some((option) => option.value === provider);
-}
-
-function getPublishProviderReadiness(input: {
-  provider: PublishProviderKind;
-  sourceControlProviders: ReadonlyArray<SourceControlProviderDiscoveryItem>;
-}): { readonly ready: boolean; readonly hint: string | null } {
-  const discovered = input.sourceControlProviders.find(
-    (provider) => provider.kind === input.provider,
-  );
-  if (!discovered) {
-    return {
-      ready: false,
-      hint: "Provider status unavailable. Open Settings -> Source Control and rescan.",
-    };
-  }
-  if (discovered.status !== "available") {
-    return { ready: false, hint: discovered.installHint };
-  }
-  if (discovered.auth.status === "unauthenticated") {
-    return {
-      ready: false,
-      hint:
-        Option.getOrNull(discovered.auth.detail) ??
-        `${discovered.label} is not authenticated. Open Settings -> Source Control for setup guidance.`,
-    };
-  }
-  return { ready: true, hint: null };
 }
 
 function formatElapsedDescription(startedAtMs: number | null): string | undefined {
@@ -1163,9 +1132,16 @@ export default function GitActionsControl({
       resolveQuickAction(gitStatusForActions, isGitActionRunning, isDefaultRef, hasPrimaryRemote),
     [gitStatusForActions, hasPrimaryRemote, isDefaultRef, isGitActionRunning],
   );
-  const quickActionDisabledReason = quickAction.disabled
-    ? (quickAction.hint ?? "This action is currently unavailable.")
+  // A repository we found but could not inspect reports a working tree we have
+  // no business acting on: every count in it is unknown, not zero. Disable the
+  // git actions with git's own reason rather than letting them run against a
+  // tree that merely looks clean.
+  const statusUnavailableReason = gitStatus?.statusUnavailable
+    ? (gitStatus.statusError ?? "This repository's status could not be read.")
     : null;
+  const quickActionDisabledReason =
+    statusUnavailableReason ??
+    (quickAction.disabled ? (quickAction.hint ?? "This action is currently unavailable.") : null);
   const pendingDefaultBranchActionCopy = pendingDefaultBranchAction
     ? resolveDefaultBranchActionDialogCopy({
         action: pendingDefaultBranchAction.action,

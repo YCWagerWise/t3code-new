@@ -1,8 +1,14 @@
-import type { VcsStatusResult } from "@t3tools/contracts";
+import type {
+  SourceControlProviderAuthStatus,
+  SourceControlProviderDiscoveryItem,
+  VcsStatusResult,
+} from "@t3tools/contracts";
+import * as Option from "effect/Option";
 import { assert, describe, it } from "vite-plus/test";
 import {
   buildGitActionProgressStages,
   buildMenuItems,
+  getPublishProviderReadiness,
   requiresDefaultBranchConfirmation,
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
@@ -1151,5 +1157,118 @@ describe("resolveAutoFeatureBranchName", () => {
   it("falls back to feature/update when no preferred name is provided", () => {
     const ref = resolveAutoFeatureBranchName(["main"]);
     assert.equal(ref, "feature/update");
+  });
+});
+
+describe("getPublishProviderReadiness", () => {
+  function item(
+    kind: "github" | "gitlab" | "bitbucket" | "azure-devops",
+    authStatus: SourceControlProviderAuthStatus,
+    detail: string | null = null,
+  ): SourceControlProviderDiscoveryItem {
+    return {
+      kind,
+      label: kind === "bitbucket" ? "Bitbucket" : kind,
+      status: "available",
+      version: Option.none(),
+      installHint: "install it",
+      detail: Option.none(),
+      auth: {
+        status: authStatus,
+        account: Option.none(),
+        host: Option.none(),
+        detail: detail === null ? Option.none() : Option.some(detail),
+      },
+    } as SourceControlProviderDiscoveryItem;
+  }
+
+  it("is ready only when auth is verified (authenticated)", () => {
+    const r = getPublishProviderReadiness({
+      provider: "github",
+      sourceControlProviders: [item("github", "authenticated")],
+    });
+    assert.equal(r.ready, true);
+    assert.equal(r.hint, null);
+  });
+
+  // #95: unknown means credentials present but UNVERIFIED — it must not be
+  // treated as ready, or Publish is enabled on an account that may fail to push.
+  it("does not treat auth unknown as ready", () => {
+    const r = getPublishProviderReadiness({
+      provider: "bitbucket",
+      sourceControlProviders: [item("bitbucket", "unknown")],
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.hint && r.hint.includes("not verified"), `hint: ${r.hint}`);
+  });
+
+  it("surfaces the backend detail for an unverified provider when present", () => {
+    const r = getPublishProviderReadiness({
+      provider: "azure-devops",
+      sourceControlProviders: [item("azure-devops", "unknown", "token present, probe failed")],
+    });
+    assert.equal(r.ready, false);
+    assert.equal(r.hint, "token present, probe failed");
+  });
+
+  it("blocks an explicitly unauthenticated provider", () => {
+    const r = getPublishProviderReadiness({
+      provider: "gitlab",
+      sourceControlProviders: [item("gitlab", "unauthenticated")],
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.hint && r.hint.includes("not authenticated"), `hint: ${r.hint}`);
+  });
+
+  it("reports unavailable when the provider was not discovered", () => {
+    const r = getPublishProviderReadiness({ provider: "github", sourceControlProviders: [] });
+    assert.equal(r.ready, false);
+    assert.ok(r.hint && r.hint.includes("unavailable"), `hint: ${r.hint}`);
+  });
+});
+
+describe("resolveQuickAction with an unreadable repository", () => {
+  // The backend distinguishes "not a repository" from "repository found, status
+  // could not be read" (vcs.rs status_unavailable). A degraded status still
+  // carries hasWorkingTreeChanges:false and an empty file list, because those
+  // counts are UNKNOWN rather than zero — so a resolver that only reads them
+  // offers an action against a tree nobody inspected.
+  it("refuses the quick action instead of reading the empty tree as clean", () => {
+    const action = resolveQuickAction(
+      status({ statusUnavailable: true, statusError: "index file corrupt" }),
+      false,
+    );
+    assert.isTrue(action.disabled, "a repository we could not inspect offers no action");
+    assert.strictEqual(action.kind, "show_hint");
+    assert.strictEqual(action.hint, "index file corrupt", "it shows git's own reason");
+  });
+
+  it("still refuses when the backend gave no reason", () => {
+    const action = resolveQuickAction(status({ statusUnavailable: true }), false);
+    assert.isTrue(action.disabled);
+    assert.strictEqual(action.hint, "This repository's status could not be read.");
+  });
+
+  it("does not offer to publish a repository whose status failed", () => {
+    // Without the gate this exact input returns an ENABLED "Publish repository":
+    // no upstream + no remote + clean-looking tree is the publish path.
+    const action = resolveQuickAction(
+      status({
+        statusUnavailable: true,
+        statusError: "git status failed",
+        hasUpstream: false,
+        hasPrimaryRemote: false,
+      }),
+      false,
+      false,
+      false,
+    );
+    assert.isTrue(action.disabled, `publish must not be offered: ${JSON.stringify(action)}`);
+    assert.notStrictEqual(action.kind, "open_publish");
+  });
+
+  it("leaves a healthy repository's action alone", () => {
+    const action = resolveQuickAction(status({ hasWorkingTreeChanges: true }), false);
+    assert.isFalse(action.disabled, "a readable dirty tree still commits");
   });
 });

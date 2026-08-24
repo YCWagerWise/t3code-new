@@ -1,0 +1,13 @@
+{
+  "kind": "project-upserted",
+  "project": {
+    "createdAt": "2026-08-23T17:22:32.284Z",
+    "defaultModelSelection": null,
+    "id": "p-fixture-upsert",
+    "scripts": [],
+    "title": "after",
+    "updatedAt": "2026-08-23T17:22:32.308Z",
+    "workspaceRoot": "/tmp"
+  },
+  "sequence": 1
+}

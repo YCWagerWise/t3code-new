@@ -902,3 +902,150 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 });
+
+// #175: the SDK's streaming contract composed with THIS reducer.
+//
+// agent-sdk-shell projects a Delta as the INCREMENT since the previous one, and
+// the backend renders each as a `streaming: true` message-sent. This reducer
+// APPENDS streaming text, so the two only agree if deltas are increments — an
+// accumulated delta renders "hel" + "hello" as "helhello". The frames below are
+// exactly what T3Projector emits for a turn that streams "hello world".
+describe("streaming deltas from the Rust runtime", () => {
+  const sent = (seq: number, text: string, streaming: boolean) =>
+    ({
+      ...baseEventFields,
+      eventId: EventId.make(`event-${seq}`),
+      sequence: seq,
+      occurredAt: "2026-04-01T06:00:00.000Z",
+      aggregateKind: "thread",
+      aggregateId: ThreadId.make("thread-1"),
+      type: "thread.message-sent",
+      payload: {
+        threadId: ThreadId.make("thread-1"),
+        messageId: MessageId.make("assistant-1"),
+        role: "assistant",
+        text,
+        turnId: TurnId.make("turn-1"),
+        streaming,
+        createdAt: "2026-04-01T06:00:00.000Z",
+        updatedAt: "2026-04-01T06:00:00.000Z",
+      },
+    }) as const;
+
+  it("renders incremental deltas as the text the model actually produced", () => {
+    let thread: OrchestrationThread = baseThread;
+    // two increments, then the settled message
+    for (const event of [
+      sent(1, "hello", true),
+      sent(2, " world", true),
+      sent(3, "hello world", false),
+    ]) {
+      const result = applyThreadDetailEvent(thread, event);
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") thread = result.thread;
+    }
+    expect(thread.messages).toHaveLength(1);
+    expect(thread.messages[0]?.text).toBe("hello world");
+    expect(thread.messages[0]?.streaming).toBe(false);
+  });
+
+  it("would duplicate text if the runtime sent accumulated deltas", () => {
+    // The regression this pins: accumulated deltas ("hello", then "hello world")
+    // through an appending reducer produce "hellohello world".
+    let thread: OrchestrationThread = baseThread;
+    for (const event of [sent(1, "hello", true), sent(2, "hello world", true)]) {
+      const result = applyThreadDetailEvent(thread, event);
+      if (result.kind === "updated") thread = result.thread;
+    }
+    expect(thread.messages[0]?.text).toBe("hellohello world");
+  });
+
+  // The 2026-08-19 capture showed one Codex reply rendered as
+  // "Hello. What should I work on in [applications]?Hello. What should I work
+  // on in [applications]?" — the settled text with the streaming frames
+  // appended onto it a second time on hydration.
+  it("does not re-append streaming frames replayed after the message settled", () => {
+    let thread: OrchestrationThread = baseThread;
+    for (const event of [
+      sent(1, "hello", true),
+      sent(2, " world", true),
+      sent(3, "hello world", false),
+    ]) {
+      const result = applyThreadDetailEvent(thread, event);
+      if (result.kind === "updated") thread = result.thread;
+    }
+    expect(thread.messages[0]?.text).toBe("hello world");
+
+    // Hydration re-delivers the same frames. The entry has already settled, so
+    // each one is a replay of text it already holds and must be a NO-OP.
+    //
+    // This used to assert " world" — the last replayed delta — and that was
+    // wrong twice over. A settled entry that accepts a replayed delta first
+    // truncates to it and then un-settles itself, which re-arms the append
+    // path, so a FULL in-order replay rebuilds the string by luck while a
+    // partial or reordered one leaves the bubble holding one fragment. The
+    // assertion enshrined that luck. Checking after EVERY frame is the point:
+    // the end state was already accidentally right, so only the intermediate
+    // state can catch it.
+    for (const event of [sent(4, "hello", true), sent(5, " world", true)]) {
+      const result = applyThreadDetailEvent(thread, event);
+      if (result.kind === "updated") thread = result.thread;
+      expect(thread.messages[0]?.text).toBe("hello world");
+      expect(thread.messages[0]?.streaming).toBe(false);
+    }
+    expect(thread.messages).toHaveLength(1);
+    expect(thread.messages[0]?.text).toBe("hello world");
+    expect(thread.messages[0]?.text).not.toContain("hello world hello");
+  });
+
+  // A replay that is CUT SHORT is the case the old behaviour lost outright: it
+  // truncated the settled reply to the first delta and there was no second
+  // frame to accidentally restore it. This is the same defect the full-replay
+  // test cannot see.
+  it("keeps a settled message intact when hydration replays only part of it", () => {
+    let thread: OrchestrationThread = baseThread;
+    for (const event of [
+      sent(1, "hello", true),
+      sent(2, " world", true),
+      sent(3, "hello world", false),
+    ]) {
+      const result = applyThreadDetailEvent(thread, event);
+      if (result.kind === "updated") thread = result.thread;
+    }
+    expect(thread.messages[0]?.text).toBe("hello world");
+
+    const result = applyThreadDetailEvent(thread, sent(4, "hello", true));
+    if (result.kind === "updated") thread = result.thread;
+    expect(thread.messages[0]?.text).toBe("hello world");
+    expect(thread.messages[0]?.text).not.toBe("hello");
+    expect(thread.messages[0]?.streaming).toBe(false);
+  });
+
+  // The same capture also showed the user's "hello" glued to the front of the
+  // assistant's reply. Matching on message id alone let two roles share a row.
+  it("never folds a user message into an assistant message that shares its id", () => {
+    const shared = MessageId.make("collides");
+    const withRole = (seq: number, role: "user" | "assistant", text: string) => ({
+      ...sent(seq, text, false),
+      payload: { ...sent(seq, text, false).payload, messageId: shared, role },
+    });
+
+    let thread: OrchestrationThread = baseThread;
+    for (const event of [
+      withRole(1, "user", "hello"),
+      withRole(2, "assistant", "Hello. What next?"),
+    ]) {
+      const result = applyThreadDetailEvent(thread, event);
+      if (result.kind === "updated") thread = result.thread;
+    }
+
+    expect(thread.messages).toHaveLength(2);
+    expect(thread.messages[0]?.role).toBe("user");
+    expect(thread.messages[0]?.text).toBe("hello");
+    expect(thread.messages[1]?.role).toBe("assistant");
+    expect(thread.messages[1]?.text).toBe("Hello. What next?");
+    for (const message of thread.messages) {
+      expect(message.text).not.toBe("helloHello. What next?");
+    }
+  });
+});

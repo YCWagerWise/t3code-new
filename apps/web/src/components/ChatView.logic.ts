@@ -51,31 +51,38 @@ export function startNewThreadForProject(
   return true;
 }
 
+/// Metadata this client may commit BEFORE the turn is accepted.
+///
+/// `modelSelection` is deliberately NOT one of them (#202). This used to return
+/// the newly picked model the instant the picker differed, and the caller
+/// dispatched it as a durable `thread.meta.update` before `thread.turn.start`
+/// had run. If the runtime then refused the switch — model missing from the
+/// live catalog, stale Ollama slug, `session/set_config_option` failure inside
+/// `applyRequestedSessionConfiguration` — the turn failed and the metadata row
+/// kept the new model anyway. The sidebar and composer named a model that no
+/// session had ever accepted, which is the worst possible lie to tell about a
+/// conversation: it misattributes which model saw the retained context.
+///
+/// The selection is still SENT with the turn; it is committed by the server
+/// once `sendTurn` succeeds (ProviderCommandReactor `processTurnStartRequested`),
+/// which is the only point at which the switch is a fact rather than an intent.
+///
+/// `branch` stays here because it is a local checkout fact the client already
+/// observed, not a runtime admission decision — nothing downstream can reject it.
 export function resolveThreadMetadataUpdateForNextTurn(input: {
   currentModelSelection: ModelSelection;
   nextModelSelection?: ModelSelection;
   currentBranch: string | null;
   nextBranch?: string;
 }): {
-  modelSelection?: ModelSelection;
   branch?: string;
   worktreePath?: null;
 } | null {
-  const nextModelSelection = input.nextModelSelection;
-  const modelSelectionChanged =
-    nextModelSelection !== undefined &&
-    (nextModelSelection.model !== input.currentModelSelection.model ||
-      nextModelSelection.instanceId !== input.currentModelSelection.instanceId ||
-      JSON.stringify(nextModelSelection.options ?? null) !==
-        JSON.stringify(input.currentModelSelection.options ?? null));
-  const branchChanged = input.nextBranch !== undefined && input.nextBranch !== input.currentBranch;
-  if (!modelSelectionChanged && !branchChanged) {
+  const nextBranch = input.nextBranch;
+  if (nextBranch === undefined || nextBranch === input.currentBranch) {
     return null;
   }
-  return {
-    ...(modelSelectionChanged ? { modelSelection: nextModelSelection } : {}),
-    ...(branchChanged ? { branch: input.nextBranch, worktreePath: null } : {}),
-  };
+  return { branch: nextBranch, worktreePath: null };
 }
 
 export function buildLocalDraftThread(

@@ -18,23 +18,23 @@ const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
 const emitGenericToolPlaceholders = process.env.T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS === "1";
 const emitAskQuestion = process.env.T3_ACP_EMIT_ASK_QUESTION === "1";
-const emitXAiAskUserQuestion = process.env.T3_ACP_EMIT_XAI_ASK_USER_QUESTION === "1";
-const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLETE_THEN_HANG === "1";
+const emitMockAskUserQuestion = process.env.T3_ACP_EMIT_ASK_USER_QUESTION === "1";
+const emitMockPromptCompleteThenHang = process.env.T3_ACP_EMIT_PROMPT_COMPLETE_THEN_HANG === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
-const omitXAiPromptCompleteStopReason =
-  process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
+const omitMockPromptCompleteStopReason =
+  process.env.T3_ACP_OMIT_PROMPT_COMPLETE_STOP_REASON === "1";
 const failLoadSession = process.env.T3_ACP_FAIL_LOAD_SESSION === "1";
 const emitLoadReplay = process.env.T3_ACP_EMIT_LOAD_REPLAY === "1";
 const hangLoadSessionAfterReplay = process.env.T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY === "1";
 const delayLoadSessionAfterReplay = process.env.T3_ACP_DELAY_LOAD_SESSION_AFTER_REPLAY === "1";
 const loadSessionDelayMs = Number(process.env.T3_ACP_LOAD_SESSION_DELAY_MS ?? "5000");
-const emitStaleXAiPromptCompleteBeforeSecondHang =
-  process.env.T3_ACP_EMIT_STALE_XAI_PROMPT_COMPLETE_BEFORE_SECOND_HANG === "1";
-const emitOverlappingXAiPromptCompleteOutOfOrder =
-  process.env.T3_ACP_EMIT_OVERLAPPING_XAI_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
+const emitStalePromptCompleteBeforeSecondHang =
+  process.env.T3_ACP_EMIT_STALE_PROMPT_COMPLETE_BEFORE_SECOND_HANG === "1";
+const emitOverlappingPromptCompleteOutOfOrder =
+  process.env.T3_ACP_EMIT_OVERLAPPING_PROMPT_COMPLETE_OUT_OF_ORDER === "1";
 const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
@@ -278,18 +278,18 @@ function modeState(): AcpSchema.SessionModeState {
   };
 }
 
-const grokAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
-  { modelId: "grok-build", name: "Grok Build" },
-  { modelId: "grok-mock-alt", name: "Grok Mock Alt" },
+const acpMockModels: ReadonlyArray<AcpSchema.ModelInfo> = [
+  { modelId: "acp-model", name: "ACP Model" },
+  { modelId: "acp-model-alt", name: "ACP Model Alt" },
 ];
 
 function modelState(): AcpSchema.SessionModelState {
-  const modelId = grokAcpModels.some((model) => model.modelId === currentModelId)
+  const modelId = acpMockModels.some((model) => model.modelId === currentModelId)
     ? currentModelId
-    : "grok-build";
+    : "acp-model";
   return {
     currentModelId: modelId,
-    availableModels: grokAcpModels,
+    availableModels: acpMockModels,
   };
 }
 
@@ -382,7 +382,7 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleSetSessionModel((request) =>
     Effect.gen(function* () {
-      if (!grokAcpModels.some((model) => model.modelId === request.modelId)) {
+      if (!acpMockModels.some((model) => model.modelId === request.modelId)) {
         return yield* AcpError.AcpRequestError.invalidParams(
           `Unknown mock model id: ${request.modelId}`,
           {
@@ -465,21 +465,21 @@ const program = Effect.gen(function* () {
         return yield* AcpError.AcpRequestError.internalError("Mock prompt failure");
       }
 
-      if (emitStaleXAiPromptCompleteBeforeSecondHang && promptCount === 1) {
+      if (emitStalePromptCompleteBeforeSecondHang && promptCount === 1) {
         return {
           stopReason: "end_turn",
           _meta: {
-            promptId: "mock-stale-xai-prompt-1",
-            requestId: "mock-stale-xai-prompt-1",
+            promptId: "mock-stale-prompt-1",
+            requestId: "mock-stale-prompt-1",
           },
         };
       }
 
-      if (emitStaleXAiPromptCompleteBeforeSecondHang && promptCount === 2) {
-        const currentPromptId = promptIdFromRequestMeta(request) ?? "mock-current-xai-prompt-2";
+      if (emitStalePromptCompleteBeforeSecondHang && promptCount === 2) {
+        const currentPromptId = promptIdFromRequestMeta(request) ?? "mock-current-prompt-2";
         writeJsonRpcNotification("_x.ai/session/prompt_complete", {
           sessionId: requestedSessionId,
-          promptId: "mock-stale-xai-prompt-1",
+          promptId: "mock-stale-prompt-1",
           stopReason: "end_turn",
           agentResult: null,
         });
@@ -494,12 +494,12 @@ const program = Effect.gen(function* () {
         return yield* Effect.never;
       }
 
-      if (emitOverlappingXAiPromptCompleteOutOfOrder && promptCount === 1) {
+      if (emitOverlappingPromptCompleteOutOfOrder && promptCount === 1) {
         overlappingFirstPromptId = promptIdFromRequestMeta(request);
         return yield* Effect.never;
       }
 
-      if (emitOverlappingXAiPromptCompleteOutOfOrder && promptCount === 2) {
+      if (emitOverlappingPromptCompleteOutOfOrder && promptCount === 2) {
         const secondPromptId = promptIdFromRequestMeta(request);
         if (overlappingFirstPromptId !== undefined && secondPromptId !== undefined) {
           writeJsonRpcNotification("_x.ai/session/prompt_complete", {
@@ -522,7 +522,7 @@ const program = Effect.gen(function* () {
         return yield* Effect.never;
       }
 
-      if (emitXAiPromptCompleteThenHang) {
+      if (emitMockPromptCompleteThenHang) {
         writeJsonRpcNotification("session/update", {
           sessionId: requestedSessionId,
           update: {
@@ -543,8 +543,8 @@ const program = Effect.gen(function* () {
 
         writeJsonRpcNotification("_x.ai/session/prompt_complete", {
           sessionId: requestedSessionId,
-          promptId: promptIdFromRequestMeta(request) ?? "mock-xai-prompt-1",
-          ...(omitXAiPromptCompleteStopReason ? {} : { stopReason: "end_turn" }),
+          promptId: promptIdFromRequestMeta(request) ?? "mock-prompt-1",
+          ...(omitMockPromptCompleteStopReason ? {} : { stopReason: "end_turn" }),
           agentResult: null,
         });
 
@@ -773,7 +773,7 @@ const program = Effect.gen(function* () {
         return { stopReason: "end_turn" };
       }
 
-      if (emitXAiAskUserQuestion) {
+      if (emitMockAskUserQuestion) {
         const result = yield* agent.client.extRequest("_x.ai/ask_user_question", {
           method: "x.ai/ask_user_question",
           params: {
@@ -781,7 +781,7 @@ const program = Effect.gen(function* () {
             toolCallId: "ask-user-question-tool-call-1",
             questions: [
               {
-                question: "Which scope should Grok use?",
+                question: "Which scope should the agent use?",
                 multiSelect: null,
                 options: [
                   { label: "Workspace", description: "Use the current workspace" },

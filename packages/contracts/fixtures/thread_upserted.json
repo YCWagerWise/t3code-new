@@ -1,0 +1,21 @@
+{
+  "kind": "thread-upserted",
+  "sequence": 1,
+  "thread": {
+    "branch": null,
+    "createdAt": "2026-08-23T16:14:16.635Z",
+    "hasActionableProposedPlan": false,
+    "hasPendingApprovals": false,
+    "hasPendingUserInput": false,
+    "id": "t-fixture-upsert",
+    "latestTurn": null,
+    "latestUserMessageAt": "2026-08-23T16:14:16.635Z",
+    "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
+    "projectId": "p-workspace",
+    "runtimeMode": "full-access",
+    "session": null,
+    "title": "recorded fixture",
+    "updatedAt": "2026-08-23T16:14:16.635Z",
+    "worktreePath": null
+  }
+}

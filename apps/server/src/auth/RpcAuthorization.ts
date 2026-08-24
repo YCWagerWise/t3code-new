@@ -89,6 +89,14 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.vcsRefreshStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.vcsPull]: AuthOrchestrationOperateScope,
   [WS_METHODS.gitRunStackedAction]: AuthOrchestrationOperateScope,
+  // #278. Inspect and attach are READS — they report on work already running
+  // and start nothing, so a read-scoped client reconnecting to a dashboard can
+  // see that a push is in flight. Cancel STOPS a process and mutates nothing
+  // less than the action it kills, so it needs the same operate scope as
+  // starting one: anyone who can halt a commit mid-hook is operating the repo.
+  [WS_METHODS.gitInspectStackedAction]: AuthOrchestrationReadScope,
+  [WS_METHODS.gitAttachStackedAction]: AuthOrchestrationReadScope,
+  [WS_METHODS.gitCancelStackedAction]: AuthOrchestrationOperateScope,
   [WS_METHODS.gitResolvePullRequest]: AuthOrchestrationOperateScope,
   [WS_METHODS.gitPreparePullRequestThread]: AuthOrchestrationOperateScope,
   [WS_METHODS.vcsListRefs]: AuthOrchestrationReadScope,

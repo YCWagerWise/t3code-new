@@ -32,6 +32,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
   EditorId,
+  type GitRunStackedActionInput,
 } from "@t3tools/contracts";
 import {
   computeDpopAccessTokenHash,
@@ -5127,9 +5128,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("routes websocket rpc git methods", () =>
     Effect.gen(function* () {
+      // `vcs.init` CREATES a repository, so it is admitted against the roots this
+      // environment owns (#277) — unlike the read/stub methods below, it needs a
+      // real directory inside one. The environment's own worktrees dir is such a
+      // root, which keeps this routing test free of a projection stub.
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const worktreesDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-wt-" });
+      const initCwd = path.join(worktreesDir, "repo");
+      yield* fs.makeDirectory(initCwd, { recursive: true });
+      const outsideCwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-outside-" });
+
       yield* buildAppUnderTest({
         config: {
           cwd: "/tmp/repo",
+          worktreesDir,
         },
         layers: {
           vcsDriver: {
@@ -5423,10 +5436,21 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
           client[WS_METHODS.vcsInit]({
-            cwd: "/tmp/repo",
+            cwd: initCwd,
           }),
         ),
       );
+
+      // …and the same RPC REFUSES a directory this environment does not own
+      // (#277). `outsideCwd` is a perfectly real directory: existence is not
+      // authority, or `vcs.init` is a write primitive aimed anywhere the server
+      // process can reach.
+      const refused = yield* Effect.result(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) => client[WS_METHODS.vcsInit]({ cwd: outsideCwd })),
+        ),
+      );
+      assert.equal(refused._tag, "Failure", "an unowned directory is refused");
 
       const diffPreview = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
@@ -5612,6 +5636,142 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assertFailure(result, gitError);
       assert.equal(invalidationCalls, 0);
       assert.equal(statusCalls, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  /**
+   * #278 at the ROUTER, not just in the registry's unit tests.
+   *
+   * A stacked action used to exist only as the live stream that started it, so
+   * there was nothing to ask about it and nothing to stop. This drives the real
+   * product path: start an action that stays running, then inspect it and cancel
+   * it over the wire, on a DIFFERENT call than the one streaming it.
+   *
+   * No sleeps and no polling: the mocked action signals `entered` after it has
+   * published its first frame, so by the time the test looks, the action is
+   * provably registered and mid-flight.
+   */
+  it.effect("routes websocket rpc git stacked-action inspect and cancel through the registry", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      // Written from inside the mocked action's own interrupt handler, so it is
+      // evidence the SERVER-SIDE work stopped — not that a flag was flipped.
+      const interruptedAt: Array<string> = [];
+      const gitStatus = {
+        isRepo: true,
+        hasPrimaryRemote: true,
+        isDefaultRef: false,
+        refName: "feature/demo",
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+        hasUpstream: true,
+        aheadCount: 0,
+        behindCount: 0,
+        pr: null,
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          gitManager: {
+            invalidateLocalStatus: () => Effect.void,
+            invalidateRemoteStatus: () => Effect.void,
+            invalidateStatus: () => Effect.void,
+            localStatus: () => Effect.succeed(gitStatus),
+            remoteStatus: () =>
+              Effect.succeed({ hasUpstream: true, aheadCount: 0, behindCount: 0, pr: null }),
+            status: () => Effect.succeed(gitStatus),
+            runStackedAction: (
+              input: GitRunStackedActionInput,
+              options?: GitManager.GitRunStackedActionOptions,
+            ) =>
+              Effect.gen(function* () {
+                yield* (
+                  options?.progressReporter?.publish({
+                    actionId: input.actionId,
+                    cwd: input.cwd,
+                    action: "commit",
+                    kind: "action_started",
+                    phases: ["commit"],
+                  } as never) ?? Effect.void
+                );
+                // The action is now REGISTERED and has published a frame.
+                yield* Deferred.succeed(entered, undefined);
+                // Stands in for a commit blocked in a hook: it stays running
+                // until something cancels it. `return yield*` so the type is
+                // `never` — this mock genuinely has no success value, and
+                // faking one would be a result the real path never produces.
+                //
+                // `onInterrupt` is the ONLY assertion here that a status-only
+                // cancel cannot satisfy. Verified: with the interrupt removed
+                // from GitActionRegistry.cancel, the status assertions and the
+                // stream termination below ALL still passed — because ending the
+                // subscriber's queue ends the stream whether or not the work
+                // died. This flag is what makes the test detect the difference.
+                return yield* Effect.never.pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.sync(() => {
+                      interruptedAt.push("interrupted");
+                    }),
+                  ),
+                );
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const streaming = yield* client[WS_METHODS.gitRunStackedAction]({
+              actionId: "a-live",
+              cwd: "/tmp/repo",
+              action: "commit",
+            }).pipe(Stream.runCollect, Effect.result, Effect.forkChild);
+
+            yield* Deferred.await(entered);
+
+            // INSPECT — a call that did not start the action can see it.
+            const inspected = yield* client[WS_METHODS.gitInspectStackedAction]({
+              actionId: "a-live",
+            });
+            assert.equal(inspected.action?.status, "running");
+            assert.equal(inspected.action?.cwd, "/tmp/repo");
+            assert.ok(
+              inspected.events.some((event) => event.kind === "action_started"),
+              "inspect must replay the frames already emitted",
+            );
+
+            // CANCEL — reaches the server-side action, not a client toast.
+            const canceled = yield* client[WS_METHODS.gitCancelStackedAction]({
+              actionId: "a-live",
+              reason: "stopped from another tab",
+            });
+            assert.equal(canceled.canceled, true);
+            assert.equal(canceled.action?.status, "canceled");
+            assert.equal(canceled.action?.failure, "stopped from another tab");
+
+            // THE DECISIVE ONE. #278: "cancellation has to reach the
+            // server-side process." `cancel` awaits the fiber, so by the time
+            // it returns the interrupt handler has already run.
+            assert.deepEqual(
+              interruptedAt,
+              ["interrupted"],
+              "cancel reported success without interrupting the running action — " +
+                "the status flipped and the stream ended, but the work never stopped",
+            );
+
+            // The streaming caller terminates too — nothing is left hanging on
+            // a socket waiting for an action that has been stopped.
+            yield* Fiber.await(streaming);
+
+            // Cancelling twice reports false: the work had already stopped.
+            const again = yield* client[WS_METHODS.gitCancelStackedAction]({
+              actionId: "a-live",
+            });
+            assert.equal(again.canceled, false);
+          }),
+        ),
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -7916,7 +8076,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         updatedAt: "2026-01-01T00:00:00.000Z",
       };
 
+      // A terminal is a shell, so its cwd is admitted against the roots this
+      // environment owns before a PTY is rooted anywhere (#290). The worktrees
+      // dir is such a root, which keeps this test free of a projection stub.
+      const fs = yield* FileSystem.FileSystem;
+      const nodePath = yield* Path.Path;
+      const worktreesDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-wt-" });
+      const admittedCwd = nodePath.join(worktreesDir, "project");
+      yield* fs.makeDirectory(admittedCwd, { recursive: true });
+      const unownedCwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-outside-" });
+
       yield* buildAppUnderTest({
+        config: { worktreesDir },
         layers: {
           terminalManager: {
             open: () => Effect.succeed(snapshot),
@@ -7936,11 +8107,41 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           client[WS_METHODS.terminalOpen]({
             threadId: "thread-1",
             terminalId: "default",
-            cwd: "/tmp/project",
+            cwd: admittedCwd,
           }),
         ),
       );
       assert.equal(opened.terminalId, "default");
+
+      // An unowned directory is REFUSED even though it exists. Both the open and
+      // the restart path re-root a shell, so both cross the seam.
+      const refusedOpen = yield* Effect.result(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalOpen]({
+              threadId: "thread-1",
+              terminalId: "default",
+              cwd: unownedCwd,
+            }),
+          ),
+        ),
+      );
+      assert.equal(refusedOpen._tag, "Failure", "terminal.open refuses an unowned cwd");
+
+      const refusedRestart = yield* Effect.result(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalRestart]({
+              threadId: "thread-1",
+              terminalId: "default",
+              cwd: unownedCwd,
+              cols: 120,
+              rows: 40,
+            }),
+          ),
+        ),
+      );
+      assert.equal(refusedRestart._tag, "Failure", "terminal.restart refuses it too");
 
       yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) =>
@@ -7977,7 +8178,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           client[WS_METHODS.terminalRestart]({
             threadId: "thread-1",
             terminalId: "default",
-            cwd: "/tmp/project",
+            cwd: admittedCwd,
             cols: 120,
             rows: 40,
           }),

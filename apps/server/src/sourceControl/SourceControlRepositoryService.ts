@@ -225,6 +225,33 @@ export const make = Effect.gen(function* () {
         provider: input.provider,
       });
       const provider = yield* providers.get(providerKind);
+      // #251: prove the LOCAL directory is a usable git working tree
+      // BEFORE creating the REMOTE repo, or a local failure orphans the
+      // externally-created remote. `git rev-parse --is-inside-work-tree`
+      // is the cheapest reliable probe: fails if `cwd` is not a git
+      // repository at all, or is inside `.git/`, or if the caller passed
+      // a bare non-existent path. Any of those would let
+      // `ensureRemote` / `pushCurrentBranch` fail AFTER the provider had
+      // already created the remote — leaving GitHub with an empty repo
+      // named after the user's project and no path back.
+      yield* git
+        .execute({
+          operation: "SourceControlRepositoryService.publishRepository.workTreeCheck",
+          cwd: input.cwd,
+          args: ["rev-parse", "--is-inside-work-tree"],
+        })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new SourceControlRepositoryError({
+                provider: input.provider,
+                operation: "publishRepository",
+                detail:
+                  "The local directory is not a git repository — nothing to publish. " +
+                  "Run `git init` first, or pass a `cwd` inside an existing repo.",
+              }),
+          ),
+        );
       const urls = yield* provider.createRepository({
         cwd: input.cwd,
         repository: input.repository.trim(),

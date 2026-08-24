@@ -28,6 +28,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vite-plus/test";
 
 import * as ProcessRunner from "../processRunner.ts";
+import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as TerminalManager from "./Manager.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
 
@@ -158,6 +159,9 @@ const waitFor = <E, R>(
     ),
   );
 
+/** The node cwd, captured before any local `process` shadows it. */
+const NODE_CWD = process.cwd();
+
 function openInput(overrides: Partial<TerminalOpenInput> = {}): TerminalOpenInput {
   return {
     threadId: "thread-1",
@@ -230,7 +234,11 @@ const createManager = (
 ): Effect.Effect<
   ManagerFixture,
   PlatformError.PlatformError,
-  FileSystem.FileSystem | Path.Path | Scope.Scope | ProcessRunner.ProcessRunner
+  | FileSystem.FileSystem
+  | Path.Path
+  | Scope.Scope
+  | ProcessRunner.ProcessRunner
+  | WorkspacePaths.WorkspacePaths
 > =>
   Effect.flatMap(Effect.service(FileSystem.FileSystem), (fs) =>
     Effect.gen(function* () {
@@ -277,7 +285,13 @@ const withHostPlatform = (platform: NodeJS.Platform) =>
   Layer.succeed(HostProcessPlatform, platform);
 
 it.layer(
-  Layer.merge(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
+  Layer.merge(
+    NodeServices.layer,
+    Layer.merge(
+      ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer)),
+      WorkspacePaths.layer.pipe(Layer.provide(NodeServices.layer)),
+    ),
+  ),
   { excludeTestServices: true },
 )("TerminalManager", (it) => {
   it.effect("spawns lazily and reuses running terminal per thread", () =>
@@ -401,14 +415,22 @@ it.layer(
         "1200 millis",
       );
 
+      // A REAL worktree that actually contains the pane's cwd. This used to be
+      // the marker string "/tmp/restart-requested", which was fine while
+      // worktreePath was an opaque echo — but it is now the shell's admitted
+      // authority (#290), so a pane cannot claim a worktree its cwd is not in.
+      const worktreePath = yield* Effect.flatMap(Effect.service(FileSystem.FileSystem), (fs) =>
+        fs.realPath(NODE_CWD),
+      );
+
       const attachEvents = yield* Ref.make<ReadonlyArray<TerminalAttachStreamEvent>>([]);
       const unsubscribe = yield* manager.attachStream(
         {
           ...openInput({
             env: {
-              T3CODE_WORKTREE_PATH: "/tmp/restart-requested",
+              T3CODE_WORKTREE_PATH: worktreePath,
             },
-            worktreePath: "/tmp/restart-requested",
+            worktreePath,
           }),
           restartIfNotRunning: true,
         },
@@ -420,7 +442,7 @@ it.layer(
       expect(snapshot).toBeDefined();
       if (!snapshot || snapshot.type !== "snapshot") return;
       assert.equal(snapshot.snapshot.status, "running");
-      assert.equal(snapshot.snapshot.worktreePath, "/tmp/restart-requested");
+      assert.equal(snapshot.snapshot.worktreePath, worktreePath);
       expect(ptyAdapter.spawnInputs).toHaveLength(2);
     }),
   );
@@ -457,6 +479,55 @@ it.layer(
         cwd,
       });
       expect("cause" in error).toBe(false);
+    }),
+  );
+
+  it.effect("refuses a cwd that is not inside the worktree the pane claims", () =>
+    Effect.gen(function* () {
+      // #290: a pane carries BOTH a cwd and a worktreePath, and the snapshot
+      // hands both to the UI. Admitting the cwd by stat alone lets a client open
+      // { cwd: "/tmp/outside", worktreePath: "/owned/worktree" } — the interface
+      // says the shell is in the worktree while every command runs elsewhere.
+      const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      const { manager, baseDir } = yield* createManager();
+
+      const worktreePath = path.join(baseDir, "owned-worktree");
+      const outside = path.join(baseDir, "outside");
+      yield* fs.makeDirectory(worktreePath, { recursive: true });
+      yield* fs.makeDirectory(outside, { recursive: true });
+
+      const error = yield* Effect.flip(manager.open(openInput({ cwd: outside, worktreePath })));
+      expect(error).toMatchObject({
+        _tag: "TerminalCwdOutsideWorktreeError",
+        cwd: outside,
+        worktreePath,
+      });
+    }),
+  );
+
+  it.effect("opens a pane whose cwd IS inside the claimed worktree", () =>
+    Effect.gen(function* () {
+      // The refusal must be about the mismatch, not about worktrees in general:
+      // a legitimate worktree pane still launches, including a subdirectory of
+      // it, and the worktree root itself.
+      const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      const { manager, baseDir } = yield* createManager();
+
+      const worktreePath = path.join(baseDir, "admitted-worktree");
+      const inside = path.join(worktreePath, "packages", "app");
+      yield* fs.makeDirectory(inside, { recursive: true });
+
+      const nested = yield* manager.open(
+        openInput({ cwd: inside, worktreePath, terminalId: "nested" }),
+      );
+      expect(nested.worktreePath).toBe(worktreePath);
+
+      const atRoot = yield* manager.open(
+        openInput({ cwd: worktreePath, worktreePath, terminalId: "root" }),
+      );
+      expect(atRoot.worktreePath).toBe(worktreePath);
     }),
   );
 

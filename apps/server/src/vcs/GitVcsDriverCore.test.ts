@@ -23,7 +23,11 @@ const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-git-vcs-driver-test-",
 });
 const TestLayer = GitVcsDriver.layer.pipe(
-  Layer.provide(ServerConfigLayer),
+  // provideMerge, not provide: the worktree ADMISSION boundary (#259/#269) is
+  // defined by `worktreesDir`, so a test that exercises it has to be able to
+  // read the same value the driver admits against. Hardcoding a second path
+  // in the test would prove nothing about the driver's actual boundary.
+  Layer.provideMerge(ServerConfigLayer),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -739,7 +743,12 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const pathService = yield* Path.Path;
-        const missingWorktree = pathService.join(cwd, "missing-worktree");
+        // ADMITTED (inside this environment's worktree area) but not a
+        // worktree, so git is the thing that fails — which is what this test
+        // is about. A path outside the area is refused before git runs now
+        // (#269), and that refusal is asserted separately below.
+        const { worktreesDir } = yield* ServerConfig;
+        const missingWorktree = pathService.join(worktreesDir, "missing-worktree");
         const driver = yield* GitVcsDriver.GitVcsDriver;
         yield* driver.initRepo({ cwd });
 
@@ -1374,15 +1383,91 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("refuses to CREATE a worktree outside the environment's worktree area", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const outside = pathService.join(yield* makeTmpDir("git-outside-"), "escaped");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const error = yield* driver
+          .createWorktree({ cwd, path: outside, refName: initialBranch })
+          .pipe(Effect.flip);
+
+        assert.deepInclude(error, {
+          _tag: "GitCommandError",
+          operation: "GitVcsDriver.createWorktree",
+        });
+        assert.include(error.detail, "outside this environment's worktree directory");
+        assert.equal(
+          yield* fileSystem.exists(outside),
+          false,
+          "refused BEFORE git ran — nothing was created at the un-admitted path",
+        );
+      }),
+    );
+
+    it.effect("refuses to REMOVE a path that is neither admitted nor a worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        // A directory with real content, outside the area and not a worktree —
+        // exactly what `git worktree remove --force` would delete.
+        const victim = pathService.join(yield* makeTmpDir("git-victim-"), "precious");
+        yield* fileSystem.makeDirectory(victim, { recursive: true });
+        yield* fileSystem.writeFileString(pathService.join(victim, "keep.txt"), "do not delete");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        const error = yield* driver
+          .removeWorktree({ cwd, path: victim, force: true })
+          .pipe(Effect.flip);
+
+        assert.deepInclude(error, {
+          _tag: "GitCommandError",
+          operation: "GitVcsDriver.removeWorktree",
+        });
+        assert.equal(
+          yield* fileSystem.exists(pathService.join(victim, "keep.txt")),
+          true,
+          "the file survives: the refusal happens before git is spawned, not after",
+        );
+      }),
+    );
+
+    it.effect("still removes a linked worktree the user made outside the area", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const outside = pathService.join(yield* makeTmpDir("git-user-worktree-"), "theirs");
+        // Registered with git by the USER, not by this server.
+        yield* git(cwd, ["worktree", "add", "-b", "user/made", outside]);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* driver.removeWorktree({ cwd, path: outside });
+
+        assert.equal(
+          yield* fileSystem.exists(outside),
+          false,
+          "admission must not break a legitimate removal — a real linked worktree of this \
+           repo is admitted even outside the area; what is refused is a path that is not a \
+           worktree at all",
+        );
+      }),
+    );
+
     it.effect("creates and removes a worktree for a new refName", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
         const { initialBranch } = yield* initRepoWithCommit(cwd);
         const pathService = yield* Path.Path;
-        const worktreePath = pathService.join(
-          yield* makeTmpDir("git-worktrees-"),
-          "feature-worktree",
-        );
+        const { worktreesDir } = yield* ServerConfig;
+        const worktreePath = pathService.join(worktreesDir, "feature-worktree");
         const driver = yield* GitVcsDriver.GitVcsDriver;
 
         const created = yield* driver.createWorktree({
@@ -1472,13 +1557,50 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.include(context?.stagedSummary ?? "", "a.txt");
         assert.notInclude(context?.stagedSummary ?? "", "b.txt");
 
-        const commit = yield* driver.commit(cwd, "Add a", "");
+        // The selection travels WITH the commit now (#268) — it is no longer
+        // pre-staged into the user's index, so a bare `commit` would have
+        // nothing to commit. This is what `GitManager` does in production.
+        const commit = yield* driver.commit(cwd, "Add a", "", { filePaths: ["a.txt"] });
         assert.match(commit.commitSha, /^[a-f0-9]{40}$/);
         assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "Add a");
 
         const status = yield* git(cwd, ["status", "--porcelain"]);
         assert.include(status, "?? b.txt");
         assert.notInclude(status, "a.txt");
+      }),
+    );
+
+    it.effect("a selected-file commit leaves the user's own staged work alone", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* writeTextFile(cwd, "mine.txt", "staged by the user\n");
+        yield* writeTextFile(cwd, "theirs.txt", "picked in the UI\n");
+        // The user stages something by hand, outside the app.
+        yield* git(cwd, ["add", "mine.txt"]);
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "mine.txt");
+
+        // The app commits a DIFFERENT file, selected in the UI.
+        const context = yield* driver.prepareCommitContext(cwd, ["theirs.txt"]);
+        assert.include(context?.stagedSummary ?? "", "theirs.txt");
+        assert.notInclude(context?.stagedSummary ?? "", "mine.txt");
+        const commit = yield* driver.commit(cwd, "Add theirs", "", {
+          filePaths: ["theirs.txt"],
+        });
+        assert.match(commit.commitSha, /^[a-f0-9]{40}$/);
+
+        // The selected-only commit landed...
+        assert.equal(yield* git(cwd, ["show", "--pretty=", "--name-only", "HEAD"]), "theirs.txt");
+        // ...and the user's staged file is STILL STAGED, untouched. The old
+        // `git reset` + stage-the-selection path discarded it silently and
+        // never put it back, so a cancelled or failed commit lost their work.
+        assert.equal(
+          yield* git(cwd, ["diff", "--cached", "--name-only"]),
+          "mine.txt",
+          "the user's index must survive a selected-file commit",
+        );
       }),
     );
 
@@ -1491,9 +1613,17 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* writeTextFile(cwd, "selected[1].txt", "literal\n");
         yield* writeTextFile(cwd, "selected1.txt", "pattern match\n");
 
-        yield* driver.prepareCommitContext(cwd, ["selected[1].txt"]);
+        const context = yield* driver.prepareCommitContext(cwd, ["selected[1].txt"]);
 
-        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "selected[1].txt");
+        // What this test is about is the PATHSPEC being literal: `[1]` must not
+        // match `selected1.txt`. It used to read that off the real index; the
+        // preview is built in a scratch index now (#268), so the assertion
+        // moves to the preview — same property, correct place.
+        assert.include(context?.stagedSummary ?? "", "selected[1].txt");
+        assert.notInclude(context?.stagedSummary ?? "", "selected1.txt");
+
+        // And the real index is untouched: nothing was staged into it at all.
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "");
 
         const status = yield* git(cwd, ["status", "--porcelain"]);
         assert.include(status, "?? selected1.txt");
@@ -1546,10 +1676,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* git(cwd, ["rev-parse", initialBranch]), beforeFetch);
 
         const pathService = yield* Path.Path;
-        const worktreePath = pathService.join(
-          yield* makeTmpDir("git-fetched-worktrees-"),
-          "fetched-origin",
-        );
+        const { worktreesDir } = yield* ServerConfig;
+        const worktreePath = pathService.join(worktreesDir, "fetched-origin");
         yield* driver.createWorktree({
           cwd,
           path: worktreePath,

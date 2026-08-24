@@ -12,6 +12,7 @@ function provider(input: {
   provider?: ProviderDriverKind;
   instanceId: string;
   models?: ReadonlyArray<string>;
+  status?: ServerProvider["status"];
 }): ServerProvider {
   const driver =
     input.provider ??
@@ -24,7 +25,7 @@ function provider(input: {
     enabled: true,
     installed: true,
     version: null,
-    status: "ready",
+    status: input.status ?? "ready",
     auth: { status: "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
     models: (input.models ?? []).map((slug) => ({
@@ -319,5 +320,48 @@ describe("instance-scoped model selection", () => {
       instanceId: ProviderInstanceId.make("claude_openrouter"),
       model: "openai/gpt-5.5",
     });
+  });
+
+  // #246: the app's text-generation model must not resolve to an instance whose
+  // probe says it cannot run. `enabled && isAvailable` alone admits an errored
+  // provider, and because this value is written back into settings, the unready
+  // choice would then be persisted as the user's preference.
+  it("does not select an errored instance when a ready one exists", () => {
+    const providers = [
+      provider({
+        instanceId: "claude_broken",
+        models: ["claude-sonnet-4-6"],
+        status: "error",
+      }),
+      provider({ instanceId: "claude_ok", models: ["claude-sonnet-4-6"] }),
+    ];
+    const settings: UnifiedSettings = {
+      ...settingsWithProviderInstances(),
+      textGenerationModelSelection: {
+        instanceId: ProviderInstanceId.make("claude_broken"),
+        model: "claude-sonnet-4-6",
+      },
+    };
+
+    expect(resolveAppModelSelectionState(settings, providers).instanceId).toBe(
+      ProviderInstanceId.make("claude_ok"),
+    );
+  });
+
+  // The other half of the ladder: an unready instance is a LAST resort, not a
+  // disqualification. With nothing ready, the app still resolves something
+  // rather than reporting no model at all.
+  it("still falls back to an unready instance when none are ready", () => {
+    const providers = [
+      provider({
+        instanceId: "claude_broken",
+        models: ["claude-sonnet-4-6"],
+        status: "error",
+      }),
+    ];
+
+    expect(
+      resolveAppModelSelectionState(settingsWithProviderInstances(), providers).instanceId,
+    ).toBe(ProviderInstanceId.make("claude_broken"));
   });
 });

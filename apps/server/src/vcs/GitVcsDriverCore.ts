@@ -1813,29 +1813,23 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       })),
     );
 
-  const prepareCommitContext: GitVcsDriver.GitVcsDriver["Service"]["prepareCommitContext"] =
-    Effect.fn("prepareCommitContext")(function* (cwd, filePaths) {
-      if (filePaths && filePaths.length > 0) {
-        yield* runGit("GitVcsDriver.prepareCommitContext.reset", cwd, ["reset"]).pipe(
-          Effect.catchTags({
-            GitCommandError: () => Effect.void,
-          }),
-        );
-        yield* runGit("GitVcsDriver.prepareCommitContext.addSelected", cwd, [
-          "--literal-pathspecs",
-          "add",
-          "-A",
-          "--",
-          ...filePaths,
-        ]);
-      } else {
-        yield* runGit("GitVcsDriver.prepareCommitContext.addAll", cwd, ["add", "-A"]);
-      }
-
-      const stagedSummary = yield* runGitStdout(
+  /**
+   * Read the staged summary + patch from whichever index `options` selects.
+   *
+   * Passing `{}` reads the repository's real index; passing an env carrying
+   * `GIT_INDEX_FILE` reads a scratch one. Shared so the selected-file and
+   * whole-tree paths cannot drift in what they show the user.
+   */
+  const readStagedPreview = (
+    cwd: string,
+    options: ExecuteGitOptions,
+  ): Effect.Effect<GitVcsDriver.GitPreparedCommitContext | null, GitCommandError> =>
+    Effect.gen(function* () {
+      const stagedSummary = yield* runGitStdoutWithOptions(
         "GitVcsDriver.prepareCommitContext.stagedSummary",
         cwd,
         ["diff", "--cached", "--name-status"],
+        options,
       ).pipe(Effect.map((stdout) => stdout.trim()));
       if (stagedSummary.length === 0) {
         return null;
@@ -1846,15 +1840,66 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         cwd,
         ["diff", "--no-ext-diff", "--cached", "--patch", "--minimal"],
         {
+          ...options,
           maxOutputBytes: PREPARED_COMMIT_PATCH_MAX_OUTPUT_BYTES,
           appendTruncationMarker: true,
         },
       );
 
-      return {
-        stagedSummary,
-        stagedPatch,
-      };
+      return { stagedSummary, stagedPatch };
+    });
+
+  const prepareCommitContext: GitVcsDriver.GitVcsDriver["Service"]["prepareCommitContext"] =
+    Effect.fn("prepareCommitContext")(function* (cwd, filePaths) {
+      // A SELECTED-FILE commit must not touch the user's index (#268).
+      //
+      // This used to run `git reset` and then stage the selection, which threw
+      // away whatever the user had staged themselves — and never restored it,
+      // so a cancelled or failed commit left their carefully staged work
+      // silently unstaged. The index was also acting as a hidden channel
+      // between `prepareCommitContext` and `commit`.
+      //
+      // Instead, build the preview in a SCRATCH index seeded from HEAD:
+      // `read-tree HEAD` gives us HEAD's contents, adding the selection there
+      // makes `diff --cached` show exactly what the commit will contain, and
+      // the real `.git/index` is never opened for writing. `commit` then names
+      // the same paths explicitly, so the two calls no longer communicate
+      // through mutable shared state.
+      const selected = filePaths && filePaths.length > 0 ? filePaths : null;
+      if (!selected) {
+        yield* runGit("GitVcsDriver.prepareCommitContext.addAll", cwd, ["add", "-A"]);
+        return yield* readStagedPreview(cwd, {});
+      }
+
+      const gitDir = yield* runGitStdout("GitVcsDriver.prepareCommitContext.gitDir", cwd, [
+        "rev-parse",
+        "--absolute-git-dir",
+      ]).pipe(Effect.map((stdout) => stdout.trim()));
+      const scratchIndex = path.join(gitDir, `t3-commit-index-${Date.now()}-${process.pid}`);
+      const scratchOptions = { env: { ...process.env, GIT_INDEX_FILE: scratchIndex } };
+
+      return yield* Effect.gen(function* () {
+        // Seed from HEAD. On an unborn branch there is no HEAD, and an empty
+        // scratch index is exactly right — every selected path then reads as
+        // an addition, which is what a first commit is.
+        yield* runGit(
+          "GitVcsDriver.prepareCommitContext.readTree",
+          cwd,
+          ["read-tree", "HEAD"],
+          scratchOptions,
+        ).pipe(Effect.catchTags({ GitCommandError: () => Effect.void }));
+        yield* runGit(
+          "GitVcsDriver.prepareCommitContext.addSelected",
+          cwd,
+          ["--literal-pathspecs", "add", "-A", "--", ...selected],
+          scratchOptions,
+        );
+        return yield* readStagedPreview(cwd, scratchOptions);
+      }).pipe(
+        // The scratch index is ours alone, so it is always removed — including
+        // on failure, where leaving it behind would litter `.git`.
+        Effect.ensuring(fileSystem.remove(scratchIndex).pipe(Effect.catch(() => Effect.void))),
+      );
     });
 
   const commit: GitVcsDriver.GitVcsDriver["Service"]["commit"] = Effect.fn("commit")(function* (
@@ -1867,6 +1912,46 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const trimmedBody = body.trim();
     if (trimmedBody.length > 0) {
       args.push("-m", trimmedBody);
+    }
+    // A selected-file commit runs against a SCRATCH INDEX (#268), never the
+    // user's.
+    //
+    // `git commit -- <paths>` was the obvious shape and it does not work here:
+    // a partial commit only accepts paths git already TRACKS, so committing a
+    // newly created file — the common case in this app — fails with "did not
+    // match any file(s) known to git". Executed, not guessed: that is the
+    // non-zero exit the selected-file tests were hitting.
+    //
+    // So: seed a scratch index from HEAD, add the selection there, and commit
+    // with `GIT_INDEX_FILE` pointing at it. git writes the commit from that
+    // index and never opens the real one, so whatever the user staged by hand
+    // is exactly as they left it — which is the invariant this finding is
+    // about.
+    const selectedPaths = options?.filePaths ?? [];
+    const selectedCommit = selectedPaths.length > 0;
+    const gitDir = selectedCommit
+      ? yield* runGitStdout("GitVcsDriver.commit.gitDir", cwd, [
+          "rev-parse",
+          "--absolute-git-dir",
+        ]).pipe(Effect.map((stdout) => stdout.trim()))
+      : null;
+    const scratchIndex =
+      gitDir === null ? null : path.join(gitDir, `t3-commit-index-${Date.now()}-${process.pid}`);
+    const scratchEnv =
+      scratchIndex === null ? {} : { env: { ...process.env, GIT_INDEX_FILE: scratchIndex } };
+    if (scratchIndex !== null) {
+      // No HEAD on an unborn branch: an empty scratch index is right, because
+      // every selected path is then an addition — which is what a first commit
+      // is.
+      yield* runGit("GitVcsDriver.commit.readTree", cwd, ["read-tree", "HEAD"], scratchEnv).pipe(
+        Effect.catchTags({ GitCommandError: () => Effect.void }),
+      );
+      yield* runGit(
+        "GitVcsDriver.commit.addSelected",
+        cwd,
+        ["--literal-pathspecs", "add", "-A", "--", ...selectedPaths],
+        scratchEnv,
+      );
     }
     const progress =
       options?.progress?.onOutputLine === undefined
@@ -1881,7 +1966,31 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     yield* executeGit("GitVcsDriver.commit.commit", cwd, args, {
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(progress ? { progress } : {}),
-    }).pipe(Effect.asVoid);
+      ...scratchEnv,
+    })
+      .pipe(Effect.asVoid)
+      .pipe(
+        Effect.ensuring(
+          scratchIndex === null
+            ? Effect.void
+            : fileSystem.remove(scratchIndex).pipe(Effect.catch(() => Effect.void)),
+        ),
+      );
+    if (selectedCommit) {
+      // Realign the REAL index for just the committed paths. Without this the
+      // paths we committed out of the scratch index read as staged DELETIONS
+      // in the user's index (their index still has no entry for a file that
+      // now exists at HEAD). `reset -- <paths>` restores those entries from
+      // HEAD and touches nothing else, so other hand-staged work survives.
+      yield* runGit("GitVcsDriver.commit.realignIndex", cwd, [
+        "--literal-pathspecs",
+        "reset",
+        "-q",
+        "HEAD",
+        "--",
+        ...selectedPaths,
+      ]).pipe(Effect.catchTags({ GitCommandError: () => Effect.void }));
+    }
     const commitSha = yield* runGitStdout("GitVcsDriver.commit.revParseHead", cwd, [
       "rev-parse",
       "HEAD",
@@ -2754,13 +2863,106 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     },
   );
 
+  /**
+   * The worktree ADMISSION boundary (#259/#269).
+   *
+   * A worktree path arrives from the client — `createWorktree(input.path)` and
+   * `removeWorktree(input.path)` both accept one verbatim — and is then handed
+   * straight to `git worktree add|remove`. Without this check, `path` is an
+   * arbitrary filesystem destination: `add` creates a checkout anywhere the
+   * server user can write, and `remove --force` DELETES a directory tree
+   * outside anything this environment owns. Admitting `cwd` does not cover it;
+   * `cwd` says which repo the command runs against, not where the worktree is.
+   *
+   * The rule is the same one `vcs` enforces when it CREATES a worktree: a
+   * worktree may only live under the environment-owned worktree area. Paths are
+   * compared after `path.resolve`, and the containment test requires a SEPARATOR
+   * after the root, so `/worktrees-evil` is not admitted by `/worktrees`.
+   *
+   * Refused BEFORE git runs — an admission check that happens after the
+   * subprocess has already deleted the directory is not an admission check.
+   */
+  const isInsideWorktreeArea = (candidate: string) => {
+    const root = path.resolve(worktreesDir);
+    const resolved = path.resolve(candidate);
+    // The separator is required: `/worktrees-evil` must not be admitted by a
+    // prefix test against `/worktrees`.
+    return resolved === root || resolved.startsWith(`${root}${path.sep}`);
+  };
+
+  /**
+   * The paths git itself reports as linked worktrees of the repo at `cwd`.
+   *
+   * Used only by the REMOVE side: a worktree the user made outside this
+   * environment is still a real worktree of their repo, and refusing to remove
+   * it would break a legitimate workflow. What must never be admitted is a path
+   * that is not a worktree at all — that is the arbitrary `rm -rf` this check
+   * exists to stop. A failure to list is NOT an empty list: it falls through to
+   * refusal rather than admitting on the strength of a read that did not work.
+   */
+  const registeredWorktreePaths = (cwd: string) =>
+    runGitStdout("GitVcsDriver.removeWorktree.list", cwd, ["worktree", "list", "--porcelain"]).pipe(
+      Effect.map((stdout) =>
+        stdout
+          .split("\n")
+          .filter((line) => line.startsWith("worktree "))
+          .map((line) => path.resolve(line.slice("worktree ".length).trim())),
+      ),
+      Effect.orElseSucceed(() => [] as ReadonlyArray<string>),
+    );
+
+  /**
+   * `path.resolve` is not enough to compare two spellings of one directory: on
+   * macOS `/var/...` and `/private/var/...` are the same place, and git reports
+   * the real one while a caller passes the symlinked one. A path that does not
+   * exist yet (the create case) has no real path, so it falls back to the
+   * lexical resolve.
+   */
+  const realOrResolved = (candidate: string) =>
+    fileSystem.realPath(candidate).pipe(Effect.orElseSucceed(() => path.resolve(candidate)));
+
+  const admitWorktreePath = (
+    operation: string,
+    cwd: string,
+    candidate: string,
+    alsoAdmitted: ReadonlyArray<string> = [],
+  ) =>
+    Effect.gen(function* () {
+      const resolved = path.resolve(candidate);
+      const real = yield* realOrResolved(candidate);
+      const areaReal = yield* realOrResolved(worktreesDir);
+      const insideArea =
+        isInsideWorktreeArea(resolved) ||
+        real === areaReal ||
+        real.startsWith(`${areaReal}${path.sep}`);
+      const admitted = insideArea || alsoAdmitted.includes(resolved) || alsoAdmitted.includes(real);
+      if (!admitted) {
+        return yield* Effect.fail(
+          new GitCommandError({
+            ...gitCommandContext({ operation, cwd, args: [] }),
+            detail:
+              "Refusing a worktree path outside this environment's worktree directory. " +
+              "A worktree may only be created or removed inside the area this environment owns.",
+          }),
+        );
+      }
+      return resolved;
+    });
+
   const createWorktree: GitVcsDriver.GitVcsDriver["Service"]["createWorktree"] = Effect.fn(
     "createWorktree",
   )(function* (input) {
     const targetBranch = input.newRefName ?? input.refName;
     const sanitizedBranch = targetBranch.replace(/\//g, "-");
     const repoName = path.basename(input.cwd);
-    const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
+    // A caller-supplied destination is ADMITTED, not trusted (#259). The
+    // derived default is inside the area by construction, and still goes
+    // through the same check so the two paths cannot drift.
+    const worktreePath = yield* admitWorktreePath(
+      "GitVcsDriver.createWorktree",
+      input.cwd,
+      input.path ?? path.join(worktreesDir, repoName, sanitizedBranch),
+    );
     const args = input.newRefName
       ? ["worktree", "add", "-b", input.newRefName, worktreePath, input.refName]
       : ["worktree", "add", worktreePath, input.refName];
@@ -2975,11 +3177,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const removeWorktree: GitVcsDriver.GitVcsDriver["Service"]["removeWorktree"] = Effect.fn(
     "removeWorktree",
   )(function* (input) {
+    // #269: `remove --force` deletes a directory tree. The path is admitted
+    // BEFORE git is spawned, because the alternative is discovering the
+    // violation from the audit log after the files are gone.
+    //
+    // Admitted: inside this environment's worktree area, OR a path git already
+    // reports as a linked worktree of this repo. The second case keeps a
+    // user-made worktree removable; what stays refused is a path that is not a
+    // worktree at all, which is the arbitrary directory deletion.
+    const target = yield* admitWorktreePath(
+      "GitVcsDriver.removeWorktree",
+      input.cwd,
+      input.path,
+      yield* registeredWorktreePaths(input.cwd),
+    );
     const args = ["worktree", "remove"];
     if (input.force) {
       args.push("--force");
     }
-    args.push(input.path);
+    args.push(target);
     yield* executeGit("GitVcsDriver.removeWorktree", input.cwd, args, {
       timeoutMs: 15_000,
       fallbackErrorDetail: "git worktree remove failed",

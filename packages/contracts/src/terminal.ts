@@ -29,6 +29,65 @@ export const TerminalThreadInput = Schema.Struct({
 });
 export type TerminalThreadInput = typeof TerminalThreadInput.Type;
 
+/**
+ * Addressing a pane that belongs to a CHILD SESSION rather than a thread (#149).
+ *
+ * A subagent runs in its own session and usually its own worktree, and its PTY
+ * is owned by Hearth — not by the thread that spawned it. Addressing it as
+ * `{threadId, terminalId}` is not merely inconvenient, it is unrepresentable:
+ * several child sessions of one thread would collide on the same key, so
+ * "focus THAT subagent's terminal" has no expression at all.
+ *
+ * THE RUNTIME ALREADY SPEAKS THIS. `backend/src/terminal.rs` resolves a pane
+ * target with `sessionId` WINNING over `threadId` (:293-307), carries
+ * `ChildSession { session_id, worktree_path }` as a first-class pane kind
+ * (:287), prefers `worktree_path` over `cwd` when both are given (:427), and
+ * already emits `sessionId` and `worktreePath` on every pane snapshot
+ * (:88-94, :141-146). The contract was the only thing that could not ask for
+ * it, which is why #149 reads as a UI gap: the UI could not be written.
+ *
+ * `worktreePath` is optional because a child session need not have its own
+ * worktree — a subagent sharing the parent's tree is normal, and requiring the
+ * field would force callers to invent one.
+ */
+export const TerminalChildSessionInput = Schema.Struct({
+  sessionId: TrimmedNonEmptyStringSchema,
+  worktreePath: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type TerminalChildSessionInput = typeof TerminalChildSessionInput.Type;
+
+/**
+ * What a pane may be addressed BY: a thread, or a child session.
+ *
+ * A union rather than one struct with both fields optional, deliberately. Two
+ * optional ids admit `{}` — a request that names no pane at all — and
+ * `{threadId, sessionId}`, where the two disagree and the reader has to know
+ * which wins. The union makes both unrepresentable, so the ambiguity is
+ * resolved at the type level instead of by a precedence rule every caller has
+ * to remember.
+ *
+ * Thread-addressed panes are UNCHANGED: `{threadId}` decodes exactly as before,
+ * so no existing caller moves.
+ */
+export const TerminalTargetInput = Schema.Union([
+  // Each variant explicitly FORBIDS the other's id. Effect structs ignore
+  // excess properties, so a bare union of the two would happily decode
+  // `{threadId, sessionId}` as the thread variant and silently drop the
+  // session — sending the user to the parent thread's terminal while the UI
+  // believed it had asked for a subagent's. Caught by
+  // "rejects a target that names both a thread and a session"; `optional(Never)`
+  // is what makes that assertion pass, rather than deleting the assertion.
+  Schema.Struct({
+    ...TerminalThreadInput.fields,
+    sessionId: Schema.optional(Schema.Never),
+  }),
+  Schema.Struct({
+    ...TerminalChildSessionInput.fields,
+    threadId: Schema.optional(Schema.Never),
+  }),
+]);
+export type TerminalTargetInput = typeof TerminalTargetInput.Type;
+
 /** Terminal ids are ALWAYS chosen by the client and sent explicitly — no server-side allocation. */
 const TerminalSessionInput = Schema.Struct({
   ...TerminalThreadInput.fields,
@@ -94,10 +153,26 @@ export const TerminalSessionStatus = Schema.Literals(["starting", "running", "ex
 export type TerminalSessionStatus = typeof TerminalSessionStatus.Type;
 
 export const TerminalSessionSnapshot = Schema.Struct({
-  threadId: Schema.String.check(Schema.isNonEmpty()),
+  /**
+   * NULL for a child-session pane (#149). `backend/src/terminal.rs:352-357`
+   * (`TerminalOwner::wire`) returns `(threadId, null)` for a thread pane and
+   * `(null, sessionId)` for a child session — a pane has exactly one owner, so
+   * a non-nullable `threadId` made a subagent's pane literally undecodable and
+   * the terminal would vanish rather than render. Exactly one of `threadId` /
+   * `sessionId` is set.
+   */
+  threadId: Schema.NullOr(TrimmedNonEmptyStringSchema),
   terminalId: Schema.String.check(Schema.isNonEmpty()),
   cwd: Schema.String.check(Schema.isNonEmpty()),
   worktreePath: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /**
+   * The child session this pane belongs to, when it is not a thread pane
+   * (#149). `optional` and not merely nullable: the Rust backend always
+   * emits the key (null for a thread pane) but the TypeScript server does
+   * not yet, and a snapshot that fails to decode is a terminal the user
+   * cannot see. Absent and null both mean 'a thread pane'.
+   */
+  sessionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   status: TerminalSessionStatus,
   pid: Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0))),
   history: Schema.String,
@@ -111,10 +186,26 @@ export const TerminalSessionSnapshot = Schema.Struct({
 export type TerminalSessionSnapshot = typeof TerminalSessionSnapshot.Type;
 
 export const TerminalSummary = Schema.Struct({
-  threadId: Schema.String.check(Schema.isNonEmpty()),
+  /**
+   * NULL for a child-session pane (#149). `backend/src/terminal.rs:352-357`
+   * (`TerminalOwner::wire`) returns `(threadId, null)` for a thread pane and
+   * `(null, sessionId)` for a child session — a pane has exactly one owner, so
+   * a non-nullable `threadId` made a subagent's pane literally undecodable and
+   * the terminal would vanish rather than render. Exactly one of `threadId` /
+   * `sessionId` is set.
+   */
+  threadId: Schema.NullOr(TrimmedNonEmptyStringSchema),
   terminalId: Schema.String.check(Schema.isNonEmpty()),
   cwd: Schema.String.check(Schema.isNonEmpty()),
   worktreePath: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /**
+   * The child session this pane belongs to, when it is not a thread pane
+   * (#149). `optional` and not merely nullable: the Rust backend always
+   * emits the key (null for a thread pane) but the TypeScript server does
+   * not yet, and a snapshot that fails to decode is a terminal the user
+   * cannot see. Absent and null both mean 'a thread pane'.
+   */
+  sessionId: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   status: TerminalSessionStatus,
   pid: Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0))),
   exitCode: Schema.NullOr(Schema.Int),
@@ -266,10 +357,35 @@ export class TerminalCwdStatError extends Schema.TaggedErrorClass<TerminalCwdSta
   }
 }
 
+export class TerminalCwdOutsideWorktreeError extends Schema.TaggedErrorClass<TerminalCwdOutsideWorktreeError>()(
+  "TerminalCwdOutsideWorktreeError",
+  {
+    cwd: Schema.String,
+    worktreePath: Schema.String,
+  },
+) {
+  override get message() {
+    return `Terminal cwd ${this.cwd} is not inside the claimed worktree ${this.worktreePath}`;
+  }
+}
+
+export class TerminalCwdNotAdmittedError extends Schema.TaggedErrorClass<TerminalCwdNotAdmittedError>()(
+  "TerminalCwdNotAdmittedError",
+  {
+    cwd: Schema.String,
+  },
+) {
+  override get message() {
+    return `Refused: ${this.cwd} is outside every project and worktree this environment owns`;
+  }
+}
+
 export const TerminalCwdError = Schema.Union([
+  TerminalCwdNotAdmittedError,
   TerminalCwdNotFoundError,
   TerminalCwdNotDirectoryError,
   TerminalCwdStatError,
+  TerminalCwdOutsideWorktreeError,
 ]);
 export type TerminalCwdError = typeof TerminalCwdError.Type;
 

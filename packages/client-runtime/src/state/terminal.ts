@@ -16,26 +16,64 @@ import {
   EMPTY_TERMINAL_BUFFER_STATE,
 } from "./terminalSession.ts";
 
+/**
+ * How a terminal command NAMES the pane it acts on (#149).
+ *
+ * A pane belongs to either a thread or a CHILD SESSION. A subagent runs in its
+ * own session, usually its own worktree, and its PTY is owned by Hearth rather
+ * than by the thread that spawned it — so `{threadId, terminalId}` cannot name
+ * it. Several child sessions of one thread collapse onto one key, and with no
+ * `threadId` at all they collapse onto `[environmentId, null]` — ONE key for
+ * every subagent in the environment.
+ *
+ * That is not cosmetic, because these keys are the CONCURRENCY keys. Lifecycle
+ * commands (open/clear/restart/close) run `serial` per key, and `resize` runs
+ * `latest` per key. Collapsed keys therefore mean: one subagent's `open` queues
+ * behind an unrelated subagent's `close`, and — worse, because `latest` DROPS
+ * what it supersedes — one subagent's resize silently discards another's. The
+ * bug is a lost command, not just a slow one.
+ *
+ * `sessionId` WINS over `threadId` when both are present. That is not a
+ * preference: it mirrors how the runtime already resolves the same target in
+ * `backend/src/terminal.rs` (:293-307), and a client that ordered these two
+ * differently would serialize commands under one identity while the server
+ * executed them under another.
+ */
+export const terminalOwnerKey = ({
+  environmentId,
+  input,
+}: {
+  readonly environmentId: string;
+  readonly input: {
+    readonly threadId?: string | undefined;
+    readonly sessionId?: string | undefined;
+  };
+}) =>
+  JSON.stringify(
+    input.sessionId !== undefined
+      ? [environmentId, "session", input.sessionId]
+      : [environmentId, "thread", input.threadId ?? null],
+  );
+
+/** [`terminalOwnerKey`] narrowed to a single pane of that owner. */
+export const terminalPaneKey = ({
+  environmentId,
+  input,
+}: {
+  readonly environmentId: string;
+  readonly input: {
+    readonly threadId?: string | undefined;
+    readonly sessionId?: string | undefined;
+    readonly terminalId?: string | undefined;
+  };
+}) => JSON.stringify([terminalOwnerKey({ environmentId, input }), input.terminalId ?? null]);
+
 export function createTerminalEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   const lifecycleScheduler = createAtomCommandScheduler();
   const resizeScheduler = createAtomCommandScheduler();
-  const terminalThreadKey = ({
-    environmentId,
-    input,
-  }: {
-    readonly environmentId: string;
-    readonly input: { readonly threadId: string; readonly terminalId?: string | undefined };
-  }) => JSON.stringify([environmentId, input.threadId]);
-  const terminalSessionKey = ({
-    environmentId,
-    input,
-  }: {
-    readonly environmentId: string;
-    readonly input: { readonly threadId: string; readonly terminalId?: string | undefined };
-  }) => JSON.stringify([environmentId, input.threadId, input.terminalId ?? null]);
-  const lifecycleConcurrency = { mode: "serial" as const, key: terminalThreadKey };
+  const lifecycleConcurrency = { mode: "serial" as const, key: terminalOwnerKey };
   return {
     attach: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:attach",
@@ -69,7 +107,7 @@ export function createTerminalEnvironmentAtoms<R, E>(
       label: "environment-data:terminal:resize",
       tag: WS_METHODS.terminalResize,
       scheduler: resizeScheduler,
-      concurrency: { mode: "latest", key: terminalSessionKey },
+      concurrency: { mode: "latest", key: terminalPaneKey },
     }),
     clear: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:clear",

@@ -1,0 +1,25 @@
+{
+  "kind": "snapshot",
+  "snapshot": {
+    "snapshotSequence": 0,
+    "thread": {
+      "activities": [],
+      "branch": "feat/sink",
+      "checkpoints": [],
+      "createdAt": "2026-08-24T00:00:00.000Z",
+      "deletedAt": null,
+      "hasPendingApprovals": false,
+      "id": "t-wt-fixture",
+      "interactionMode": "plan",
+      "latestTurn": null,
+      "messages": [],
+      "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
+      "projectId": "p-1",
+      "runtimeMode": "approval-required",
+      "session": null,
+      "title": "port the sink",
+      "updatedAt": "2026-08-24T00:00:00.000Z",
+      "worktreePath": "/workspace/wt/t-wt-fixture"
+    }
+  }
+}

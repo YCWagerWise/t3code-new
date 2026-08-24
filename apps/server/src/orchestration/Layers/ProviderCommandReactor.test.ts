@@ -153,6 +153,16 @@ describe("ProviderCommandReactor", () => {
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
+    /// Lets a test make the TURN fail while the session start succeeds — the
+    /// shape #202 is about, where the runtime refuses a model switch inside
+    /// `applyRequestedSessionConfiguration` after the session already exists.
+    readonly sendTurnEffect?: (result: {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+    }) => Effect.Effect<
+      { readonly threadId: ThreadId; readonly turnId: TurnId },
+      ProviderAdapterRequestError
+    >;
   }) {
     const now = "2026-01-01T00:00:00.000Z";
     const baseDir =
@@ -229,12 +239,14 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
-    const sendTurn = vi.fn((_: unknown) =>
-      Effect.succeed({
+    const sendTurnEffect = input?.sendTurnEffect;
+    const sendTurn = vi.fn((_: unknown) => {
+      const result = {
         threadId: ThreadId.make("thread-1"),
         turnId: asTurnId("turn-1"),
-      }),
-    );
+      };
+      return sendTurnEffect?.(result) ?? Effect.succeed(result);
+    });
     const interruptTurn = vi.fn((_: unknown) => Effect.void);
     const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
     const respondToUserInput = vi.fn<ProviderServiceShape["respondToUserInput"]>(() => Effect.void);
@@ -1688,6 +1700,188 @@ describe("ProviderCommandReactor", () => {
       threadId: ThreadId.make("thread-1"),
       interactionMode: "plan",
     });
+  });
+
+  // #244: a restart forced by a model change must still CARRY THE CONVERSATION.
+  //
+  // `sessionModelSwitch: "unsupported"` says the provider cannot mutate the
+  // model of a live session. The reactor used to translate that into
+  // `resumeCursor: undefined` — so switching model silently started a brand new
+  // provider session with no history, while the UI happily showed a model
+  // switch on the same thread. The user asked to keep talking to a different
+  // model and got their conversation deleted instead.
+  //
+  // The sibling test below (`preserves the active session model ...`) only
+  // covers the case where NO model was explicitly requested. This one covers
+  // the case the finding is actually about: an explicit switch.
+  it("carries the resume cursor through a model-change restart when in-session switching is unsupported", async () => {
+    const harness = await createHarness({ sessionModelSwitch: "unsupported" });
+    const now = "2026-01-01T00:00:00.000Z";
+
+    // Turn one establishes a session with a real resume cursor. Without a
+    // cursor there is no continuity to lose and this test would prove nothing.
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-switch-resume-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-switch-resume-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    // The first start is a cold start: nothing to resume from yet.
+    expect(harness.startSession.mock.calls[0]?.[1]).not.toMatchObject({
+      resumeCursor: expect.anything(),
+    });
+
+    // Turn two EXPLICITLY requests a different model on the same thread. This
+    // is the switch that used to reset the conversation.
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-switch-resume-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-switch-resume-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex-high",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    // The model change must force a restart under "unsupported" ...
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+
+    // ... and THE ASSERTION THAT MATTERS: the restart carries the prior
+    // session's resume cursor. `undefined` here is the #244 regression.
+    const restartInput = harness.startSession.mock.calls[1]?.[1] as
+      | { readonly resumeCursor?: unknown; readonly modelSelection?: { readonly model?: string } }
+      | undefined;
+    // `toBeDefined` is the regression itself — the bug wrote `undefined` here.
+    expect(restartInput?.resumeCursor).toBeDefined();
+    // And it must be the cursor MINTED BY THE FIRST SESSION, not a fresh one.
+    // The harness stamps `resume-${sessionIndex}` and its counter starts at 1,
+    // so turn one's session owns `resume-1`; a reactor that invented a new
+    // cursor, or forwarded a later session's, fails here rather than passing on
+    // a mere non-undefined value.
+    expect(restartInput?.resumeCursor).toEqual({ opaque: "resume-1" });
+
+    // And the switch actually happened — a restart that preserved context by
+    // ignoring the requested model would be the opposite bug.
+    expect(restartInput?.modelSelection?.model).toBe("gpt-5-codex-high");
+  });
+
+  // #202: the durable model is committed by the SERVER, and only once the
+  // runtime has accepted the turn carrying it. These two tests are a pair —
+  // the first would pass against a client that still wrote metadata
+  // optimistically, so it proves nothing on its own. The second is the one
+  // that catches the regression.
+  it("commits the requested model to thread metadata once the turn is accepted", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5-codex",
+      },
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-model-commit-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-model-commit-1"),
+          role: "user",
+          text: "switch and go",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex-high",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await waitFor(async () => {
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      return thread?.modelSelection.model === "gpt-5-codex-high";
+    });
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.modelSelection.model).toBe("gpt-5-codex-high");
+  });
+
+  // THE REGRESSION. A rejected turn must leave the PREVIOUS model visible.
+  // Committing here is the #202 bug: the thread would advertise a model that
+  // no session ever accepted, misattributing which model saw the context.
+  // Note it must not silently fall back to a default either — the assertion is
+  // on the previous model specifically, not merely "not the new one".
+  it("does not commit the requested model when the runtime rejects the turn", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5-codex",
+      },
+      sendTurnEffect: () =>
+        new ProviderAdapterRequestError({
+          provider: "codex",
+          method: "thread.turn.start",
+          detail: "the live catalog does not have that model",
+        }),
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-model-reject-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-model-reject-1"),
+          role: "user",
+          text: "switch to something the runtime will refuse",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "a-model-the-runtime-refuses",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    // Give the (forked) commit path every chance to run before asserting it
+    // did not — otherwise this passes by racing rather than by contract.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.modelSelection.model).toBe("gpt-5-codex");
   });
 
   it("preserves the active session model when in-session model switching is unsupported", async () => {

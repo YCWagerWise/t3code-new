@@ -167,6 +167,19 @@ export function resolveQuickAction(
     };
   }
 
+  // A repository we FOUND but could not inspect is not a clean one. Every count
+  // in a degraded status is unknown, not zero, so falling through to the
+  // clean-tree branches below offers "Publish repository" or "Commit & push"
+  // against a tree nobody has read. Refuse with git's own reason instead.
+  if (gitStatus.statusUnavailable === true) {
+    return {
+      label: "Commit",
+      disabled: true,
+      kind: "show_hint",
+      hint: gitStatus.statusError ?? "This repository's status could not be read.",
+    };
+  }
+
   const hasBranch = gitStatus.refName !== null;
   const hasChanges = gitStatus.hasWorkingTreeChanges;
   const hasOpenPr = gitStatus.pr?.state === "open";

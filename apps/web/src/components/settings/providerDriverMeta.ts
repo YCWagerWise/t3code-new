@@ -1,13 +1,12 @@
 import {
   ClaudeSettings,
   CodexSettings,
-  CursorSettings,
-  GrokSettings,
   OpenCodeSettings,
+  OpenaiCompatSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
-import { ClaudeAI, CursorIcon, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { ClaudeAI, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
 
 type ProviderSettingsSchema = {
   readonly fields: Readonly<Record<string, Schema.Top>>;
@@ -48,25 +47,33 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     settingsSchema: ClaudeSettings,
   },
   {
-    value: ProviderDriverKind.make("cursor"),
-    label: "Cursor",
-    icon: CursorIcon,
-    badgeLabel: "Early Access",
-    settingsSchema: CursorSettings,
-  },
-  {
-    value: ProviderDriverKind.make("grok"),
-    label: "Grok",
-    icon: GrokIcon,
-    badgeLabel: "Early Access",
-    settingsSchema: GrokSettings,
-  },
-  {
     value: ProviderDriverKind.make("opencode"),
     label: "OpenCode",
     icon: OpenCodeIcon,
     settingsSchema: OpenCodeSettings,
+    // The Rust runtime has no OpenCode backend: it drives ACP CLIs and
+    // OpenAI-compatible endpoints, and OpenCode is neither. An instance still
+    // SAVES (settings are open, and a fork or a later build may run it), but the
+    // badge says so up front instead of letting a live-looking provider fail at
+    // the first turn (#96).
+    badgeLabel: "Not on this runtime",
   },
+  // #70: OpenAI-compatible endpoints (Ollama, LM Studio, vLLM, any hosted
+  // proxy speaking Chat Completions). The Rust runtime has driven the
+  // `openaiCompat` driver for months and probes model lists via
+  // `GET /v1/models`, but without an entry here the UI's Add Provider flow
+  // could not create the instance, so Ollama was invisible from the app.
+  {
+    value: ProviderDriverKind.make("openaiCompat"),
+    label: "OpenAI-compatible (Ollama, LM Studio, …)",
+    icon: OpenAI,
+    settingsSchema: OpenaiCompatSettings,
+  },
+  // Cursor and Grok were removed from this build (#150). Their entries stayed
+  // here after the drivers were deleted, so Add Provider still offered Grok
+  // with a "Binary path" field placeholdered `grok` for a CLI nothing could
+  // instantiate. Offering a provider the runtime cannot run is worse than not
+  // offering it: the user configures it and finds out later.
 ];
 
 export const PROVIDER_CLIENT_DEFINITION_BY_VALUE: Partial<

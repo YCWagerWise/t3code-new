@@ -68,7 +68,10 @@ export const make = Effect.fn("background.hostPower.make")(function* (
       Effect.flatMap(
         Option.match({
           onNone: () => Effect.void,
-          onSome: (next) => PubSub.publish(changes, next),
+          // `PubSub.publish` returns `Effect<boolean>`; unify both branches
+          // to `Effect<void>` so `Option.match` types cleanly under
+          // `exactOptionalPropertyTypes` (#409).
+          onSome: (next) => PubSub.publish(changes, next).pipe(Effect.asVoid),
         }),
       ),
       Effect.asVoid,

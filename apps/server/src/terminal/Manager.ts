@@ -11,6 +11,7 @@ import {
   TerminalCwdError,
   TerminalCwdNotDirectoryError,
   TerminalCwdNotFoundError,
+  TerminalCwdOutsideWorktreeError,
   TerminalCwdStatError,
   TerminalError,
   TerminalHistoryError,
@@ -52,6 +53,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as ServerConfig from "../config.ts";
+import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import {
   increment,
   terminalRestartsTotal,
@@ -1146,6 +1148,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  // The same admission seam file edits and VCS use, so a pane's shell authority
+  // and the worktree the UI names cannot drift apart (#290).
+  const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
 
@@ -1548,7 +1553,24 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     );
   });
 
-  const assertValidCwd = Effect.fn("terminal.assertValidCwd")(function* (cwd: string) {
+  /**
+   * Admit a terminal's working directory.
+   *
+   * Existing-and-a-directory is necessary but NOT sufficient (#290). A pane is
+   * opened with a `cwd` AND a `worktreePath`, and the snapshot hands both to the
+   * UI — so if nothing ties them together, a client can open
+   * `{ cwd: "/tmp/outside", worktreePath: "/owned/worktree" }` and the interface
+   * reports a shell attached to the worktree while every command runs somewhere
+   * else entirely. The displayed worktree and the shell's authority have to be
+   * the same object, or the label is a lie.
+   *
+   * Admission canonicalizes both sides, so a symlink inside the worktree that
+   * points out of it is refused rather than followed.
+   */
+  const assertValidCwd = Effect.fn("terminal.assertValidCwd")(function* (
+    cwd: string,
+    worktreePath?: string | null,
+  ) {
     const stats = yield* fileSystem.stat(cwd).pipe(
       Effect.catchTags({
         PlatformError: (cause) =>
@@ -1559,6 +1581,21 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     );
     if (stats.type !== "Directory") {
       return yield* new TerminalCwdNotDirectoryError({ cwd });
+    }
+    const claimed = worktreePath?.trim();
+    if (!claimed) {
+      return;
+    }
+    const admitted = yield* workspacePaths
+      .admitPathWithinRoots({ candidate: cwd, roots: [claimed] })
+      .pipe(
+        Effect.matchEffect({
+          onFailure: () => Effect.succeed(null),
+          onSuccess: (resolved: string) => Effect.succeed(resolved as string | null),
+        }),
+      );
+    if (admitted === null) {
+      return yield* new TerminalCwdOutsideWorktreeError({ cwd, worktreePath: claimed });
     }
   });
 
@@ -2144,7 +2181,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   const openLocked = Effect.fn("terminal.openLocked")(function* (input: TerminalOpenInput) {
     const terminalId = input.terminalId;
-    yield* assertValidCwd(input.cwd);
+    yield* assertValidCwd(input.cwd, input.worktreePath);
 
     const sessionKey = toSessionKey(input.threadId, terminalId);
     const existing = yield* getSession(input.threadId, terminalId);
@@ -2321,14 +2358,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const readAllTerminalMetadata = () =>
     readManagerState.pipe(
       Effect.map((state) =>
-        [...state.sessions.values()]
-          .map(summary)
-          .sort(
-            (left, right) =>
-              right.updatedAt.localeCompare(left.updatedAt) ||
-              left.threadId.localeCompare(right.threadId) ||
-              left.terminalId.localeCompare(right.terminalId),
-          ),
+        [...state.sessions.values()].map(summary).sort(
+          (left, right) =>
+            right.updatedAt.localeCompare(left.updatedAt) ||
+            // `threadId` is null for a child-session pane (#149), and this is
+            // an ORDERING key, not an identity — coalescing to "" keeps the
+            // sort total and stable (session panes group ahead of thread
+            // panes) instead of throwing on a pane the list must still show.
+            // `terminalId` remains the tiebreaker, so ordering within either
+            // group is unchanged.
+            (left.threadId ?? "").localeCompare(right.threadId ?? "") ||
+            left.terminalId.localeCompare(right.terminalId),
+        ),
       ),
     );
 
@@ -2557,7 +2598,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       Effect.gen(function* () {
         yield* increment(terminalRestartsTotal, { scope: "thread" });
         const terminalId = input.terminalId;
-        yield* assertValidCwd(input.cwd);
+        yield* assertValidCwd(input.cwd, input.worktreePath);
 
         const sessionKey = toSessionKey(input.threadId, terminalId);
         const existingSession = yield* getSession(input.threadId, terminalId);
@@ -2666,4 +2707,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   });
 });
 
-export const layer = Layer.effect(TerminalManager, make()).pipe(Layer.provide(ProcessRunner.layer));
+export const layer = Layer.effect(TerminalManager, make()).pipe(
+  Layer.provide(ProcessRunner.layer),
+  Layer.provide(WorkspacePaths.layer),
+);

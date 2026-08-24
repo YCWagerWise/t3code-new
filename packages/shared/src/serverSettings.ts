@@ -58,9 +58,18 @@ export function resolveSourceControlWriterModelSelection(
   }
 
   const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
-  return provider?.enabled === true && isProviderAvailable(provider)
-    ? selection
-    : settings.textGenerationModelSelection;
+  if (!provider || provider.enabled !== true || !isProviderAvailable(provider)) {
+    return settings.textGenerationModelSelection;
+  }
+  // #195: the model slug the user PICKED must still be a real slug the
+  // provider actually serves. Without this check, a stale settings file
+  // (or an Ollama/custom model the user removed) silently routes commit
+  // messages, PR bodies, and generated branch names through the wrong
+  // model — the picker says one thing, the request runs another. Fall
+  // back to the general text-generation selection so the writer never
+  // silently swaps to a slug the provider does not serve.
+  const modelIsRoutable = provider.models.some((m) => m.slug === selection.model);
+  return modelIsRoutable ? selection : settings.textGenerationModelSelection;
 }
 
 export interface PersistedServerObservabilitySettings {

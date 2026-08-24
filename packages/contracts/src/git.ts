@@ -206,6 +206,16 @@ const VcsStatusLocalShape = {
   isDefaultRef: Schema.Boolean,
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
   hasWorkingTreeChanges: Schema.Boolean,
+  /**
+   * The repository was found but could not be inspected — a corrupt index,
+   * unreadable git metadata, a blocked git binary.
+   *
+   * Distinct from `isRepo: false`. When this is set the working tree below is
+   * UNKNOWN rather than clean, so surfaces must not read "no changes" from it
+   * or offer to initialize the repository; show `statusError` instead.
+   */
+  statusUnavailable: Schema.optional(Schema.Boolean),
+  statusError: Schema.optional(Schema.String),
   workingTree: Schema.Struct({
     files: Schema.Array(
       Schema.Struct({
@@ -451,3 +461,76 @@ export const GitActionProgressEvent = Schema.Union([
   GitActionFailedEvent,
 ]);
 export type GitActionProgressEvent = typeof GitActionProgressEvent.Type;
+
+/**
+ * A running or recently-finished stacked action, as the SERVER sees it (#278).
+ *
+ * The action used to exist only as a live stream and a client-side ref, so a
+ * reconnecting client could not answer "is something running in this repo" and
+ * nothing could stop it. This is the durable handle those controls address.
+ */
+export const GitActionRunStatus = Schema.Literals(["running", "completed", "failed", "canceled"]);
+export type GitActionRunStatus = typeof GitActionRunStatus.Type;
+
+export const GitActionSnapshot = Schema.Struct({
+  actionId: TrimmedNonEmptyStringSchema,
+  cwd: TrimmedNonEmptyStringSchema,
+  action: GitStackedAction,
+  status: GitActionRunStatus,
+  startedAt: TrimmedNonEmptyStringSchema,
+  endedAt: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /** Failure message for `failed`; the cancel reason for `canceled`. */
+  failure: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /** Progress events retained and replayable right now. */
+  eventCount: NonNegativeInt,
+  /**
+   * Events dropped because the retention cap was reached. Surfaced rather than
+   * swallowed: a replay missing frames is indistinguishable from an action that
+   * never emitted them, and a client folding the stream would render a phase
+   * that never ended.
+   */
+  droppedEvents: NonNegativeInt,
+});
+export type GitActionSnapshot = typeof GitActionSnapshot.Type;
+
+export const GitInspectStackedActionInput = Schema.Struct({
+  actionId: TrimmedNonEmptyStringSchema,
+});
+export type GitInspectStackedActionInput = typeof GitInspectStackedActionInput.Type;
+
+export const GitInspectStackedActionResult = Schema.Struct({
+  /** `null` when the id is unknown — never a fabricated idle snapshot. */
+  action: Schema.NullOr(GitActionSnapshot),
+  /** Everything after the caller's cursor, so a reconnect replays the gap. */
+  events: Schema.Array(GitActionProgressEvent),
+});
+export type GitInspectStackedActionResult = typeof GitInspectStackedActionResult.Type;
+
+export const GitAttachStackedActionInput = Schema.Struct({
+  actionId: TrimmedNonEmptyStringSchema,
+  /**
+   * Index of the first event the caller has NOT seen. A reconnecting client
+   * passes what it already folded, so it neither misses frames nor double-counts
+   * them. Omitted means "from the beginning".
+   */
+  cursor: Schema.optional(NonNegativeInt),
+});
+export type GitAttachStackedActionInput = typeof GitAttachStackedActionInput.Type;
+
+export const GitCancelStackedActionInput = Schema.Struct({
+  actionId: TrimmedNonEmptyStringSchema,
+  reason: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type GitCancelStackedActionInput = typeof GitCancelStackedActionInput.Type;
+
+export const GitCancelStackedActionResult = Schema.Struct({
+  /**
+   * `true` only when a RUNNING action was stopped and its process is gone.
+   * `false` for an unknown id or one that had already finished — telling a
+   * caller we stopped work that had already ended is the same class of lie as
+   * the fail-open exit this finding is about.
+   */
+  canceled: Schema.Boolean,
+  action: Schema.NullOr(GitActionSnapshot),
+});
+export type GitCancelStackedActionResult = typeof GitCancelStackedActionResult.Type;
