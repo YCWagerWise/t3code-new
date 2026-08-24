@@ -63,7 +63,9 @@ fn walk(root: &std::path::Path) -> (Vec<(String, bool)>, bool) {
     let mut stack = vec![root.to_path_buf()];
     let mut truncated = false;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             if out.len() >= MAX_ENTRIES {
                 truncated = true;
@@ -74,7 +76,9 @@ fn walk(root: &std::path::Path) -> (Vec<(String, bool)>, bool) {
                 continue;
             }
             let path = e.path();
-            let Ok(rel) = path.strip_prefix(root) else { continue };
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             out.push((rel.to_string_lossy().into_owned(), is_dir));
             if is_dir {
@@ -88,8 +92,9 @@ fn walk(root: &std::path::Path) -> (Vec<(String, bool)>, bool) {
 /// The extensions an image picker may offer. Deliberately a list, not a
 /// content sniff: the picker runs over a whole tree and reading every file to
 /// classify it would make browsing a large repo unusable.
-const IMAGE_EXTENSIONS: &[&str] =
-    &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico"];
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
+];
 
 fn is_image(path: &str) -> bool {
     std::path::Path::new(path)
@@ -125,14 +130,22 @@ pub async fn list_entries(cwd: &str) -> Value {
 /// over the path, and a match earlier in the basename ranks higher, which is
 /// what makes typing `srvmn` find `src/server_main.rs`.
 pub async fn search_entries(cwd: &str, input: &Value) -> Value {
-    let query = input.get("query").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
     let want_kind = input.get("kind").and_then(Value::as_str);
     // The favicon/image pickers ask for images ONLY. Ignoring the filter lets
     // them offer README/source/binary paths as if they were pictures, and the
     // downstream preview or artwork write then fails on a path that was never
     // an image (#93).
-    let image_only = input.get("imageOnly").and_then(Value::as_bool).unwrap_or(false);
+    let image_only = input
+        .get("imageOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let (found, mut truncated) = match entries(std::path::Path::new(cwd)).await {
         Ok(v) => v,
@@ -204,7 +217,10 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<i64> {
 
 /// `projects.readFile` — file preview.
 pub async fn read_file(cwd: &str, input: &Value) -> Result<Value, String> {
-    let rel = input.get("relativePath").and_then(Value::as_str).ok_or("relativePath is required")?;
+    let rel = input
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .ok_or("relativePath is required")?;
     let root = std::path::Path::new(cwd);
     // cairn confines the path; an escape is refused rather than read
     let contents = cairn::read_file(root, rel).map_err(|e| e.to_string())?;
@@ -253,19 +269,22 @@ pub async fn write_file(
     cwd: &str,
     input: &Value,
 ) -> Result<Value, String> {
-    let rel = input.get("relativePath").and_then(Value::as_str).ok_or("relativePath is required")?;
+    let rel = input
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .ok_or("relativePath is required")?;
     let contents = input.get("contents").and_then(Value::as_str).unwrap_or("");
     let root = std::path::Path::new(cwd);
     match crate::tools::discover_stack(pool, root).await {
         cairn::Discovery::Repo(stack) => {
-            cairn::write_file(&stack, rel, contents).await.map_err(|e| e.to_string())?;
+            cairn::write_file(&stack, rel, contents)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         cairn::Discovery::NotRepository => cairn::write_file_atomic(root, rel, contents)?,
-        cairn::Discovery::Unavailable(why) => {
-            return Err(format!(
-                "cairn checkpoint substrate unavailable ({why}); refusing unversioned write to {rel}"
-            ))
-        }
+        cairn::Discovery::Unavailable(why) => return Err(format!(
+            "cairn checkpoint substrate unavailable ({why}); refusing unversioned write to {rel}"
+        )),
     }
     Ok(json!({ "relativePath": rel }))
 }
@@ -288,15 +307,24 @@ mod tests {
     async fn listing_skips_the_noise_and_reports_kinds() {
         let dir = workspace().await;
         let out = list_entries(dir.to_str().unwrap()).await;
-        let paths: Vec<&str> =
-            out["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        let paths: Vec<&str> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
         assert!(paths.contains(&"README.md"), "{paths:?}");
         assert!(paths.contains(&"src/server_main.rs"), "{paths:?}");
         assert!(
             !paths.iter().any(|p| p.starts_with("node_modules")),
             "node_modules is not the user's code: {paths:?}"
         );
-        let src = out["entries"].as_array().unwrap().iter().find(|e| e["path"] == "src").unwrap();
+        let src = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == "src")
+            .unwrap();
         assert_eq!(src["kind"], "directory");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -307,27 +335,40 @@ mod tests {
         let dir = workspace().await;
         let cwd = dir.to_str().unwrap();
 
-        let browse = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
+        let browse = search_entries(cwd, &json!({"query": "", "limit": 50}))
+            .await;
         assert!(
             !browse["entries"].as_array().unwrap().is_empty(),
             "an empty query browses rather than returning nothing"
         );
 
-        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10})).await;
-        let paths: Vec<&str> =
-            hit["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
-        assert_eq!(paths.first(), Some(&"src/server_main.rs"), "fuzzy subsequence: {paths:?}");
+        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10}))
+            .await;
+        let paths: Vec<&str> = hit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths.first(),
+            Some(&"src/server_main.rs"),
+            "fuzzy subsequence: {paths:?}"
+        );
 
-        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10})).await;
+        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10}))
+            .await;
         assert!(none["entries"].as_array().unwrap().is_empty());
 
         // limit truncates AND says so
-        let capped = search_entries(cwd, &json!({"query": "", "limit": 1})).await;
+        let capped = search_entries(cwd, &json!({"query": "", "limit": 1}))
+            .await;
         assert_eq!(capped["entries"].as_array().unwrap().len(), 1);
         assert_eq!(capped["truncated"], json!(true), "truncation is reported");
 
         // kind filter
-        let dirs = search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"})).await;
+        let dirs = search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"}))
+            .await;
         assert!(dirs["entries"]
             .as_array()
             .unwrap()
@@ -346,22 +387,41 @@ mod tests {
         std::fs::write(dir.join("assets/notes.txt"), "x").unwrap();
         let cwd = dir.to_str().unwrap();
 
-        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true})).await;
-        let paths: Vec<&str> =
-            out["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
-        assert!(paths.contains(&"assets/logo.PNG"), "case-insensitive extension: {paths:?}");
+        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true}))
+            .await;
+        let paths: Vec<&str> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"assets/logo.PNG"),
+            "case-insensitive extension: {paths:?}"
+        );
         assert!(paths.contains(&"assets/icon.svg"), "{paths:?}");
-        assert!(!paths.iter().any(|p| p.ends_with(".txt")), "no text files: {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.ends_with(".txt")),
+            "no text files: {paths:?}"
+        );
         assert!(!paths.contains(&"README.md"), "{paths:?}");
-        assert!(!paths.contains(&"assets"), "no directories in an image picker: {paths:?}");
+        assert!(
+            !paths.contains(&"assets"),
+            "no directories in an image picker: {paths:?}"
+        );
         for e in out["entries"].as_array().unwrap() {
             assert_eq!(e["kind"], "file");
         }
 
         // without the flag the same search still returns everything
-        let all = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
-        let all_paths: Vec<&str> =
-            all["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        let all = search_entries(cwd, &json!({"query": "", "limit": 50}))
+            .await;
+        let all_paths: Vec<&str> = all["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
         assert!(all_paths.contains(&"README.md"), "{all_paths:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -396,29 +456,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Read and write are confined and honest about size.
     #[tokio::test]
     async fn read_and_write_are_confined_to_the_workspace() {
         let dir = workspace().await;
         let cwd = dir.to_str().unwrap();
 
-        let r = read_file(cwd, &json!({"relativePath": "README.md"})).await.unwrap();
+        let r = read_file(cwd, &json!({"relativePath": "README.md"}))
+            .await
+            .unwrap();
         assert_eq!(r["contents"], "# hi\n");
         assert_eq!(r["byteLength"], json!(5));
         assert_eq!(r["truncated"], json!(false));
 
         // a path escaping the workspace is REFUSED, both ways
-        assert!(read_file(cwd, &json!({"relativePath": "../../../etc/passwd"})).await.is_err());
+        assert!(
+            read_file(cwd, &json!({"relativePath": "../../../etc/passwd"}))
+                .await
+                .is_err()
+        );
         let pool = do_storage::DbPool::new(dir.join(".t3code-agent"));
-        assert!(write_file(&pool, cwd, &json!({"relativePath": "../escape.txt", "contents": "x"}))
-            .await
-            .is_err());
+        assert!(write_file(
+            &pool,
+            cwd,
+            &json!({"relativePath": "../escape.txt", "contents": "x"})
+        )
+        .await
+        .is_err());
 
         // writing creates directories and lands atomically
-        write_file(&pool, cwd, &json!({"relativePath": "docs/new/note.md", "contents": "body\n"}))
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("docs/new/note.md")).unwrap(), "body\n");
+        write_file(
+            &pool,
+            cwd,
+            &json!({"relativePath": "docs/new/note.md", "contents": "body\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("docs/new/note.md")).unwrap(),
+            "body\n"
+        );
         let strays: Vec<_> = std::fs::read_dir(dir.join("docs/new"))
             .unwrap()
             .flatten()
@@ -440,10 +516,17 @@ mod tests {
         let cwd = dir.to_str().unwrap();
         let pool = do_storage::DbPool::new(dir.join(".t3code-agent"));
 
-        write_file(&pool, cwd, &json!({"relativePath": "edited.md", "contents": "from the UI\n"}))
-            .await
-            .expect("save succeeds");
-        assert_eq!(std::fs::read_to_string(dir.join("edited.md")).unwrap(), "from the UI\n");
+        write_file(
+            &pool,
+            cwd,
+            &json!({"relativePath": "edited.md", "contents": "from the UI\n"}),
+        )
+        .await
+        .expect("save succeeds");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("edited.md")).unwrap(),
+            "from the UI\n"
+        );
 
         // the checkpoint stack recorded it, so the save can be diffed/reverted
         let stack = match crate::tools::discover_stack(&pool, &dir).await {
@@ -467,16 +550,31 @@ mod tests {
         let repeats = (MAX_READ_BYTES / unit.len()) + 1000;
         let body: String = unit.repeat(repeats);
         assert!(body.len() > MAX_READ_BYTES);
-        assert!(!body.is_char_boundary(MAX_READ_BYTES), "the cap must split a codepoint");
+        assert!(
+            !body.is_char_boundary(MAX_READ_BYTES),
+            "the cap must split a codepoint"
+        );
         std::fs::write(dir.join("big.txt"), &body).unwrap();
 
-        let r = read_file(cwd, &json!({"relativePath": "big.txt"})).await.unwrap();
+        let r = read_file(cwd, &json!({"relativePath": "big.txt"}))
+            .await
+            .unwrap();
         assert_eq!(r["truncated"], json!(true));
-        assert_eq!(r["byteLength"], json!(body.len()), "the ORIGINAL length is reported");
+        assert_eq!(
+            r["byteLength"],
+            json!(body.len()),
+            "the ORIGINAL length is reported"
+        );
         let preview = r["contents"].as_str().unwrap();
-        assert!(!preview.is_empty(), "a truncated preview is still a preview");
+        assert!(
+            !preview.is_empty(),
+            "a truncated preview is still a preview"
+        );
         assert!(preview.len() <= MAX_READ_BYTES);
-        assert!(body.starts_with(preview), "the preview is a prefix of the file");
+        assert!(
+            body.starts_with(preview),
+            "the preview is a prefix of the file"
+        );
     }
 }
 
@@ -492,8 +590,15 @@ mod tests {
 /// it lists DIRECTORIES under an existing parent, and says which failure it
 /// hit so the UI can explain itself (#72).
 pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String)> {
-    let partial = input.get("partialPath").and_then(Value::as_str).unwrap_or("");
-    let cwd = input.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(default_cwd);
+    let partial = input
+        .get("partialPath")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_cwd);
     if partial.contains('\\') || partial.chars().nth(1) == Some(':') {
         return Err((
             "windows_path_unsupported".into(),
@@ -523,7 +628,10 @@ pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String
         (candidate.clone(), String::new())
     } else {
         (
-            candidate.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| candidate.clone()),
+            candidate
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| candidate.clone()),
             candidate
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -532,7 +640,10 @@ pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String
     };
 
     let read = std::fs::read_dir(&parent).map_err(|e| {
-        ("read_directory_failed".to_string(), format!("Cannot read {}: {e}", parent.display()))
+        (
+            "read_directory_failed".to_string(),
+            format!("Cannot read {}: {e}", parent.display()),
+        )
     })?;
     let mut entries: Vec<Value> = Vec::new();
     for dirent in read.flatten() {
@@ -547,7 +658,12 @@ pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String
         }
         entries.push(json!({ "name": name, "fullPath": dirent.path().to_string_lossy() }));
     }
-    entries.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    entries.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
     entries.truncate(500);
     Ok(json!({ "parentPath": parent.to_string_lossy(), "entries": entries }))
 }
@@ -646,10 +762,23 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
     if query.is_empty() {
         return Err("query is required".into());
     }
-    let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(100).min(1_000) as usize;
-    let case_sensitive = input.get("caseSensitive").and_then(Value::as_bool).unwrap_or(false);
-    let whole_word = input.get("wholeWord").and_then(Value::as_bool).unwrap_or(false);
-    let use_regex = input.get("useRegex").and_then(Value::as_bool).unwrap_or(false);
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .min(1_000) as usize;
+    let case_sensitive = input
+        .get("caseSensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let whole_word = input
+        .get("wholeWord")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let use_regex = input
+        .get("useRegex")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // A regex the user is still typing is normal; refusing the whole search for
     // it would make the toggle unusable. Fall back to literal and SAY so.
@@ -679,12 +808,17 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
             break;
         }
         let full = root.join(&rel);
-        if std::fs::metadata(&full).map(|m| m.len() > MAX_SEARCH_FILE_BYTES).unwrap_or(true) {
+        if std::fs::metadata(&full)
+            .map(|m| m.len() > MAX_SEARCH_FILE_BYTES)
+            .unwrap_or(true)
+        {
             continue;
         }
         // cairn confines the read to the workspace; a path that escapes is
         // skipped rather than followed.
-        let Ok(contents) = cairn::read_file(root, &rel) else { continue };
+        let Ok(contents) = cairn::read_file(root, &rel) else {
+            continue;
+        };
         opened += 1;
         for (i, line) in contents.lines().enumerate() {
             let ranges = matcher.ranges(line);
@@ -719,21 +853,33 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
 /// option, so `useRegex` compiles a real regex and everything else is a literal
 /// scan with explicit case and word-boundary rules.
 enum Matcher {
-    Literal { needle: String, case_sensitive: bool, whole_word: bool },
+    Literal {
+        needle: String,
+        case_sensitive: bool,
+        whole_word: bool,
+    },
     Regex(regex::Regex),
 }
 
 impl Matcher {
     fn literal(query: &str, case_sensitive: bool, whole_word: bool) -> Self {
         Matcher::Literal {
-            needle: if case_sensitive { query.to_string() } else { query.to_lowercase() },
+            needle: if case_sensitive {
+                query.to_string()
+            } else {
+                query.to_lowercase()
+            },
             case_sensitive,
             whole_word,
         }
     }
 
     fn regex(query: &str, case_sensitive: bool, whole_word: bool) -> Result<Self, String> {
-        let pattern = if whole_word { format!(r"\b(?:{query})\b") } else { query.to_string() };
+        let pattern = if whole_word {
+            format!(r"\b(?:{query})\b")
+        } else {
+            query.to_string()
+        };
         regex::RegexBuilder::new(&pattern)
             .case_insensitive(!case_sensitive)
             .build()
@@ -745,8 +891,16 @@ impl Matcher {
     fn ranges(&self, line: &str) -> Vec<(usize, usize)> {
         match self {
             Matcher::Regex(re) => re.find_iter(line).map(|m| (m.start(), m.end())).collect(),
-            Matcher::Literal { needle, case_sensitive, whole_word } => {
-                let hay = if *case_sensitive { line.to_string() } else { line.to_lowercase() };
+            Matcher::Literal {
+                needle,
+                case_sensitive,
+                whole_word,
+            } => {
+                let hay = if *case_sensitive {
+                    line.to_string()
+                } else {
+                    line.to_lowercase()
+                };
                 let mut out = Vec::new();
                 let mut from = 0usize;
                 while let Some(rel) = hay[from..].find(needle.as_str()) {
@@ -756,7 +910,8 @@ impl Matcher {
                         let before = hay[..start].chars().next_back();
                         let after = hay[end..].chars().next();
                         let wordish = |c: char| c.is_alphanumeric() || c == '_';
-                        !before.map(wordish).unwrap_or(false) && !after.map(wordish).unwrap_or(false)
+                        !before.map(wordish).unwrap_or(false)
+                            && !after.map(wordish).unwrap_or(false)
                     };
                     if boundary_ok {
                         out.push((start, end));
@@ -770,5 +925,4 @@ impl Matcher {
             }
         }
     }
-
 }

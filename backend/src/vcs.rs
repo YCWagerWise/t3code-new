@@ -20,6 +20,9 @@ use cairn::{Repo, Status};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+const WORKING_TREE_FILE_LIMIT: usize = 200;
+const WORKING_TREE_FILE_BYTES_LIMIT: usize = 64 * 1024;
+
 /// Open the repository at `cwd`, or `None` when it is not one.
 pub async fn open(cwd: &str) -> Option<Repo> {
     repo(cwd).await
@@ -224,7 +227,7 @@ fn not_a_repo() -> Value {
     json!({
         "isRepo": false, "hasPrimaryRemote": false, "isDefaultRef": false,
         "refName": null, "hasWorkingTreeChanges": false,
-        "workingTree": { "files": [], "insertions": 0, "deletions": 0 },
+        "workingTree": { "files": [], "insertions": 0, "deletions": 0, "fileCount": 0, "filesTruncated": false },
     })
 }
 
@@ -241,11 +244,31 @@ fn status_unavailable(why: &str) -> Value {
         "isRepo": true, "hasPrimaryRemote": false, "isDefaultRef": false,
         "refName": null, "hasWorkingTreeChanges": false,
         "statusUnavailable": true, "statusError": why,
-        "workingTree": { "files": [], "insertions": 0, "deletions": 0 },
+        "workingTree": { "files": [], "insertions": 0, "deletions": 0, "fileCount": 0, "filesTruncated": false },
     })
 }
 
+fn bounded_working_tree_files(s: &Status) -> (Vec<Value>, bool) {
+    let mut files = Vec::new();
+    let mut bytes = 2usize; // JSON array brackets.
+    for c in &s.working_tree.changes {
+        if files.len() >= WORKING_TREE_FILE_LIMIT {
+            return (files, true);
+        }
+        let item = json!({ "path": c.path, "insertions": c.insertions, "deletions": c.deletions });
+        let item_bytes = serde_json::to_vec(&item).map(|v| v.len()).unwrap_or(usize::MAX);
+        let next_bytes = bytes.saturating_add(item_bytes).saturating_add(1);
+        if !files.is_empty() && next_bytes > WORKING_TREE_FILE_BYTES_LIMIT {
+            return (files, true);
+        }
+        bytes = next_bytes;
+        files.push(item);
+    }
+    (files, false)
+}
+
 fn local_status(s: &Status) -> Value {
+    let (files, files_truncated) = bounded_working_tree_files(s);
     json!({
         "isRepo": true,
         "hasPrimaryRemote": s.has_origin,
@@ -253,10 +276,11 @@ fn local_status(s: &Status) -> Value {
         "refName": s.branch,
         "hasWorkingTreeChanges": s.is_dirty(),
         "workingTree": {
-            // per-file counts come from cairn's single numstat parse
-            "files": s.working_tree.changes.iter().map(|c| json!({
-                "path": c.path, "insertions": c.insertions, "deletions": c.deletions,
-            })).collect::<Vec<_>>(),
+            // Retained VCS frames are copied into do-pubsub subscriber inboxes,
+            // so carry a bounded preview plus an explicit total/truncation flag.
+            "files": files,
+            "fileCount": s.working_tree.changes.len(),
+            "filesTruncated": files_truncated,
             "insertions": s.working_tree.insertions,
             "deletions": s.working_tree.deletions,
         },
@@ -1301,6 +1325,38 @@ mod tests {
         let files = s["workingTree"]["files"].as_array().unwrap();
         assert!(files.iter().any(|f| f["path"] == "a.txt"), "untracked file listed: {files:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_payload_bounds_working_tree_files_for_retained_vcs_frames() {
+        let changes: Vec<cairn::FileLines> = (0..5_000)
+            .map(|i| cairn::FileLines {
+                path: format!("generated/{i:04}/really-long-generated-file-name-{i:04}.txt"),
+                insertions: 1,
+                deletions: 0,
+                binary: false,
+            })
+            .collect();
+        let status = Status {
+            branch: Some("main".into()),
+            has_origin: true,
+            working_tree: cairn::WorkingTree {
+                files: changes.iter().map(|c| c.path.clone()).collect(),
+                changes,
+                insertions: 5_000,
+                deletions: 0,
+            },
+            ..Status::default()
+        };
+
+        let local = status_from(&status);
+        let files = local["workingTree"]["files"].as_array().unwrap();
+        assert!(files.len() <= WORKING_TREE_FILE_LIMIT, "retained VCS frame carried {} per-file rows", files.len());
+        assert_eq!(local["workingTree"]["fileCount"], json!(5_000));
+        assert_eq!(local["workingTree"]["filesTruncated"], json!(true));
+        let retained = json!({"_tag": "localUpdated", "local": local});
+        let bytes = serde_json::to_vec(&retained).unwrap().len();
+        assert!(bytes < WORKING_TREE_FILE_BYTES_LIMIT + 16 * 1024, "retained localUpdated payload grew to {bytes} bytes");
     }
 
     /// Branch create/switch and ref listing all cross cairn's screened seam.

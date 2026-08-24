@@ -224,6 +224,8 @@ const VcsStatusLocalShape = {
         deletions: NonNegativeInt,
       }),
     ),
+    fileCount: Schema.optional(NonNegativeInt),
+    filesTruncated: Schema.optional(Schema.Boolean),
     insertions: NonNegativeInt,
     deletions: NonNegativeInt,
   }),
