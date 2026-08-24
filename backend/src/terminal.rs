@@ -815,6 +815,41 @@ mod wait_tests {
         );
     }
 
+    /// The read side of the same fault: a store that cannot be read must not be
+    /// rendered as "no such pane" or an empty pane list.
+    #[tokio::test]
+    async fn unreadable_pane_store_is_not_reported_as_missing_or_empty() {
+        // Use the module's own fault helpers rather than reaching into a
+        // private field: `registry_with_db` hands back the store this registry
+        // is built on, which is the supported way to break it.
+        let (reg, db) = registry_with_db().await;
+        reg.open(&TerminalOwner::thread("t-broken"), "pane-a", None, None, &[])
+            .await
+            .expect("pane opens");
+        break_pane_store(&db).await;
+
+        assert!(
+            reg.get(&TerminalOwner::thread("t-broken"), "pane-a")
+                .await
+                .is_err(),
+            "get must not turn unreadable durable pane state into None"
+        );
+        assert!(
+            reg.wait_for(
+                &TerminalOwner::thread("t-broken"),
+                "pane-a",
+                std::time::Duration::from_millis(1)
+            )
+            .await
+            .is_err(),
+            "wait_for must not turn unreadable durable pane state into a timeout/missing pane"
+        );
+        assert!(
+            reg.list(&TerminalOwner::thread("t-broken")).await.is_err(),
+            "list must not turn unreadable durable pane state into []"
+        );
+    }
+
     /// A pane launched with env is still a USABLE shell.
     ///
     /// hearth's `relaunch` deliberately keeps nothing from the previous

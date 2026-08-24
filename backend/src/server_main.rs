@@ -1303,10 +1303,10 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
             json!({ "type": "snapshot", "terminals": rows })
         }
         Err(e) => json!({
-            "type": "snapshot",
-            "terminals": [],
-            "statusUnavailable": true,
-            "statusError": e,
+            "type": "store_unavailable",
+            "threadId": thread,
+            "terminals": Value::Null,
+            "error": format!("terminal pane store unavailable: {e}"),
         }),
     };
     let topic = terminal_meta_topic(&thread);
@@ -2490,6 +2490,7 @@ async fn handle_request(
                     }
                     Ok(None) => Value::Null,
                     Err(e) => {
+                        tracing::error!(%e, %thread_id, "session status unreadable");
                         snapshot_tail.close().await;
                         chunk(tx, &id, json!({ "kind": "error",
                             "error": { "message": format!("session status unreadable: {e}") } }));
@@ -3051,21 +3052,43 @@ async fn handle_request(
             let action_db = state.rt.store().db().clone();
             // The orchestration isolate never ran an agent's BOOT_DDL, so it has
             // no `agent_control` table until we say so. Idempotent.
-            let _ = agent_sdk_do::Control::ensure_schema(&action_db).await;
+            if let Err(e) = agent_sdk_do::Control::ensure_schema(&action_db).await {
+                exit_failure(tx, &id, &format!("action control schema unavailable: {e}"));
+                return;
+            }
             let action_control = agent_sdk_do::Control::new(action_db);
-            let action_id =
-                payload.get("actionId").and_then(Value::as_str).unwrap_or("action").to_string();
-            // `ensure` before the run so `cancel` has a row to flip even if it
-            // lands in the gap before the first phase boundary is reached.
-            let _ = action_control.ensure(&action_id).await;
+            let action_id = match payload
+                .get("actionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(action_id) => action_id.to_string(),
+                None => {
+                    exit_failure(tx, &id, "runStackedAction requires an actionId");
+                    return;
+                }
+            };
+            // A new user action is a fresh control-row generation. `ensure`
+            // preserves stale cancel bits by design; reusable action ids need
+            // an explicit reset before phase boundaries start checking.
+            if let Err(e) = action_control.start_fresh(&action_id).await {
+                exit_failure(tx, &id, &format!("could not start action control: {e}"));
+                return;
+            }
             match vcs::run_stacked_action_streaming(&cwd, &payload, &mut emit, Some(&action_control))
                 .await
             {
                 Ok(None) => {
+                    let _ = action_control.clear(&action_id).await;
                     exit_success(tx, &id, Value::Null);
                     publish_vcs_status(&state, &cwd).await;
                 }
                 Ok(Some((phase, message))) => {
+                    if message.contains("cancelled") {
+                        let _ = action_control.finish(&action_id, agent_sdk_do::Checkpoint::Cancel).await;
+                    }
+                    let _ = action_control.clear(&action_id).await;
                     // A refused phase can still have mutated the repository —
                     // `commit` may have landed before `push` was refused — so
                     // the status is republished on this path too. Leaving it
@@ -3074,7 +3097,10 @@ async fn handle_request(
                     let phase = phase.as_str().unwrap_or("action").to_string();
                     exit_failure(tx, &id, &format!("{phase}: {message}"));
                 }
-                Err(e) => exit_failure(tx, &id, &e),
+                Err(e) => {
+                    let _ = action_control.clear(&action_id).await;
+                    exit_failure(tx, &id, &e);
+                }
             }
         }
         // ── project files: browse / search / preview / write (#64) ─────────
@@ -3103,7 +3129,10 @@ async fn handle_request(
                 return;
             }
             let cancel_db = state.rt.store().db().clone();
-            let _ = agent_sdk_do::Control::ensure_schema(&cancel_db).await;
+            if let Err(e) = agent_sdk_do::Control::ensure_schema(&cancel_db).await {
+                exit_failure(tx, &id, &format!("action control schema unavailable: {e}"));
+                return;
+            }
             let control = agent_sdk_do::Control::new(cancel_db);
             // `canceled` is TRUE ONLY IF THERE WAS A RUNNING ACTION TO STOP.
             //
@@ -3116,8 +3145,19 @@ async fn handle_request(
             //
             // `Control::cancel` only moves running -> cancelling, so the state
             // BEFORE the call is what decides the answer.
-            let was_running = control.state(action_id).await.map(|s| s == "running").unwrap_or(false);
-            match control.cancel(action_id).await {
+            let was_running = match control.state_opt(action_id).await {
+                Ok(state) => state.as_deref() == Some("running"),
+                Err(e) => {
+                    exit_failure(tx, &id, &format!("action control state unreadable: {e}"));
+                    return;
+                }
+            };
+            let cancel = if was_running {
+                control.cancel(action_id).await
+            } else {
+                Ok(())
+            };
+            match cancel {
                 // `action: null` — this backend has no snapshot registry to
                 // report. Null is the contract's shape for "no record", and it is
                 // the truth here; fabricating an idle snapshot would be worse.
@@ -4308,10 +4348,10 @@ fn spawn_metadata_tail(
                 Ok(panes) => panes,
                 Err(e) => {
                     let ev = json!({
-                        "type": "snapshot",
-                        "terminals": [],
-                        "statusUnavailable": true,
-                        "statusError": e,
+                        "type": "store_unavailable",
+                        "threadId": thread_id,
+                        "terminals": Value::Null,
+                        "error": format!("terminal pane store unavailable: {e}"),
                     });
                     let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None));
                     return;

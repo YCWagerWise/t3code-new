@@ -1102,6 +1102,60 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
     );
 }
 
+#[tokio::test]
+async fn unreadable_terminal_pane_store_is_not_a_valid_empty_metadata_snapshot() {
+    let (state, _d) = test_state().await;
+    state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-pane-corrupt"),
+            "pane-real",
+            Some(&state.cwd),
+            None,
+            &[],
+        )
+        .await
+        .expect("pane opens before durable store corruption");
+    state
+        .tool_roots
+        .session_db()
+        .execute("DROP TABLE exec_pane", vec![])
+        .await
+        .expect("corrupt pane store");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-pane-corrupt" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let events: Vec<Value> = frames
+        .iter()
+        .filter_map(|f| f["values"].get(0).cloned())
+        .collect();
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "store_unavailable"
+                && e["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("terminal pane store unavailable"))
+        }),
+        "unreadable durable pane state must be explicit, not an empty terminal list: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| {
+            e["type"] == "snapshot"
+                && e["terminals"]
+                    .as_array()
+                    .is_some_and(|rows| rows.is_empty())
+        }),
+        "corrupt pane state was reported as a valid empty snapshot: {events:?}"
+    );
+}
+
 /// Subscriber lists must SHRINK when clients go away.
 ///
 /// Every `subscribe*` pushed and nothing ever removed, so each reconnect —
@@ -3608,6 +3662,102 @@ async fn a_stacked_action_that_fails_exits_failure_and_says_which_phase() {
         defect.contains("push") || defect.contains("remote"),
         "#427: the Failure must name the phase that refused so a caller can tell \
          a failed commit from a failed push; got {defect:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cancel_stacked_action_fails_when_control_state_is_unreadable() {
+    let (state, dir) = test_state().await;
+    let db = state.rt.store().db().clone();
+    db.execute("DROP TABLE IF EXISTS agent_control", vec![])
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE agent_control (run_id TEXT PRIMARY KEY)", vec![])
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "git.cancelStackedAction",
+        json!({ "actionId": "locked-action" }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("cancel request exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "unreadable action-control state must not become canceled:false: {exit}"
+    );
+    let defect = exit["exit"]["cause"][0]["defect"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        defect.contains("action control state unreadable") || defect.contains("no such column"),
+        "failure should name the unreadable durable control state, got {defect:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cancelling_an_unknown_stacked_action_id_does_not_poison_a_later_run() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &cancel_tx,
+        "git.cancelStackedAction",
+        json!({ "actionId": "reuse-me" }),
+    )
+    .await;
+    let cancel_exit = drain(&mut cancel_rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("cancel request exits");
+    assert_eq!(cancel_exit["exit"]["_tag"], "Success", "{cancel_exit}");
+    assert_eq!(
+        cancel_exit["exit"]["value"]["canceled"],
+        json!(false),
+        "an unknown action id must not be reported as stopped: {cancel_exit}"
+    );
+
+    let (run_tx, mut run_rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &run_tx,
+        "git.runStackedAction",
+        json!({
+            "cwd": cwd,
+            "actionId": "reuse-me",
+            "action": "commit",
+            "commitMessage": "fresh action",
+        }),
+    )
+    .await;
+    let frames = drain(&mut run_rx);
+    assert!(
+        !frames.iter().any(|f| {
+            f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_cancelled"
+        }),
+        "stale cancel row poisoned the later action: {frames:?}"
+    );
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("run exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "the later action should run normally with the reused id: {frames:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
