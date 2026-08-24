@@ -5664,13 +5664,12 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
 
     // OUT OF BAND: a real `sed -i`, not a runtime write. Nothing told the
     // backend this happened.
-    let out = std::process::Command::new("sed")
-        .args(["-i", "", "s/before/after/"])
-        .arg(&file)
+    let out = std::process::Command::new("sh")
+        .args(["-c", "sed 's/before/after/' oob.txt > oob.txt.tmp && mv oob.txt.tmp oob.txt"])
         .current_dir(&state.cwd)
         .output()
-        .expect("sed");
-    assert!(out.status.success(), "sed failed: {out:?}");
+        .expect("out-of-band edit");
+    assert!(out.status.success(), "out-of-band edit failed: {out:?}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
 
     // It is in the summary, because cairn diffs the WORKTREE and not a
