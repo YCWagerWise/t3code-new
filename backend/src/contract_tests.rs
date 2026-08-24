@@ -923,7 +923,7 @@ async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty
             "{method} names the missing owner fields: {why}"
         );
         assert!(
-            state.terminals.get(&empty_owner, "term-missing").await.is_none(),
+            state.terminals.get(&empty_owner, "term-missing").await.unwrap().is_none(),
             "{method} created or mutated a pane under the shared thread: scope"
         );
     }
@@ -943,7 +943,7 @@ async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty
         });
         assert_eq!(exit["exit"]["_tag"], "Failure", "{method}: {exit}");
         assert!(
-            state.terminals.get(&empty_owner, "term-blank").await.is_none(),
+            state.terminals.get(&empty_owner, "term-blank").await.unwrap().is_none(),
             "{method} treated a blank threadId as thread:"
         );
     }
@@ -1086,7 +1086,14 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
 
     // Closing it must publish its removal — and, crucially, must not end the
     // subscription: the agent pane is still listed afterwards.
-    assert!(state.terminals.close(&terminal::TerminalOwner::thread("t-meta"), "pane-late").await, "own-PTY pane closes");
+    assert!(
+        state
+            .terminals
+            .close(&terminal::TerminalOwner::thread("t-meta"), "pane-late")
+            .await
+            .expect("pane store readable"),
+        "own-PTY pane closes"
+    );
     assert!(
         until(&mut rx, |rows| !has(rows, "pane-late")
             && has(rows, terminal::AGENT_TERMINAL_ID))
@@ -2299,6 +2306,79 @@ async fn stop_command_fails_when_hearth_foreground_interrupt_fails() {
     );
 }
 
+#[tokio::test]
+async fn stop_command_fails_when_runtime_cancel_state_is_unreadable() {
+    use agent_sdk_do::ObjectDb;
+    let (state, _d) = test_state().await;
+    // Keep the Hearth half healthy so this specifically proves SDK/runtime
+    // cancellation failure is not hidden behind a successful terminal interrupt.
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+
+    state
+        .rt
+        .store()
+        .db()
+        .execute("DROP TABLE thread_session", vec![])
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.interrupt",
+            "threadId": "t-stop-broken-runtime",
+        }}),
+    )
+    .await;
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
+    assert_eq!(exits.len(), 1, "one terminal frame for failed stop: {exits:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "runtime cancel failure must not be acked as Success: {exits:?}"
+    );
+    assert!(
+        exits[0].to_string().contains("runtime cancel failed"),
+        "failure must name runtime cancellation: {exits:?}"
+    );
+}
+
+#[tokio::test]
+async fn stop_command_fails_when_terminal_interrupt_fails() {
+    let (state, _d) = test_state().await;
+    // No shell has been spawned yet, so Hearth reports "no live shell".
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.interrupt",
+            "threadId": "t-stop-no-shell",
+        }}),
+    )
+    .await;
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
+    assert_eq!(exits.len(), 1, "one terminal frame for failed stop: {exits:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "terminal interrupt failure must not be acked as Success: {exits:?}"
+    );
+    assert!(
+        exits[0].to_string().contains("terminal interrupt failed"),
+        "failure must name Hearth/terminal interrupt: {exits:?}"
+    );
+}
+
 /// #68: a settings/provider write must reach the UI's shared config
 /// projection, which only advances when `subscribeServerConfig` emits.
 /// Returning the new value from the command is not enough — every passive
@@ -3237,6 +3317,67 @@ async fn an_edit_made_outside_the_backend_reaches_a_vcs_subscriber() {
     assert!(saw, "an out-of-band branch switch reached the subscriber through the watch");
 }
 
+/// #51: the subscription snapshot and the durable watch baseline are one read.
+///
+/// If the snapshot is read clean, then the worktree changes before
+/// `watch_begin`, registering a freshly re-read dirty fingerprint suppresses
+/// the dirty status as "already seen" even though the subscriber never saw it.
+/// This drives that exact window without sleeping: take the clean snapshot
+/// baseline, mutate the repo, then register/start the watch from that baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vcs_snapshot_baseline_survives_a_mutation_before_watch_registration() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let sh = |c: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c").arg(c).current_dir(&dir).output().expect("sh");
+        assert!(out.status.success(), "`{c}`: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    sh("git config user.email t@t && git config user.name t");
+    std::fs::write(dir.join(".gitignore"), "data/\n").unwrap();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    sh("git add -A && git commit -qm base");
+
+    let tail = state.rt.vcs_tail_skip_retained(&cwd).await.expect("vcs tail");
+    let (snapshot, baseline) = vcs::status_snapshot_and_fingerprint(&cwd).await;
+    assert_eq!(snapshot["_tag"], "snapshot", "{snapshot}");
+    assert_eq!(
+        snapshot["local"]["hasWorkingTreeChanges"], false,
+        "the subscriber snapshot is clean before the interleaving: {snapshot}"
+    );
+
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+    state.rt.watch_begin("vcs", &cwd, &baseline).await.expect("watch begin");
+    let (watched, registered) = state
+        .rt
+        .watch_marks("vcs")
+        .await
+        .expect("the watch registry is readable")
+        .into_iter()
+        .next()
+        .expect("the subscriber registered a watch");
+    assert_eq!(registered, baseline, "watch_begin uses the snapshot's baseline");
+
+    let (ready_tx, ready) = tokio::sync::oneshot::channel();
+    let watcher =
+        tokio::spawn(watch_one_tree(state.clone(), watched, registered, Some(ready_tx)));
+    ready.await.expect("the watch is placed");
+
+    let items = tail.next(std::time::Duration::from_secs(20)).await.expect("vcs tail read");
+    tail.close().await;
+    watcher.abort();
+    let local = items
+        .into_iter()
+        .map(|(_, item)| item)
+        .find(|item| item["_tag"] == "localUpdated")
+        .expect("the dirty status must publish immediately from the clean baseline");
+    assert_eq!(
+        local["local"]["hasWorkingTreeChanges"], true,
+        "the mutation between snapshot and registration must not be suppressed: {local}"
+    );
+}
+
 /// A bare context: these tools do not read anything off it.
 struct ToolCtx;
 impl agent_sdk_core::Ctx for ToolCtx {}
@@ -4087,16 +4228,26 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
         session_id: SAME.to_string(),
         worktree_path: None,
     };
-    let a = state.terminals.get(&thread_owner, "pane-1").await.expect("thread pane");
-    let b = state.terminals.get(&child_owner, "pane-1").await.expect("child pane");
+    let a = state
+        .terminals
+        .get(&thread_owner, "pane-1")
+        .await
+        .expect("pane store readable")
+        .expect("thread pane");
+    let b = state
+        .terminals
+        .get(&child_owner, "pane-1")
+        .await
+        .expect("pane store readable")
+        .expect("child pane");
     assert!(
         !std::sync::Arc::ptr_eq(&a.runner, &b.runner),
         "the child session joined the thread's shell instead of getting its own"
     );
 
     // They list independently: a thread's drawer must not show a child's PTYs.
-    assert_eq!(state.terminals.list(&thread_owner).await.len(), 1);
-    assert_eq!(state.terminals.list(&child_owner).await.len(), 1);
+    assert_eq!(state.terminals.list(&thread_owner).await.expect("pane store readable").len(), 1);
+    assert_eq!(state.terminals.list(&child_owner).await.expect("pane store readable").len(), 1);
 
     // And closing the CHILD leaves the thread's pane alone.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4105,11 +4256,21 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
     })).await;
     let _ = drain(&mut rx);
     assert!(
-        state.terminals.get(&child_owner, "pane-1").await.is_none(),
+        state
+            .terminals
+            .get(&child_owner, "pane-1")
+            .await
+            .expect("pane store readable")
+            .is_none(),
         "the child pane did not close"
     );
     assert!(
-        state.terminals.get(&thread_owner, "pane-1").await.is_some(),
+        state
+            .terminals
+            .get(&thread_owner, "pane-1")
+            .await
+            .expect("pane store readable")
+            .is_some(),
         "closing the child session's PTY tore down the THREAD's pane — the two \
          lifecycles are still fused"
     );
@@ -4138,7 +4299,12 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "the pane reports where it really is"
     );
 
-    let pane_a = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.expect("registered");
+    let pane_a = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+        .await
+        .expect("pane store readable")
+        .expect("registered");
     let where_a = pane_a.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
     assert!(where_a.output.contains("sub"), "the shell started in the requested cwd: {where_a:?}");
     assert!(where_a.output.contains("[a]"), "the launch env reached the shell: {where_a:?}");
@@ -4150,7 +4316,12 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "env": { "PANE": "b" },
     })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let pane_b = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.expect("registered");
+    let pane_b = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-b")
+        .await
+        .expect("pane store readable")
+        .expect("registered");
     let where_b = pane_b.runner.run("echo [$PANE]", false, Some(10), false).await;
     assert!(where_b.output.contains("[b]"), "pane B has its OWN env: {where_b:?}");
     let recheck_a = pane_a.runner.run("echo [$PANE]", false, Some(10), false).await;
@@ -4181,7 +4352,12 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         "env": { "PANE": "restarted" },
     })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    let after = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.unwrap();
+    let after = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+        .await
+        .expect("pane store readable")
+        .expect("pane A remains registered");
     let env_after = after.runner.run("echo [$PANE][$LEAKED]", false, Some(10), false).await;
     assert!(
         env_after.output.contains("[restarted][]"),
@@ -4216,8 +4392,24 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "terminal.close", json!({ "threadId": "t-1", "terminalId": "pane-a" })).await;
     assert_eq!(drain(&mut rx)[0]["exit"]["_tag"], "Success");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-a").await.is_none(), "pane A is gone");
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-b").await.is_some(), "pane B is untouched");
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "pane-a")
+            .await
+            .expect("pane store readable")
+            .is_none(),
+        "pane A is gone"
+    );
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "pane-b")
+            .await
+            .expect("pane store readable")
+            .is_some(),
+        "pane B is untouched"
+    );
     // The process is really gone, checked ONCE, immediately.
     //
     // This used to poll for a second and it was hiding a real defect: `close`
@@ -4733,7 +4925,12 @@ async fn terminal_metadata_updates_report_the_real_panes() {
     assert!(ids.contains(&"pane-x".to_string()), "the snapshot lists the real pane: {ids:?}");
 
     // move the pane's lifecycle — the live path must speak about pane-x
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "pane-x").await.unwrap();
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), "pane-x")
+        .await
+        .expect("pane store readable")
+        .expect("pane exists");
     pane.runner.run("echo moving", false, Some(10), false).await;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4883,7 +5080,15 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
     })).await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["exit"]["_tag"], "Failure", "a PTY obeys the same boundary: {:?}", f[0]);
-    assert!(state.terminals.get(&terminal::TerminalOwner::thread("t-1"), "escape").await.is_none(), "no pane was registered");
+    assert!(
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-1"), "escape")
+            .await
+            .expect("pane store readable")
+            .is_none(),
+        "no pane was registered"
+    );
 
     // …nor attached to one
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4947,7 +5152,12 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
         json!({ "threadId": "t-1", "terminalId": terminal_id })).await;
     let f = drain(&mut rx);
     assert_eq!(f[0]["values"][0]["type"], "snapshot", "attach opened: {f:?}");
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-1"), terminal_id).await.expect("registered");
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-1"), terminal_id)
+        .await
+        .expect("pane store readable")
+        .expect("registered");
     assert!(pane.shared, "it is the AGENT's shell, not a fresh pane");
 
     // a non-shell tool advertises no terminal rather than a misleading one
@@ -4995,7 +5205,12 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
     let f = drain(&mut rx);
     assert_eq!(f[0]["values"][0]["pending"], json!(true), "no pane exists yet: {f:?}");
     assert!(
-        state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.is_none(),
+        state
+            .terminals
+            .get(&terminal::TerminalOwner::thread("t-9"), "pane-x")
+            .await
+            .expect("pane store readable")
+            .is_none(),
         "the subscription created a pane and pinned its identity"
     );
 
@@ -5007,7 +5222,12 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
     })).await;
     assert_eq!(drain(&mut rx2)[0]["exit"]["_tag"], "Success");
 
-    let pane = state.terminals.get(&terminal::TerminalOwner::thread("t-9"), "pane-x").await.expect("opened");
+    let pane = state
+        .terminals
+        .get(&terminal::TerminalOwner::thread("t-9"), "pane-x")
+        .await
+        .expect("pane store readable")
+        .expect("opened");
     let where_x = pane.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
     assert!(where_x.output.contains("wt"), "the pane landed in the requested worktree: {where_x:?}");
     assert!(where_x.output.contains("[x]"), "the requested env reached the shell: {where_x:?}");
@@ -6097,7 +6317,7 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
             .expect("checkpoint at the turn boundary");
     }
 
-    // OUT OF BAND: a real `sed -i`, not a runtime write. Nothing told the
+    // OUT OF BAND: a real process edit, not a runtime write. Nothing told the
     // backend this happened.
     let out = std::process::Command::new("sh")
         .args(["-c", "sed 's/before/after/' oob.txt > oob.txt.tmp && mv oob.txt.tmp oob.txt"])
@@ -6790,6 +7010,8 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert!(running, "the turn must be running before the interrupt is meaningful");
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
 
     // THE WIRE FRAME. Same shape the Effect RPC client sends on stop.
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -7062,6 +7284,8 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert!(running, "the turn must be running before the interrupt is meaningful");
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
 
     // THE MISROUTED FRAME: well-formed, known tag, but a thread that is not
     // the one running.
@@ -7106,6 +7330,8 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
         "id": "t-int", "projectId": "p-workspace", "title": "int",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })).await.unwrap();
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     // Effect RPC embeds the original payload alongside the request id;
@@ -7150,40 +7376,19 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
 /// SDK cancel cannot be written, the frame must produce a visible failure
 /// instead of dropping the error while the UI already believes stop landed.
 #[tokio::test]
-async fn ws_interrupt_frame_reports_runtime_interrupt_failure() {
+async fn ws_interrupt_frame_reports_runtime_cancel_failure() {
+    use agent_sdk_do::ObjectDb;
     use super::dispatch_ws_frame;
-    let (state, dir) = test_state().await;
-
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-int-fail", "projectId": "p-workspace", "title": "int-fail",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-
-    let binding = SessionBinding {
-        thread_id: "t-int-fail".into(),
-        provider_instance_id: "claude_resume:test".into(),
-        model_key: "k".into(),
-    };
-    let def = AgentDefinition {
-        name: "t3code".into(),
-        instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
-        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
-    };
-    state.rt.session_for(&binding, def).await.unwrap();
-    let sid = state
+    let (state, _d) = test_state().await;
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    state
         .rt
-        .sessions_for_thread("t-int-fail")
+        .store()
+        .db()
+        .execute("DROP TABLE thread_session", vec![])
         .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .expect("the interrupt has a bound SDK session to cancel");
-
-    let pool = do_storage::DbPool::new(dir.join("data"));
-    let db = pool.object_db("ShellSession", &sid).await.unwrap();
-    db.execute("DROP TABLE agent_control", vec![]).await.unwrap();
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     dispatch_ws_frame(
@@ -7197,18 +7402,16 @@ async fn ws_interrupt_frame_reports_runtime_interrupt_failure() {
     )
     .await;
 
-    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
-        .map(|(s, _)| serde_json::from_str(&s).unwrap())
-        .collect();
-    let failure = frames
-        .iter()
-        .find(|f| f["_tag"] == "Exit" && f["requestId"] == json!("r-int-fail"))
-        .unwrap_or_else(|| panic!("raw Interrupt must answer failure on stop error: {frames:?}"));
-    assert_eq!(failure["exit"]["_tag"], "Failure", "{failure}");
-    let defect = failure["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    let frames = drain(&mut rx);
+    let exits: Vec<&Value> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "raw Interrupt failure must be visible once: {frames:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "raw Interrupt runtime failure must not be silent: {frames:?}"
+    );
     assert!(
-        defect.contains("interrupt failed") && defect.contains("agent_control"),
-        "failure must name the durable cancel failure, got {failure}"
+        exits[0].to_string().contains("runtime cancel failed"),
+        "failure must name runtime cancellation: {frames:?}"
     );
 }
 

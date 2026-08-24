@@ -318,18 +318,28 @@ pub async fn status(cwd: &str) -> Value {
 
 /// `subscribeVcsStatus` — the initial snapshot frame.
 pub async fn status_snapshot(cwd: &str) -> Value {
+    status_snapshot_and_fingerprint(cwd).await.0
+}
+
+/// `subscribeVcsStatus` — the initial snapshot frame and the exact baseline it
+/// carries. These must come from one status read: reading the snapshot, then
+/// re-reading for the watch cursor lets a filesystem change land between them
+/// and be suppressed as already seen.
+pub async fn status_snapshot_and_fingerprint(cwd: &str) -> (Value, String) {
     let Some(repo) = repo(cwd).await else {
-        return json!({"_tag": "snapshot", "local": not_a_repo(), "remote": null});
+        let snapshot = json!({"_tag": "snapshot", "local": not_a_repo(), "remote": null});
+        return (snapshot.clone(), snapshot["local"].to_string());
     };
     let s = match repo.status().await {
         Ok(s) => s,
         Err(e) => {
-            return json!({
+            let snapshot = json!({
                 "_tag": "snapshot", "local": status_unavailable(&e.to_string()), "remote": null
-            })
+            });
+            return (snapshot.clone(), snapshot["local"].to_string());
         }
     };
-    status_snapshot_from(&s)
+    (status_snapshot_from(&s), s.fingerprint())
 }
 
 /// `vcs.listRefs`.
@@ -340,22 +350,52 @@ pub async fn list_refs(cwd: &str, input: &Value) -> Value {
     };
     let query = input.get("query").and_then(Value::as_str);
     let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-    let refs = repo.list_refs(query, Some(limit)).await.unwrap_or_default();
+    let refs = repo
+        .list_refs(query, Some(limit))
+        .await
+        .map_err(|e| format!("ref list unavailable: {e}"));
     let default = repo.default_branch().await;
     let has_remote = repo.remote().await.is_some();
+    let worktrees = repo
+        .worktrees()
+        .await
+        .map_err(|e| format!("worktree ownership unavailable: {e}"));
+    list_refs_payload(refs, worktrees, default, has_remote)
+}
+
+fn refs_unavailable(why: String) -> Value {
+    json!({
+        "refs": [],
+        "isRepo": true,
+        "hasPrimaryRemote": false,
+        "nextCursor": null,
+        "totalCount": 0,
+        "statusUnavailable": true,
+        "statusError": why,
+    })
+}
+
+fn list_refs_payload(
+    refs: Result<Vec<cairn::Ref>, String>,
+    worktrees: Result<Vec<cairn::Worktree>, String>,
+    default: Option<String>,
+    has_remote: bool,
+) -> Value {
+    let refs = match refs {
+        Ok(refs) => refs,
+        Err(e) => return refs_unavailable(e),
+    };
+    let worktrees = match worktrees {
+        Ok(worktrees) => worktrees,
+        Err(e) => return refs_unavailable(e),
+    };
     let total = refs.len() as i64;
     // Which branch is checked out in which linked worktree. The backend owns
     // this truth: without it the UI cannot disable unsafe operations on a ref
     // another worktree already holds, and cannot route a click to the pane that
-    // owns it. A worktree listing failure leaves the map empty — the refs still
-    // answer, they just carry no ownership, which is the pre-existing behaviour.
-    let owners: HashMap<String, String> = repo
-        .worktrees()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|w| (w.branch, w.path))
-        .collect();
+    // owns it.
+    let owners: HashMap<String, String> =
+        worktrees.into_iter().map(|w| (w.branch, w.path)).collect();
     json!({
         "refs": refs.iter().map(|r| json!({
             "name": r.name,
@@ -1233,6 +1273,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #60: a cairn ref enumeration failure is not a valid empty refs list.
+    #[test]
+    fn list_refs_surfaces_ref_list_failure_instead_of_empty_success() {
+        let out = list_refs_payload(
+            Err("ref list unavailable: git for-each-ref exploded".into()),
+            Ok(Vec::new()),
+            None,
+            true,
+        );
+        assert_eq!(out["isRepo"], json!(true), "the repo was detected: {out}");
+        assert_eq!(out["statusUnavailable"], json!(true), "the failure must be explicit: {out}");
+        assert!(
+            out["statusError"].as_str().unwrap_or("").contains("git for-each-ref exploded"),
+            "the cairn failure reason must survive: {out}"
+        );
+        assert!(
+            out["refs"].as_array().unwrap().is_empty(),
+            "empty refs are only acceptable with the unavailable marker: {out}"
+        );
+    }
+
+    /// #60: branch ownership is part of the refs contract. If git cannot list
+    /// worktrees, returning refs with every `worktreePath` cleared lies to the UI.
+    #[test]
+    fn list_refs_surfaces_worktree_ownership_failure_instead_of_clearing_paths() {
+        let out = list_refs_payload(
+            Ok(vec![cairn::Ref {
+                name: "feature-x".into(),
+                is_current: false,
+                commit: "abc123".into(),
+            }]),
+            Err("worktree ownership unavailable: git worktree list exploded".into()),
+            None,
+            true,
+        );
+        assert_eq!(out["isRepo"], json!(true), "the repo was detected: {out}");
+        assert_eq!(out["statusUnavailable"], json!(true), "the failure must be explicit: {out}");
+        assert!(
+            out["statusError"].as_str().unwrap_or("").contains("git worktree list exploded"),
+            "the worktree failure reason must survive: {out}"
+        );
+        assert!(
+            out["refs"].as_array().unwrap().is_empty(),
+            "refs without trustworthy ownership must not be emitted as safe refs: {out}"
+        );
+    }
+
     /// THE STACKED-ACTION RPC MUST BE ABLE TO FAIL.
     ///
     /// Every phase refusal emitted an `action_failed` FRAME and then returned
@@ -1769,7 +1856,12 @@ mod tests {
 
     /// Commit what is on disk, so a worktree can be branched off a real HEAD.
     async fn commit_all(dir: &std::path::Path, msg: &str) {
-        for args in [vec!["add", "-A"], vec!["commit", "-m", msg]] {
+        for args in [
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-m", msg],
+        ] {
             let out = std::process::Command::new("git")
                 .current_dir(dir)
                 .args(&args)

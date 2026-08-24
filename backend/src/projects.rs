@@ -33,7 +33,7 @@ async fn entries(root: &std::path::Path) -> Result<(Vec<(String, bool)>, bool), 
         let (files, truncated) = repo
             .list_files()
             .await
-            .map_err(|e| format!("cairn workspace listing unavailable: {e}"))?;
+            .map_err(|e| format!("project file list unavailable for {}: {e}", root.display()))?;
         let mut out: Vec<(String, bool)> = Vec::new();
         let mut dirs: std::collections::BTreeSet<String> = Default::default();
         for f in files.iter().take(MAX_ENTRIES) {
@@ -103,12 +103,19 @@ fn entry(path: &str, is_dir: bool) -> Value {
     json!({ "path": path, "kind": if is_dir { "directory" } else { "file" } })
 }
 
+fn unavailable(error: String) -> Value {
+    json!({ "entries": [], "truncated": false, "statusUnavailable": true, "statusError": error })
+}
+
 /// `projects.listEntries`.
-pub async fn list_entries(cwd: &str) -> Result<Value, String> {
-    let (found, truncated) = entries(std::path::Path::new(cwd)).await?;
+pub async fn list_entries(cwd: &str) -> Value {
+    let (found, truncated) = match entries(std::path::Path::new(cwd)).await {
+        Ok(v) => v,
+        Err(e) => return unavailable(e),
+    };
     let mut list: Vec<Value> = found.iter().map(|(p, d)| entry(p, *d)).collect();
     list.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-    Ok(json!({ "entries": list, "truncated": truncated }))
+    json!({ "entries": list, "truncated": truncated })
 }
 
 /// `projects.searchEntries` — the file picker's filter.
@@ -117,7 +124,7 @@ pub async fn list_entries(cwd: &str) -> Result<Value, String> {
 /// it and would otherwise look broken. Matching is a case-insensitive subsequence
 /// over the path, and a match earlier in the basename ranks higher, which is
 /// what makes typing `srvmn` find `src/server_main.rs`.
-pub async fn search_entries(cwd: &str, input: &Value) -> Result<Value, String> {
+pub async fn search_entries(cwd: &str, input: &Value) -> Value {
     let query = input.get("query").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
     let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
     let want_kind = input.get("kind").and_then(Value::as_str);
@@ -127,7 +134,10 @@ pub async fn search_entries(cwd: &str, input: &Value) -> Result<Value, String> {
     // an image (#93).
     let image_only = input.get("imageOnly").and_then(Value::as_bool).unwrap_or(false);
 
-    let (found, mut truncated) = entries(std::path::Path::new(cwd)).await?;
+    let (found, mut truncated) = match entries(std::path::Path::new(cwd)).await {
+        Ok(v) => v,
+        Err(e) => return unavailable(e),
+    };
     let mut scored: Vec<(i64, String, bool)> = Vec::new();
     for (path, is_dir) in found {
         if let Some(k) = want_kind {
@@ -155,10 +165,10 @@ pub async fn search_entries(cwd: &str, input: &Value) -> Result<Value, String> {
         truncated = true;
         scored.truncate(limit);
     }
-    Ok(json!({
+    json!({
         "entries": scored.iter().map(|(_, p, d)| entry(p, *d)).collect::<Vec<_>>(),
         "truncated": truncated,
-    }))
+    })
 }
 
 /// Subsequence match with a bonus for contiguous runs and for matching inside
@@ -277,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn listing_skips_the_noise_and_reports_kinds() {
         let dir = workspace().await;
-        let out = list_entries(dir.to_str().unwrap()).await.unwrap();
+        let out = list_entries(dir.to_str().unwrap()).await;
         let paths: Vec<&str> =
             out["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"README.md"), "{paths:?}");
@@ -297,37 +307,27 @@ mod tests {
         let dir = workspace().await;
         let cwd = dir.to_str().unwrap();
 
-        let browse = search_entries(cwd, &json!({"query": "", "limit": 50}))
-            .await
-            .unwrap();
+        let browse = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
         assert!(
             !browse["entries"].as_array().unwrap().is_empty(),
             "an empty query browses rather than returning nothing"
         );
 
-        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10}))
-            .await
-            .unwrap();
+        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10})).await;
         let paths: Vec<&str> =
             hit["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
         assert_eq!(paths.first(), Some(&"src/server_main.rs"), "fuzzy subsequence: {paths:?}");
 
-        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10}))
-            .await
-            .unwrap();
+        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10})).await;
         assert!(none["entries"].as_array().unwrap().is_empty());
 
         // limit truncates AND says so
-        let capped = search_entries(cwd, &json!({"query": "", "limit": 1}))
-            .await
-            .unwrap();
+        let capped = search_entries(cwd, &json!({"query": "", "limit": 1})).await;
         assert_eq!(capped["entries"].as_array().unwrap().len(), 1);
         assert_eq!(capped["truncated"], json!(true), "truncation is reported");
 
         // kind filter
-        let dirs = search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"}))
-            .await
-            .unwrap();
+        let dirs = search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"})).await;
         assert!(dirs["entries"]
             .as_array()
             .unwrap()
@@ -346,9 +346,7 @@ mod tests {
         std::fs::write(dir.join("assets/notes.txt"), "x").unwrap();
         let cwd = dir.to_str().unwrap();
 
-        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true}))
-            .await
-            .unwrap();
+        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true})).await;
         let paths: Vec<&str> =
             out["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
         assert!(paths.contains(&"assets/logo.PNG"), "case-insensitive extension: {paths:?}");
@@ -361,12 +359,40 @@ mod tests {
         }
 
         // without the flag the same search still returns everything
-        let all = search_entries(cwd, &json!({"query": "", "limit": 50}))
-            .await
-            .unwrap();
+        let all = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
         let all_paths: Vec<&str> =
             all["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
         assert!(all_paths.contains(&"README.md"), "{all_paths:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57: once cairn detects a repo, a failed repo listing is an unavailable
+    /// state, not permission to walk the filesystem with product-local ignore
+    /// rules.
+    #[tokio::test]
+    async fn a_repo_whose_file_listing_fails_is_not_downgraded_to_a_manual_walk() {
+        let dir = workspace().await;
+        cairn::init_repository(&dir).await.unwrap();
+        std::fs::write(dir.join("ignored-by-git.log"), "generated\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.join(".git/index"), "not a git index\n").unwrap();
+
+        let out = list_entries(dir.to_str().unwrap()).await;
+        assert_eq!(out["statusUnavailable"], json!(true), "repo list failure must be explicit: {out}");
+        assert!(
+            out["statusError"].as_str().unwrap_or("").contains("project file list unavailable"),
+            "the error explains that cairn could not list the repo: {out}"
+        );
+        assert!(
+            out["entries"].as_array().unwrap().is_empty(),
+            "manual walking would expose ignored/generated files after cairn failed: {out}"
+        );
+
+        let search = search_entries(dir.to_str().unwrap(), &json!({"query": "ignored", "limit": 10})).await;
+        assert_eq!(
+            search["statusUnavailable"], json!(true),
+            "search must not downgrade a repo-list failure to manual walk either: {search}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -426,47 +452,6 @@ mod tests {
         };
         let history = stack.list().await.unwrap();
         assert!(!history.is_empty(), "the UI save left a checkpoint behind");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #111: a git-backed workspace whose cairn/git listing fails must fail
-    /// closed. Falling back to the raw filesystem walk re-owns workspace truth
-    /// in product code and leaks ignored/generated paths as if cairn had
-    /// approved them.
-    #[tokio::test]
-    async fn git_backed_listing_failure_does_not_raw_walk() {
-        let dir = std::env::temp_dir().join(format!("t3-proj-bad-index-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("node_modules/junk")).unwrap();
-        std::fs::write(dir.join("node_modules/junk/generated.js"), "noise\n").unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        std::fs::remove_file(dir.join(".git/index")).ok();
-        std::fs::create_dir_all(dir.join(".git/index")).unwrap();
-
-        let err = list_entries(dir.to_str().unwrap())
-            .await
-            .expect_err("git-backed list failure must not raw-walk around cairn");
-        assert!(
-            err.contains("cairn workspace listing unavailable"),
-            "error names the failing substrate: {err}"
-        );
-        let err = search_entries(dir.to_str().unwrap(), &json!({"query": "generated", "limit": 50}))
-            .await
-            .expect_err("git-backed search failure must not raw-walk around cairn");
-        assert!(
-            err.contains("cairn workspace listing unavailable"),
-            "search error names the failing substrate: {err}"
-        );
-        let err = search_contents(dir.to_str().unwrap(), &json!({"query": "noise", "limit": 50}))
-            .await
-            .expect_err("content search must not raw-walk around cairn");
-        assert!(
-            err.contains("cairn workspace listing unavailable"),
-            "content search error names the failing substrate: {err}"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

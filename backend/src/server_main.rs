@@ -1263,10 +1263,11 @@ impl AppState {
     /// workspace terminal. Keying the lookup by owner is the difference between
     /// addressing a subagent's shell and addressing something that merely
     /// answers.
-    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> terminal::Terminal {
+    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> Result<terminal::Terminal, String> {
         match self.terminals.get(owner, terminal_id).await {
-            Some(pane) => pane.runner,
-            None => self.terminal.clone(),
+            Ok(Some(pane)) => Ok(pane.runner),
+            Ok(None) => Ok(self.terminal.clone()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -1293,11 +1294,21 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
     // Built ONCE for the thread rather than per subscriber: every watcher of a
     // thread receives the same rows, and each row costs a PTY session lock.
     let now = now_iso();
-    let mut rows = Vec::new();
-    for pane in state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
-        rows.push(terminal::pane_summary(&pane, &now).await);
-    }
-    let payload = json!({ "type": "snapshot", "terminals": rows });
+    let payload = match state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
+        Ok(panes) => {
+            let mut rows = Vec::new();
+            for pane in panes {
+                rows.push(terminal::pane_summary(&pane, &now).await);
+            }
+            json!({ "type": "snapshot", "terminals": rows })
+        }
+        Err(e) => json!({
+            "type": "snapshot",
+            "terminals": [],
+            "statusUnavailable": true,
+            "statusError": e,
+        }),
+    };
     let topic = terminal_meta_topic(&thread);
     if let Err(e) = state.rt.topic_publish(&topic, &payload).await {
         tracing::error!(%e, %thread, "terminal metadata publish failed");
@@ -2873,18 +2884,20 @@ async fn handle_request(
             Ok(cwd) => {
                 // snapshot first, then stay registered: every later mutation and
                 // every external git change publishes onto this stream (#117).
-                chunk(tx, &id, vcs::status_snapshot(&cwd).await);
+                let (snapshot, seen) = vcs::status_snapshot_and_fingerprint(&cwd).await;
+                chunk(tx, &id, snapshot);
                 // Register the DURABLE watch (#335). The fingerprint this
                 // client was just handed is the baseline its watch reconciles
-                // against, and it belongs below the product: `watch_begin` is
+                // against, and it comes from the SAME cairn status read as the
+                // snapshot. Re-reading after `chunk` creates a race where a
+                // filesystem edit lands between the two reads, is recorded as
+                // already seen, and is then suppressed by the cairn watcher.
+                //
+                // The mark belongs below the product: `watch_begin` is
                 // first-writer-wins, so a second subscriber arriving later
                 // cannot drag the mark past a change the first has not been
                 // told about. A failed registration is reported — a socket
                 // that silently never watches is worse than one that errors.
-                let seen = match vcs::status_fingerprint(&cwd).await {
-                    Some(seen) => seen,
-                    None => vcs::status(&cwd).await.to_string(),
-                };
                 if let Err(e) = state.rt.watch_begin("vcs", &cwd, &seen).await {
                     exit_failure(tx, &id, &format!("subscribeVcsStatus: {e}"));
                     return;
@@ -3164,14 +3177,14 @@ async fn handle_request(
                 Err(e) => { exit_failure(tx, &id, &e); return; }
             };
             match method {
-                "projects.listEntries" => match projects::list_entries(&cwd).await {
-                    Ok(v) => exit_success(tx, &id, v),
-                    Err(e) => exit_failure(tx, &id, &e),
-                },
-                "projects.searchEntries" => match projects::search_entries(&cwd, &payload).await {
-                    Ok(v) => exit_success(tx, &id, v),
-                    Err(e) => exit_failure(tx, &id, &e),
-                },
+                // These two carry their failure IN the payload
+                // (`statusUnavailable` / `statusError`) rather than failing the
+                // request: the file panel can then say it is unavailable instead
+                // of rendering an empty tree that looks like an empty repo.
+                "projects.listEntries" => exit_success(tx, &id, projects::list_entries(&cwd).await),
+                "projects.searchEntries" => {
+                    exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
+                }
                 "projects.searchContents" => match projects::search_contents(&cwd, &payload).await {
                     Ok(v) => exit_success(tx, &id, v),
                     Err(e) => exit_failure(tx, &id, &e),
@@ -3256,7 +3269,7 @@ async fn handle_request(
                 // saw a new snapshot could not tell a restart from a repaint.
                 broadcast_terminal_event(
                     &state,
-                    json!({ "type": "restarted", "threadId": thread, "terminalId": term, "snapshot": snap }),
+                    json!({ "type": "restarted", "threadId": owner.thread_id(), "terminalId": term, "snapshot": snap }),
                 )
                 .await;
             }
@@ -3271,7 +3284,10 @@ async fn handle_request(
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
             };
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(runner) => runner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
+            };
             if let Some(data) = payload.get("data").and_then(Value::as_str) {
                 terminal::write(&runner, data).await;
             }
@@ -3286,7 +3302,10 @@ async fn handle_request(
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
             };
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(runner) => runner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
+            };
             if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
                 terminal::resize(&runner, rows as u16, cols as u16).await;
             }
@@ -3304,12 +3323,14 @@ async fn handle_request(
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
             };
-            let thread = owner.thread_id().unwrap_or("").to_string();
-            let runner = state.pane_runner(&owner, &term).await;
+            let runner = match state.pane_runner(&owner, &term).await {
+                Ok(runner) => runner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
+            };
             terminal::clear(&runner).await;
             broadcast_terminal_event(
                 &state,
-                json!({ "type": "output", "threadId": thread, "terminalId": term,
+                json!({ "type": "output", "threadId": owner.thread_id(), "terminalId": term,
                         "data": terminal::repaint("") }),
             )
             .await;
@@ -3324,11 +3345,13 @@ async fn handle_request(
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
             };
-            let thread = owner.thread_id().unwrap_or("").to_string();
-            let killed = state.terminals.close(&owner, &term).await;
+            let killed = match state.terminals.close(&owner, &term).await {
+                Ok(killed) => killed,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
+            };
             broadcast_terminal_event(
                 &state,
-                json!({ "type": "closed", "threadId": thread, "terminalId": term, "killedShell": killed }),
+                json!({ "type": "closed", "threadId": owner.thread_id(), "terminalId": term, "killedShell": killed }),
             )
             .await;
             exit_success(tx, &id, Value::Null);
@@ -3401,34 +3424,57 @@ async fn handle_request(
                 Err(e) => tracing::error!(%e, "terminal events tail attach failed"),
             }
             match state.terminals.get(&owner, &term).await {
-                Some(pane) => {
+                Ok(Some(pane)) => {
                     let started = terminal::pane_snapshot(&pane, &now_iso()).await;
-                    chunk(tx, &id, json!({ "type": "started", "threadId": thread, "terminalId": term, "snapshot": started }));
+                    chunk(tx, &id, json!({ "type": "started", "threadId": owner.thread_id(), "terminalId": term, "snapshot": started }));
                     spawn_terminal_tail(pane.runner.clone(), tx.clone(), id.clone(), thread, term);
                 }
-                None => {
+                Ok(None) => {
                     // Announce the subscription with no snapshot, then WAIT for
                     // the real open rather than manufacturing one.
                     chunk(tx, &id, json!({
-                        "type": "started", "threadId": thread, "terminalId": term,
+                        "type": "started", "threadId": owner.thread_id(), "terminalId": term,
                         "snapshot": Value::Null, "pending": true,
                     }));
                     let terminals = state.terminals.clone();
                     let (tx2, id2) = (tx.clone(), id.clone());
                     let (owner2, thread2, term2) = (owner.clone(), thread.clone(), term.clone());
                     tokio::spawn(async move {
-                        if let Some(pane) = terminals
+                        match terminals
                             .wait_for(&owner2, &term2, std::time::Duration::from_secs(300))
                             .await
                         {
-                            let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
-                            chunk(&tx2, &id2, json!({
-                                "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
-                                "snapshot": snap,
-                            }));
-                            spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
+                            Ok(Some(pane)) => {
+                                let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
+                                chunk(&tx2, &id2, json!({
+                                    "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
+                                    "snapshot": snap,
+                                }));
+                                spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                chunk(&tx2, &id2, json!({
+                                    "type": "started",
+                                    "threadId": thread2,
+                                    "terminalId": term2,
+                                    "snapshot": Value::Null,
+                                    "terminalUnavailable": true,
+                                    "terminalError": e,
+                                }));
+                            }
                         }
                     });
+                }
+                Err(e) => {
+                    chunk(tx, &id, json!({
+                        "type": "started",
+                        "threadId": owner.thread_id(),
+                        "terminalId": term,
+                        "snapshot": Value::Null,
+                        "terminalUnavailable": true,
+                        "terminalError": e,
+                    }));
                 }
             }
         }
@@ -3447,13 +3493,33 @@ async fn handle_request(
             // owner and are deliberately not folded in here (#149) — doing so
             // would put them in the parent's drawer, which is the ownership
             // boundary the finding is about.
-            let _ = state.terminals.open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[]).await;
-            let now = now_iso();
-            let mut rows = Vec::new();
-            for pane in state.terminals.list(&thread_owner).await {
-                rows.push(terminal::pane_summary(&pane, &now).await);
+            let thread_owner = terminal::TerminalOwner::thread(&thread);
+            if let Err(e) = state
+                .terminals
+                .open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[])
+                .await
+            {
+                return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}"));
             }
-            chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
+            let now = now_iso();
+            match state.terminals.list(&thread_owner).await {
+                Ok(panes) => {
+                    let mut rows = Vec::new();
+                    for pane in panes {
+                        rows.push(terminal::pane_summary(&pane, &now).await);
+                    }
+                    chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
+                }
+                Err(e) => {
+                    chunk(tx, &id, json!({
+                        "type": "snapshot",
+                        "terminals": [],
+                        "statusUnavailable": true,
+                        "statusError": e,
+                    }));
+                    return;
+                }
+            }
             // Metadata fanout on the SDK's generic named-topic seam, scoped
             // per thread so a subscriber only wakes for its own panes.
             // Suppress the retained frame (the snapshot above already covered
@@ -4238,7 +4304,19 @@ fn spawn_metadata_tail(
             // Holding `panes` for the length of the iteration also keeps each
             // runner alive across the wait, so a watch cannot end underneath us
             // and turn one closed pane into a terminated stream.
-            let panes = terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await;
+            let panes = match terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await {
+                Ok(panes) => panes,
+                Err(e) => {
+                    let ev = json!({
+                        "type": "snapshot",
+                        "terminals": [],
+                        "statusUnavailable": true,
+                        "statusError": e,
+                    });
+                    let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None));
+                    return;
+                }
+            };
             let mut watches: Vec<hearth::ScreenWatch> =
                 panes.iter().map(|p| terminal::watch(&p.runner)).collect();
 

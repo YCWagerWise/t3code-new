@@ -1,4 +1,3 @@
-
 //! PROOF (#328): `server.getUsageSummary` reports REAL transcript usage in the
 //! wire shape, and reports honestly when it cannot.
 //!
@@ -8,7 +7,7 @@
 //! assertion below is about the CONTENT of the payload.
 
 use super::diagnostics;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn seed_claude(home: &std::path::Path, ts: &str, out: i64) {
     let file = home.join("projects/p/session.jsonl");
@@ -49,7 +48,11 @@ fn the_usage_rpc_reports_tokens_it_actually_read() {
 
     assert_eq!(out["contractVersion"], 4);
     let buckets = out["buckets"].as_array().expect("buckets is an array");
-    assert_eq!(buckets.len(), 1, "a seeded transcript must produce a bucket: {out}");
+    assert_eq!(
+        buckets.len(),
+        1,
+        "a seeded transcript must produce a bucket: {out}"
+    );
     assert_eq!(buckets[0]["day"], "2026-03-04");
     assert_eq!(buckets[0]["provider"], "claude");
     assert_eq!(buckets[0]["model"], "claude-opus-5");
@@ -58,16 +61,25 @@ fn the_usage_rpc_reports_tokens_it_actually_read() {
     assert_eq!(buckets[0]["records"], 1);
     // Daily requests must OMIT hourStart — the contract types it as a
     // trimmed non-empty string, so a null would fail to decode.
-    assert!(buckets[0].get("hourStart").is_none(), "no hourStart on a daily bucket");
+    assert!(
+        buckets[0].get("hourStart").is_none(),
+        "no hourStart on a daily bucket"
+    );
 
     let sources_wire = out["sources"].as_array().expect("sources is an array");
-    assert_eq!(sources_wire.len(), 1, "the source it read is reported: {out}");
+    assert_eq!(
+        sources_wire.len(),
+        1,
+        "the source it read is reported: {out}"
+    );
     assert_eq!(sources_wire[0]["status"], "ok");
     assert_eq!(sources_wire[0]["scannedFiles"], 1);
     assert_eq!(sources_wire[0]["distinctSessions"], 1);
     assert_eq!(sources_wire[0]["fingerprint"]["provider"], "claude");
     assert!(
-        sources_wire[0]["fingerprint"]["hostId"].as_str().is_some_and(|h| !h.is_empty()),
+        sources_wire[0]["fingerprint"]["hostId"]
+            .as_str()
+            .is_some_and(|h| !h.is_empty()),
         "the fingerprint names this host, or two servers on one home double count"
     );
 
@@ -106,10 +118,16 @@ fn an_unused_provider_is_reported_missing_rather_than_omitted() {
 
     let rows = out["sources"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "every source gets a row: {out}");
-    let codex = rows.iter().find(|r| r["fingerprint"]["provider"] == "codex").unwrap();
+    let codex = rows
+        .iter()
+        .find(|r| r["fingerprint"]["provider"] == "codex")
+        .unwrap();
     assert_eq!(codex["status"], "missing");
     assert_eq!(codex["scannedFiles"], 0);
-    assert!(codex["message"].is_string(), "and says which path was absent");
+    assert!(
+        codex["message"].is_string(),
+        "and says which path was absent"
+    );
     // The other provider's usage is unaffected.
     assert_eq!(out["buckets"].as_array().unwrap().len(), 1);
 }
@@ -135,7 +153,10 @@ fn an_empty_window_still_reports_the_source_it_scanned() {
     )
     .expect("an empty window is a summary, not an error");
 
-    assert!(out["buckets"].as_array().unwrap().is_empty(), "nothing in that window");
+    assert!(
+        out["buckets"].as_array().unwrap().is_empty(),
+        "nothing in that window"
+    );
     let rows = out["sources"].as_array().unwrap();
     assert_eq!(rows[0]["status"], "ok", "the file was still read");
     assert_eq!(rows[0]["scannedFiles"], 1);
