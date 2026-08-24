@@ -291,18 +291,18 @@ async fn turns_before_and_after_a_restart_are_one_conversation() {
             .run_turn_with_prompt_id(&b, definition(), "first", Some("umsg-first"), &projector(&rt))
             .await;
         assert_eq!(out, TurnOutcome::Completed, "the pre-restart turn completed");
-        rt.cursor(&b).await
+        rt.cursor(&b).await.unwrap()
     };
     assert!(cursor_before >= 0, "the first turn advanced the durable cursor");
 
     let rt = boot(&data).await;
-    assert_eq!(rt.cursor(&b).await, cursor_before, "the cursor came back with the process");
+    assert_eq!(rt.cursor(&b).await.unwrap(), cursor_before, "the cursor came back with the process");
 
     let out = rt
         .run_turn_with_prompt_id(&b, definition(), "second", Some("umsg-second"), &projector(&rt))
         .await;
     assert_eq!(out, TurnOutcome::Completed, "the post-restart turn completed");
-    assert!(rt.cursor(&b).await > cursor_before, "and moved the cursor further");
+    assert!(rt.cursor(&b).await.unwrap() > cursor_before, "and moved the cursor further");
 
     let msgs = rt.messages("thread-1").await;
     let assistants = msgs.iter().filter(|m| m["role"] == "assistant").count();
@@ -377,7 +377,7 @@ async fn a_turn_left_in_flight_by_a_crash_blocks_a_concurrent_redispatch() {
     // the process is gone; the durable claim is not.
     let rt = boot(&data).await;
     assert_eq!(
-        rt.claimed_turn("thread-1").await.as_deref(),
+        rt.claimed_turn("thread-1").await.unwrap().as_deref(),
         Some("turn-crashed"),
         "the durable claim survived the restart"
     );

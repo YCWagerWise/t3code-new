@@ -90,7 +90,11 @@ pub(super) fn tool_result_summary(output: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if line.is_empty() {
         "finished".to_string()
     } else {
@@ -192,21 +196,40 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
         let (thread_id, items): (String, Vec<(&str, Value)>) = match event {
             Lifecycle::TurnStarted { thread_id, turn_id } => (
                 thread_id.clone(),
-                vec![("thread.session-set", json!({ "threadId": thread_id, "session": {
+                vec![(
+                    "thread.session-set",
+                    json!({ "threadId": thread_id, "session": {
                     "threadId": thread_id, "status": "running", "providerName": null,
-                    "activeTurnId": turn_id, "lastError": null, "updatedAt": now } }))],
+                    "activeTurnId": turn_id, "lastError": null, "updatedAt": now } }),
+                )],
             ),
-            Lifecycle::Delta { thread_id, turn_id, message_id, text } => (
+            Lifecycle::Delta {
+                thread_id,
+                turn_id,
+                message_id,
+                text,
+            } => (
                 thread_id.clone(),
-                vec![("thread.message-sent", json!({ "threadId": thread_id, "messageId": message_id,
+                vec![(
+                    "thread.message-sent",
+                    json!({ "threadId": thread_id, "messageId": message_id,
                     "role": "assistant", "text": text, "turnId": turn_id, "streaming": true,
-                    "createdAt": now, "updatedAt": now }))],
+                    "createdAt": now, "updatedAt": now }),
+                )],
             ),
-            Lifecycle::MessageFinal { thread_id, turn_id, message_id, text } => (
+            Lifecycle::MessageFinal {
+                thread_id,
+                turn_id,
+                message_id,
+                text,
+            } => (
                 thread_id.clone(),
-                vec![("thread.message-sent", json!({ "threadId": thread_id, "messageId": message_id,
+                vec![(
+                    "thread.message-sent",
+                    json!({ "threadId": thread_id, "messageId": message_id,
                     "role": "assistant", "text": text, "turnId": turn_id, "streaming": false,
-                    "createdAt": now, "updatedAt": now }))],
+                    "createdAt": now, "updatedAt": now }),
+                )],
             ),
             // A parked approval becomes a visible activity AND flips the
             // thread's pending flag. The requestId encodes session/turn/callId
@@ -226,40 +249,58 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
             // (`OrchestrationThreadShell.hasPendingApprovals`), never inside a
             // `thread.session-set` payload the reducer ignores.
             Lifecycle::ApprovalRequested {
-                thread_id, turn_id, session_id, turn, call_id, tool, args,
+                thread_id,
+                turn_id,
+                session_id,
+                turn,
+                call_id,
+                tool,
+                args,
             } => (
                 thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": approval_requested_activity(
-                        session_id, *turn, call_id, tool, args, Some(turn_id), now,
-                    ),
-                }))],
+                vec![(
+                    "thread.activity-appended",
+                    json!({
+                        "threadId": thread_id,
+                        "activity": approval_requested_activity(
+                            session_id, *turn, call_id, tool, args, Some(turn_id), now,
+                        ),
+                    }),
+                )],
             ),
-            Lifecycle::UserInputRequested { thread_id, turn_id, session_id, prompt, questions } => (
+            Lifecycle::UserInputRequested {
+                thread_id,
+                turn_id,
+                session_id,
+                prompt,
+                questions,
+            } => (
                 thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        "id": format!("user-input:{session_id}"),
-                        "tone": "approval",
-                        "kind": "user-input.requested",
-                        "summary": prompt_summary(prompt),
-                        "payload": {
-                            "requestId": session_id,
-                            "prompt": prompt,
-                            // Forwarded verbatim when the provider supplied
-                            // structure: the answer widget needs the options,
-                            // and prose alone would make a multiple-choice ask
-                            // render as a free-text box. Absent stays absent —
-                            // an invented single option would send its label
-                            // back as the user's answer.
-                            "questions": questions,
+                vec![(
+                    "thread.activity-appended",
+                    json!({
+                        "threadId": thread_id,
+                        "activity": {
+                            "id": format!("user-input:{session_id}"),
+                            "tone": "approval",
+                            "kind": "user-input.requested",
+                            "summary": prompt_summary(prompt),
+                            "payload": {
+                                "requestId": session_id,
+                                "prompt": prompt,
+                                // Forwarded verbatim when the provider supplied
+                                // structure: the answer widget needs the options,
+                                // and prose alone would make a multiple-choice ask
+                                // render as a free-text box. Absent stays absent —
+                                // an invented single option would send its label
+                                // back as the user's answer.
+                                "questions": questions,
+                            },
+                            "turnId": turn_id,
+                            "createdAt": now,
                         },
-                        "turnId": turn_id,
-                        "createdAt": now,
-                    },
-                }))],
+                    }),
+                )],
             ),
             // Tool work becomes a durable ACTIVITY row: the thing a user can
             // see running, click into, and pair with its result. `id` is the
@@ -270,7 +311,11 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
             // carry: a `Session` command is mountable and cancellable, a
             // `ProviderInternal` one ran inside the provider's process and has
             // no pane — offering an attach button for it would open nothing.
-            Lifecycle::ShellCommand { thread_id, turn_id, call } => {
+            Lifecycle::ShellCommand {
+                thread_id,
+                turn_id,
+                call,
+            } => {
                 let terminal = match &call.site {
                     agent_sdk_shell::ShellSite::Session { session_id } => json!({
                         "terminalId": session_id, "attachable": true,
@@ -279,81 +324,112 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
                 };
                 (
                     thread_id.clone(),
-                    vec![("thread.activity-appended", json!({
+                    vec![(
+                        "thread.activity-appended",
+                        json!({
+                            "threadId": thread_id,
+                            "activity": {
+                                "id": format!("shell:{}", call.call_id.clone().unwrap_or_else(
+                                    || format!("{turn_id}:{}", call.command))),
+                                "tone": "tool",
+                                "kind": "shell.command",
+                                "summary": call.trace_line(),
+                                "payload": {
+                                    "command": call.command,
+                                    "callId": call.call_id,
+                                    "succeeded": call.succeeded,
+                                    "terminal": terminal,
+                                },
+                                "turnId": turn_id,
+                                "createdAt": now,
+                            },
+                        }),
+                    )],
+                )
+            }
+            Lifecycle::ToolStarted {
+                thread_id,
+                turn_id,
+                call_id,
+                tool,
+                args,
+            } => (
+                thread_id.clone(),
+                vec![(
+                    "thread.activity-appended",
+                    json!({
                         "threadId": thread_id,
                         "activity": {
-                            "id": format!("shell:{}", call.call_id.clone().unwrap_or_else(
-                                || format!("{turn_id}:{}", call.command))),
+                            "id": format!("tool:{call_id}"),
                             "tone": "tool",
-                            "kind": "shell.command",
-                            "summary": call.trace_line(),
+                            "kind": "tool.started",
+                            "summary": tool_summary(tool, args),
                             "payload": {
-                                "command": call.command,
-                                "callId": call.call_id,
-                                "succeeded": call.succeeded,
-                                "terminal": terminal,
+                                "callId": call_id,
+                                "toolName": tool,
+                                "input": args,
+                                // A shell tool is WATCHABLE while it runs, so the row
+                                // carries the pane to attach to. Waiting for
+                                // completion to learn the handle is useless: the
+                                // whole workflow is watching and cancelling a command
+                                // mid-flight (#182).
+                                "terminal": attachable_terminal(tool),
                             },
                             "turnId": turn_id,
                             "createdAt": now,
                         },
-                    }))],
-                )
-            }
-            Lifecycle::ToolStarted { thread_id, turn_id, call_id, tool, args } => (
+                    }),
+                )],
+            ),
+            Lifecycle::ToolCompleted {
+                thread_id,
+                turn_id,
+                call_id,
+                output,
+            } => (
                 thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        "id": format!("tool:{call_id}"),
-                        "tone": "tool",
-                        "kind": "tool.started",
-                        "summary": tool_summary(tool, args),
-                        "payload": {
-                            "callId": call_id,
-                            "toolName": tool,
-                            "input": args,
-                            // A shell tool is WATCHABLE while it runs, so the row
-                            // carries the pane to attach to. Waiting for
-                            // completion to learn the handle is useless: the
-                            // whole workflow is watching and cancelling a command
-                            // mid-flight (#182).
-                            "terminal": attachable_terminal(tool),
+                vec![(
+                    "thread.activity-appended",
+                    json!({
+                        "threadId": thread_id,
+                        "activity": {
+                            // The SAME row id as the start: the client reducer
+                            // replaces an activity whose id it already has, so the
+                            // running row becomes the finished row. A separate
+                            // `:done` id appended a second row and left the first
+                            // one spinning forever (#136).
+                            "id": format!("tool:{call_id}"),
+                            "tone": "tool",
+                            "kind": "tool.completed",
+                            "summary": tool_result_summary(output),
+                            "payload": { "callId": call_id, "output": output },
+                            "turnId": turn_id,
+                            "createdAt": now,
                         },
-                        "turnId": turn_id,
-                        "createdAt": now,
-                    },
-                }))],
+                    }),
+                )],
             ),
-            Lifecycle::ToolCompleted { thread_id, turn_id, call_id, output } => (
-                thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        // The SAME row id as the start: the client reducer
-                        // replaces an activity whose id it already has, so the
-                        // running row becomes the finished row. A separate
-                        // `:done` id appended a second row and left the first
-                        // one spinning forever (#136).
-                        "id": format!("tool:{call_id}"),
-                        "tone": "tool",
-                        "kind": "tool.completed",
-                        "summary": tool_result_summary(output),
-                        "payload": { "callId": call_id, "output": output },
-                        "turnId": turn_id,
-                        "createdAt": now,
-                    },
-                }))],
-            ),
-            Lifecycle::TurnEnded { thread_id, outcome, .. } => {
+            Lifecycle::TurnEnded {
+                thread_id, outcome, ..
+            } => {
                 let last_error = match outcome {
                     TurnOutcome::Failed { message } => json!(message),
                     _ => Value::Null,
                 };
-                (thread_id.clone(), vec![("thread.session-set", json!({ "threadId": thread_id, "session": {
+                (
+                    thread_id.clone(),
+                    vec![(
+                        "thread.session-set",
+                        json!({ "threadId": thread_id, "session": {
                     "threadId": thread_id, "status": "idle", "providerName": null,
-                    "activeTurnId": null, "lastError": last_error, "updatedAt": now } }))])
+                    "activeTurnId": null, "lastError": last_error, "updatedAt": now } }),
+                    )],
+                )
             }
         };
-        (thread_id, items.into_iter().map(|(t, p)| (t.to_string(), p)).collect())
+        (
+            thread_id,
+            items.into_iter().map(|(t, p)| (t.to_string(), p)).collect(),
+        )
     }
 }

@@ -180,8 +180,13 @@ pub async fn resize(runner: &Runner, rows: u16, cols: u16) {
 /// agent has a bash command running (Ctrl-C to the foreground, never the harness
 /// itself, since hearth owns the process group). This is what a stop control
 /// reaches (#52), distinct from `terminal.close` which only closes a pane.
-pub async fn interrupt(runner: &Runner) {
-    let _ = runner.interrupt().await;
+pub async fn interrupt(runner: &Runner) -> Result<String, String> {
+    let out = runner.interrupt().await;
+    if let Some(err) = out.strip_prefix("ERROR: ") {
+        Err(err.to_string())
+    } else {
+        Ok(out)
+    }
 }
 
 /// `terminal.clear` → empty the pane's screen, keeping its shell (cwd, env and
@@ -433,17 +438,13 @@ impl TerminalRegistry {
     ///
     /// A store read error is NOT `None`. "There is no such pane" and "I could
     /// not find out" are different answers, and collapsing them is how a UI
-    /// silently drops a live terminal — so the error is logged and surfaced as
-    /// absent only after it has been said out loud.
-    pub async fn get(&self, owner: &TerminalOwner, terminal_id: &str) -> Option<Pane> {
-        match self.panes.get(&owner.scope(), terminal_id).await {
-            Ok(Some(p)) => Some(self.to_pane(p, owner)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!(%e, scope = %owner.scope(), terminal_id, "pane store unreadable");
-                None
-            }
-        }
+    /// silently drops a live terminal.
+    pub async fn get(&self, owner: &TerminalOwner, terminal_id: &str) -> Result<Option<Pane>, String> {
+        self.panes
+            .get(&owner.scope(), terminal_id)
+            .await
+            .map(|p| p.map(|p| self.to_pane(p, owner)))
+            .map_err(|e| format!("pane store unreadable for {}/{}: {e}", owner.scope(), terminal_id))
     }
 
     /// Open (or return) a pane.
@@ -483,22 +484,18 @@ impl TerminalRegistry {
 
     /// Wait until `(owner, terminal_id)` EXISTS, without creating it.
     ///
-    /// `None` means the wait timed out and nobody ever opened it — or the store
-    /// could not be read, which is logged rather than swallowed silently.
+    /// `Ok(None)` means the wait timed out and nobody ever opened it.
     pub async fn wait_for(
         &self,
         owner: &TerminalOwner,
         terminal_id: &str,
         timeout: std::time::Duration,
-    ) -> Option<Pane> {
-        match self.panes.wait_for(&owner.scope(), terminal_id, timeout).await {
-            Ok(Some(p)) => Some(self.to_pane(p, owner)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!(%e, scope = %owner.scope(), terminal_id, "pane store unreadable while waiting");
-                None
-            }
-        }
+    ) -> Result<Option<Pane>, String> {
+        self.panes
+            .wait_for(&owner.scope(), terminal_id, timeout)
+            .await
+            .map(|p| p.map(|p| self.to_pane(p, owner)))
+            .map_err(|e| format!("pane store unreadable while waiting for {}/{}: {e}", owner.scope(), terminal_id))
     }
 
     /// Restart a pane's shell with the cwd/env it is (re)launched with.
@@ -534,14 +531,11 @@ impl TerminalRegistry {
     /// alive with nothing attached to it and no way to reach it again. The
     /// agent's shared shell is never killed and never de-registered; a refused
     /// close changes nothing at all.
-    pub async fn close(&self, owner: &TerminalOwner, terminal_id: &str) -> bool {
-        match self.panes.close(&owner.scope(), terminal_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(%e, scope = %owner.scope(), terminal_id, "pane close failed");
-                false
-            }
-        }
+    pub async fn close(&self, owner: &TerminalOwner, terminal_id: &str) -> Result<bool, String> {
+        self.panes
+            .close(&owner.scope(), terminal_id)
+            .await
+            .map_err(|e| format!("pane close failed for {}/{}: {e}", owner.scope(), terminal_id))
     }
 
     /// Every pane open for one OWNER, oldest id first (stable for a UI list).
@@ -549,15 +543,13 @@ impl TerminalRegistry {
     /// Takes the owner, not a thread id, so a subagent's panes list
     /// independently of its parent thread's — listing by thread would either
     /// hide the child's PTYs or fold them into the parent's drawer.
-    pub async fn list(&self, owner: &TerminalOwner) -> Vec<Pane> {
+    pub async fn list(&self, owner: &TerminalOwner) -> Result<Vec<Pane>, String> {
         let scope = owner.scope();
-        let records = match self.panes.list(&scope).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(%e, %scope, "pane store unreadable while listing");
-                return vec![];
-            }
-        };
+        let records = self
+            .panes
+            .list(&scope)
+            .await
+            .map_err(|e| format!("pane store unreadable while listing {scope}: {e}"))?;
         let mut out = Vec::with_capacity(records.len());
         for r in records {
             // A row whose shell cannot be resolved is omitted rather than
@@ -569,15 +561,16 @@ impl TerminalRegistry {
                 Err(e) => tracing::error!(%e, %scope, terminal_id = %r.terminal_id, "pane unresolvable"),
             }
         }
-        out
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod wait_tests {
     use super::*;
+    use agent_sdk_do::ObjectDb;
 
-    async fn registry() -> Arc<TerminalRegistry> {
+    async fn registry_with_db() -> (Arc<TerminalRegistry>, Arc<dyn ObjectDb>) {
         let dir = std::env::temp_dir().join(format!("t3term-{}", uuid::Uuid::new_v4()));
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -591,11 +584,20 @@ mod wait_tests {
             Arc::new(agent_sdk_exec::RootedAdmission::new([dir.clone()])),
         ));
         sessions.migrate().await.unwrap();
-        Arc::new(
-            TerminalRegistry::new(runner, dir.to_string_lossy().into(), sessions, db)
+        let registry = Arc::new(
+            TerminalRegistry::new(runner, dir.to_string_lossy().into(), sessions, db.clone())
                 .await
                 .unwrap(),
-        )
+        );
+        (registry, db)
+    }
+
+    async fn registry() -> Arc<TerminalRegistry> {
+        registry_with_db().await.0
+    }
+
+    async fn break_pane_store(db: &Arc<dyn ObjectDb>) {
+        db.execute("DROP TABLE exec_pane", vec![]).await.unwrap();
     }
 
     /// `wait_for` must be woken BY the open, not rescued by its own timeout.
@@ -630,7 +632,7 @@ mod wait_tests {
             tokio::task::yield_now().await;
 
             reg.open(&TerminalOwner::thread(&thread_id), &term, None, None, &[]).await.expect("open");
-            assert!(waiter.await.unwrap().is_some(), "round {i}: the waiter saw the pane");
+            assert!(waiter.await.unwrap().unwrap().is_some(), "round {i}: the waiter saw the pane");
             worst = worst.max(round_start.elapsed());
         }
 
@@ -684,7 +686,11 @@ mod wait_tests {
 
         // The registry can only ever hold one of them, so every caller must have
         // been handed THAT one — any other Arc is a shell the registry has lost.
-        let registered = reg.get(&TerminalOwner::thread("t-race"), "term-1").await.expect("pane registered");
+        let registered = reg
+            .get(&TerminalOwner::thread("t-race"), "term-1")
+            .await
+            .expect("pane store readable")
+            .expect("pane registered");
         for (i, p) in panes.iter().enumerate() {
             assert!(
                 Arc::ptr_eq(&p.runner, &registered.runner),
@@ -710,19 +716,80 @@ mod wait_tests {
             .await
             .expect("agent pane opens");
 
-        assert!(!reg.close(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID).await, "the shared shell is not killed");
+        assert!(
+            !reg.close(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID)
+                .await
+                .expect("pane store readable"),
+            "the shared shell is not killed"
+        );
 
         let still = reg
             .get(&TerminalOwner::thread("t-agent"), AGENT_TERMINAL_ID)
             .await
+            .expect("pane store readable")
             .expect("the agent pane is still registered after a refused close");
         assert!(
             Arc::ptr_eq(&still.runner, &opened.runner),
             "and it is the same shell, not a re-created one"
         );
         assert!(
-            reg.list(&TerminalOwner::thread("t-agent")).await.iter().any(|p| p.terminal_id == AGENT_TERMINAL_ID),
+            reg.list(&TerminalOwner::thread("t-agent"))
+                .await
+                .expect("pane store readable")
+                .iter()
+                .any(|p| p.terminal_id == AGENT_TERMINAL_ID),
             "the UI still sees a row for the terminal the agent is working in"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_list_and_wait_for_surface_pane_store_failures() {
+        let (reg, db) = registry_with_db().await;
+        break_pane_store(&db).await;
+        let owner = TerminalOwner::thread("t-fault");
+
+        let get_err = match reg.get(&owner, "pane-x").await {
+            Ok(_) => panic!("get returned success for a broken pane store"),
+            Err(e) => e,
+        };
+        assert!(
+            get_err.contains("pane store unreadable for thread:t-fault/pane-x"),
+            "get error names the unreadable pane store: {get_err}"
+        );
+
+        let list_err = match reg.list(&owner).await {
+            Ok(_) => panic!("list returned success for a broken pane store"),
+            Err(e) => e,
+        };
+        assert!(
+            list_err.contains("pane store unreadable while listing thread:t-fault"),
+            "list error names the unreadable pane store: {list_err}"
+        );
+
+        let wait_err = match reg
+            .wait_for(&owner, "pane-x", std::time::Duration::from_millis(1))
+            .await
+        {
+            Ok(_) => panic!("wait_for returned success for a broken pane store"),
+            Err(e) => e,
+        };
+        assert!(
+            wait_err.contains("pane store unreadable while waiting for thread:t-fault/pane-x"),
+            "wait_for error names the unreadable pane store: {wait_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_surfaces_pane_store_failures() {
+        let (reg, db) = registry_with_db().await;
+        break_pane_store(&db).await;
+        let err = reg
+            .close(&TerminalOwner::thread("t-fault"), "pane-x")
+            .await
+            .expect_err("close fails closed");
+        assert!(
+            err.contains("pane close failed for thread:t-fault/pane-x"),
+            "close error names the unreadable pane store: {err}"
         );
     }
 

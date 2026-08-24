@@ -28,29 +28,31 @@ const MAX_READ_BYTES: usize = 2_000_000;
 /// Prefers cairn's `list_files` (git's own view, so ignore rules apply); falls
 /// back to a bounded walk when the workspace is not a repository yet, because a
 /// user who has not run `git init` still needs a file picker.
-async fn entries(root: &std::path::Path) -> (Vec<(String, bool)>, bool) {
+async fn entries(root: &std::path::Path) -> Result<(Vec<(String, bool)>, bool), String> {
     if let Some(repo) = crate::vcs::open(&root.to_string_lossy()).await {
-        if let Ok((files, truncated)) = repo.list_files().await {
-            let mut out: Vec<(String, bool)> = Vec::new();
-            let mut dirs: std::collections::BTreeSet<String> = Default::default();
-            for f in files.iter().take(MAX_ENTRIES) {
-                // every ancestor of a tracked file is a real directory
-                let mut cur = std::path::Path::new(f);
-                while let Some(p) = cur.parent() {
-                    if p.as_os_str().is_empty() {
-                        break;
-                    }
-                    dirs.insert(p.to_string_lossy().into_owned());
-                    cur = p;
+        let (files, truncated) = repo
+            .list_files()
+            .await
+            .map_err(|e| format!("project file list unavailable for {}: {e}", root.display()))?;
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut dirs: std::collections::BTreeSet<String> = Default::default();
+        for f in files.iter().take(MAX_ENTRIES) {
+            // every ancestor of a tracked file is a real directory
+            let mut cur = std::path::Path::new(f);
+            while let Some(p) = cur.parent() {
+                if p.as_os_str().is_empty() {
+                    break;
                 }
-                out.push((f.clone(), false));
+                dirs.insert(p.to_string_lossy().into_owned());
+                cur = p;
             }
-            out.extend(dirs.into_iter().map(|d| (d, true)));
-            let over = files.len() > MAX_ENTRIES;
-            return (out, truncated || over);
+            out.push((f.clone(), false));
         }
+        out.extend(dirs.into_iter().map(|d| (d, true)));
+        let over = files.len() > MAX_ENTRIES;
+        return Ok((out, truncated || over));
     }
-    walk(root)
+    Ok(walk(root))
 }
 
 /// Bounded walk for a workspace git does not know about. Skips `.git` and the
@@ -101,9 +103,16 @@ fn entry(path: &str, is_dir: bool) -> Value {
     json!({ "path": path, "kind": if is_dir { "directory" } else { "file" } })
 }
 
+fn unavailable(error: String) -> Value {
+    json!({ "entries": [], "truncated": false, "statusUnavailable": true, "statusError": error })
+}
+
 /// `projects.listEntries`.
 pub async fn list_entries(cwd: &str) -> Value {
-    let (found, truncated) = entries(std::path::Path::new(cwd)).await;
+    let (found, truncated) = match entries(std::path::Path::new(cwd)).await {
+        Ok(v) => v,
+        Err(e) => return unavailable(e),
+    };
     let mut list: Vec<Value> = found.iter().map(|(p, d)| entry(p, *d)).collect();
     list.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     json!({ "entries": list, "truncated": truncated })
@@ -125,7 +134,10 @@ pub async fn search_entries(cwd: &str, input: &Value) -> Value {
     // an image (#93).
     let image_only = input.get("imageOnly").and_then(Value::as_bool).unwrap_or(false);
 
-    let (found, mut truncated) = entries(std::path::Path::new(cwd)).await;
+    let (found, mut truncated) = match entries(std::path::Path::new(cwd)).await {
+        Ok(v) => v,
+        Err(e) => return unavailable(e),
+    };
     let mut scored: Vec<(i64, String, bool)> = Vec::new();
     for (path, is_dir) in found {
         if let Some(k) = want_kind {
@@ -351,6 +363,36 @@ mod tests {
         let all_paths: Vec<&str> =
             all["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
         assert!(all_paths.contains(&"README.md"), "{all_paths:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #57: once cairn detects a repo, a failed repo listing is an unavailable
+    /// state, not permission to walk the filesystem with product-local ignore
+    /// rules.
+    #[tokio::test]
+    async fn a_repo_whose_file_listing_fails_is_not_downgraded_to_a_manual_walk() {
+        let dir = workspace().await;
+        cairn::init_repository(&dir).await.unwrap();
+        std::fs::write(dir.join("ignored-by-git.log"), "generated\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.join(".git/index"), "not a git index\n").unwrap();
+
+        let out = list_entries(dir.to_str().unwrap()).await;
+        assert_eq!(out["statusUnavailable"], json!(true), "repo list failure must be explicit: {out}");
+        assert!(
+            out["statusError"].as_str().unwrap_or("").contains("project file list unavailable"),
+            "the error explains that cairn could not list the repo: {out}"
+        );
+        assert!(
+            out["entries"].as_array().unwrap().is_empty(),
+            "manual walking would expose ignored/generated files after cairn failed: {out}"
+        );
+
+        let search = search_entries(dir.to_str().unwrap(), &json!({"query": "ignored", "limit": 10})).await;
+        assert_eq!(
+            search["statusUnavailable"], json!(true),
+            "search must not downgrade a repo-list failure to manual walk either: {search}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -623,7 +665,7 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
     };
 
     let root = std::path::Path::new(cwd);
-    let (all, mut truncated) = entries(root).await;
+    let (all, mut truncated) = entries(root).await?;
     let mut matches: Vec<Value> = Vec::new();
     let mut opened = 0usize;
     for (rel, is_dir) in all {
