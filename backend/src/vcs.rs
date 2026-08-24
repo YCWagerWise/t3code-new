@@ -1045,6 +1045,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("t3-vcs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cairn::init_repository(&dir).await.unwrap();
+        for args in [
+            ["config", "user.email", "t@t"],
+            ["config", "user.name", "t"],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         dir
     }
