@@ -1179,7 +1179,16 @@ async fn watch_one_tree(
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
-    while edges.changed().await.is_some() {
+    let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            edge = edges.changed() => {
+                if edge.is_none() {
+                    break;
+                }
+            }
+            _ = reconcile.tick() => {}
+        }
         let fingerprint = vcs::status(&cwd).await.to_string();
         if fingerprint != seen {
             seen = fingerprint;

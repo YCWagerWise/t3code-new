@@ -2210,8 +2210,15 @@ async fn diagnostics_rpcs_are_implemented_and_report_real_processes() {
     assert_eq!(f["exit"]["_tag"], "Success", "not the unsupported arm: {f:?}");
     let h = &f["exit"]["value"];
     assert_eq!(h["windowMs"], 60_000, "the caller's window, echoed: {h}");
-    assert!(h["retainedSampleCount"].as_i64().unwrap() >= 1, "the read sampled: {h}");
-    assert!(!h["buckets"].as_array().unwrap().is_empty(), "a sampled bucket: {h}");
+    if d["error"]["_tag"] == "None" {
+        assert!(h["retainedSampleCount"].as_i64().unwrap() >= 1, "the read sampled: {h}");
+        assert!(!h["buckets"].as_array().unwrap().is_empty(), "a sampled bucket: {h}");
+    } else {
+        assert_eq!(h["retainedSampleCount"], 0, "failed ps read must not invent history: {h}");
+        assert!(h["buckets"].as_array().unwrap().is_empty(), "failed ps read must not invent buckets: {h}");
+        assert_eq!(h["health"]["native"]["lastError"]["_tag"], "Some",
+                   "history reports the collector failure: {h}");
+    }
 
     // trace diagnostics: no OTLP file on this runtime, so it must say so
     // rather than answer with a clean-looking empty scan
@@ -2952,9 +2959,9 @@ async fn provider_entries_use_the_contract_shapes() {
 /// working tree entirely outside the server — the case the watcher exists
 /// for, and the one a user hits every time they save in another editor.
 ///
-/// It used to be caught by a 1.5s `git status` timer. There is no timer any
-/// more, so anything that does not arrive on cairn's filesystem edge does
-/// not arrive at all.
+/// It used to be caught by a 1.5s `git status` timer per subscriber. The
+/// current watcher is edge-first, with one low-frequency reconciliation pass
+/// per watched repo so a dropped platform event cannot wedge the panel forever.
 ///
 /// A BRANCH SWITCH rather than a commit, deliberately: with no upstream
 /// configured a commit leaves every field of `vcs::status` identical (same
