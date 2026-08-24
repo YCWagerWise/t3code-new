@@ -1050,13 +1050,24 @@ async fn publish_user_input_failed(
 /// Recompute source-control status for `cwd` and push it to every subscriber
 /// watching that directory.
 ///
-/// Called after each mutating VCS command AND by the change poller, so the
+/// Called after each mutating VCS command and by cairn's status watch, so the
 /// panel tracks the repository whether it moved because of us or because the
 /// user ran git in their own terminal.
 async fn publish_vcs_status(state: &AppState, cwd: &str) {
     let local = vcs::status(cwd).await;
     let snapshot = vcs::status_snapshot(cwd).await;
     let remote = snapshot.get("remote").cloned().unwrap_or(Value::Null);
+    publish_vcs_status_parts(state, cwd, local, remote).await;
+}
+
+async fn publish_vcs_status_from_cairn(state: &AppState, cwd: &str, status: &cairn::Status) {
+    let local = vcs::status_from(status);
+    let snapshot = vcs::status_snapshot_from(status);
+    let remote = snapshot.get("remote").cloned().unwrap_or(Value::Null);
+    publish_vcs_status_parts(state, cwd, local, remote).await;
+}
+
+async fn publish_vcs_status_parts(state: &AppState, cwd: &str, local: Value, remote: Value) {
     // Publish through the SDK's per-cwd durable topic (#335 / packet DM):
     // a second backend process attached to this isolate delivers the frame
     // to every subscriber on this cwd. The old process-local `Vec<Sender>`
@@ -1143,11 +1154,9 @@ fn spawn_vcs_watcher(state: AppState) {
 
 /// Publish `cwd`'s source-control status whenever the repository actually moves.
 ///
-/// Parks on cairn's watch, which covers BOTH ways status changes: git operations
-/// land in the git directory, working-tree edits land in the tree. The
-/// fingerprint check stays because an edge means "something touched the
-/// repository", not "status changed" — a write that leaves `git status`
-/// identical must not repaint the panel.
+/// Parks on cairn's status watch. Cairn owns both the low-level filesystem edge
+/// and the status reconciliation that decides whether that edge matters, so the
+/// product backend only publishes typed statuses it is handed.
 async fn watch_one_tree(
     state: AppState,
     cwd: String,
@@ -1155,35 +1164,29 @@ async fn watch_one_tree(
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let Some(repo) = cairn::Repo::detect(std::path::Path::new(&cwd)).await else { return };
-    // `baseline` is the fingerprint a SUBSCRIBER was handed, not one this task
-    // read for itself. Placing a watch is asynchronous — detect the repository,
-    // walk its directories — and a commit or branch switch in that window
-    // produces no edge. A self-read baseline folded such a change in silently,
-    // so it was never announced and nothing re-reconciled: the panel sat on a
-    // stale ref until some later unrelated edit happened to move it.
-    let mut seen = baseline;
-    let Some(mut edges) = repo.watch().await else {
-        tracing::warn!(%cwd, "no filesystem watch available; vcs panel will update on commands only");
-        return;
+    let mut watch = match repo.watch_status_from(baseline).await {
+        Ok(Some(start)) => {
+            if let Some(status) = start.changed_since_baseline {
+                publish_vcs_status_from_cairn(&state, &cwd, &status).await;
+            }
+            start.watch
+        }
+        Ok(None) => {
+            tracing::warn!(%cwd, "no filesystem watch available; vcs panel will update on commands only");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(%cwd, %e, "could not place status watch; vcs panel will update on commands only");
+            return;
+        }
     };
-    // Close the placement window: anything that landed while the watch was being
-    // set up gets published now, exactly as an edge would have published it.
-    let placed = vcs::status(&cwd).await.to_string();
-    if placed != seen {
-        seen = placed;
-        publish_vcs_status(&state, &cwd).await;
-    }
-    // The watch is live and the gap is reconciled. Anything from here on arrives
-    // as an edge, which is what makes this a receipt worth waiting on rather
-    // than a timer worth guessing at.
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
-    while edges.changed().await.is_some() {
-        let fingerprint = vcs::status(&cwd).await.to_string();
-        if fingerprint != seen {
-            seen = fingerprint;
-            publish_vcs_status(&state, &cwd).await;
+    while let Some(status) = watch.changed().await {
+        match status {
+            Ok(status) => publish_vcs_status_from_cairn(&state, &cwd, &status).await,
+            Err(e) => tracing::warn!(%cwd, %e, "vcs status watch could not read status"),
         }
     }
 }
@@ -2803,7 +2806,10 @@ async fn handle_request(
                 // cannot drag the mark past a change the first has not been
                 // told about. A failed registration is reported — a socket
                 // that silently never watches is worse than one that errors.
-                let seen = vcs::status(&cwd).await.to_string();
+                let seen = match vcs::status_fingerprint(&cwd).await {
+                    Some(seen) => seen,
+                    None => vcs::status(&cwd).await.to_string(),
+                };
                 if let Err(e) = state.rt.watch_begin("vcs", &cwd, &seen).await {
                     exit_failure(tx, &id, &format!("subscribeVcsStatus: {e}"));
                     return;
