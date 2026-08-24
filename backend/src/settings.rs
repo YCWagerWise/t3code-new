@@ -26,12 +26,11 @@ const INSTANCES_KEY: &str = "server_settings:provider_instances";
 const OTHER_KEY: &str = "server_settings:other";
 
 /// The stored non-provider settings fields (empty until the user saves one).
-pub async fn load_other(store: &OrchStore) -> Map<String, Value> {
-    store
-        .kv(OTHER_KEY)
-        .await
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+pub async fn load_other(store: &OrchStore) -> Result<Map<String, Value>, String> {
+    let Some(raw) = store.kv(OTHER_KEY).await? else {
+        return Ok(Map::new());
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("{OTHER_KEY} is malformed: {e}"))
 }
 
 pub async fn save_other(store: &OrchStore, other: &Map<String, Value>) -> Result<(), String> {
@@ -245,14 +244,14 @@ fn parse_instance_keyed(key: &str, v: &Value) -> Option<ProviderInstanceConfig> 
 pub async fn load_instances(
     store: &OrchStore,
     defaults: Vec<ProviderInstanceConfig>,
-) -> Vec<ProviderInstanceConfig> {
-    let saved: Vec<ProviderInstanceConfig> = store
-        .kv(INSTANCES_KEY)
-        .await
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+) -> Result<Vec<ProviderInstanceConfig>, String> {
+    let saved: Vec<ProviderInstanceConfig> = match store.kv(INSTANCES_KEY).await? {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("{INSTANCES_KEY} is malformed: {e}"))?,
+        None => Vec::new(),
+    };
     if saved.is_empty() {
-        return defaults;
+        return Ok(defaults);
     }
     let mut out = defaults;
     for s in saved {
@@ -262,7 +261,7 @@ pub async fn load_instances(
             out.push(s);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Persist the current instance set durably (write-through, reported on failure).

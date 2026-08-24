@@ -44,6 +44,36 @@ use t3code_agent::{assets, diagnostics, keybindings, projects, providers, review
 /// This is what lets the tail ack the bus AFTER delivery, not after enqueue.
 type OutFrame = (String, Option<tokio::sync::oneshot::Sender<bool>>);
 
+struct WsThreadSink {
+    tx: mpsc::UnboundedSender<OutFrame>,
+    req: Value,
+}
+
+#[async_trait::async_trait]
+impl agent_sdk_shell::ThreadSink for WsThreadSink {
+    async fn deliver(&self, item: Value) -> Result<(), String> {
+        let frame = json!({ "_tag": "Chunk", "clientId": 0, "requestId": self.req.clone(), "values": [item] }).to_string();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send((frame, Some(done_tx)))
+            .map_err(|_| "websocket channel closed before thread event delivery".to_string())?;
+        match done_rx.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("websocket sink rejected thread event".to_string()),
+            Err(_) => Err("websocket delivery confirmation dropped".to_string()),
+        }
+    }
+}
+
+async fn interrupt_foreground_terminal(runner: &terminal::Terminal) -> Result<String, String> {
+    let out = runner.interrupt().await;
+    if let Some(err) = out.strip_prefix("ERROR:") {
+        Err(err.trim().to_string())
+    } else {
+        Ok(out)
+    }
+}
+
 /// Shared server state. The turn engine, thread↔session binding, stream cursor,
 /// history and lifecycle projection all live in the SDK's [`ThreadRuntime`] —
 /// the backend delegates to it and owns only the socket wiring.
@@ -411,7 +441,9 @@ async fn main() {
     // settings survives restart instead of falling back to the skinny boot env
     // catalog (#47). The picker renders its snapshots and every turn resolves
     // against it; settings writes reconcile it in place.
-    let instances = settings::load_instances(rt.store(), providers::configured_instances()).await;
+    let instances = settings::load_instances(rt.store(), providers::configured_instances())
+        .await
+        .expect("server settings unreadable at boot");
     // Ask every configured OpenAI-compatible endpoint what it serves before the
     // first picker render: an install pointed at a running Ollama should show
     // its models without the user hand-typing slugs (#180). Unreachable
@@ -1359,27 +1391,21 @@ fn spawn_thread_tail_with_cleanup<F>(
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let _ = &thread_id;
+        let sink = WsThreadSink { tx: tx.clone(), req: req.clone() };
         loop {
-            match tail.next(std::time::Duration::from_secs(25)).await {
-                Ok(items) => {
-                    let mut hi = -1_i64;
-                    for (seq, item) in items {
-                        let frame = json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [item] }).to_string();
-                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                        if tx.send((frame, Some(done_tx))).is_err() {
-                            tail.close().await;
-                            on_close.await;
-                            return;
-                        }
-                        match done_rx.await {
-                            Ok(true) => hi = seq,
-                            _ => { tail.close().await; on_close.await; return; }
-                        }
-                    }
-                    if hi >= 0 { let _ = tail.ack(hi).await; }
-                }
-                Err(_) => { tail.close().await; on_close.await; return; }
+            if let Err(e) = tail.pump(&sink, std::time::Duration::from_secs(25)).await {
+                tracing::error!(%e, %thread_id, "thread tail pump failed");
+                let _ = tx.send((
+                    json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [{
+                        "kind": "error",
+                        "error": { "message": format!("thread subscription failed: {e}") },
+                    }]})
+                    .to_string(),
+                    None,
+                ));
+                tail.close().await;
+                on_close.await;
+                return;
             }
         }
     });
@@ -1512,8 +1538,21 @@ pub(crate) async fn dispatch_ws_frame(
                 .map(str::to_string);
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
-                let _ = state.rt.interrupt(&thread_id).await;
-                let _ = state.terminal.interrupt().await;
+                let rt_out = state.rt.interrupt(&thread_id).await;
+                let shell_out = interrupt_foreground_terminal(&state.terminal).await;
+                match (rt_out, shell_out) {
+                    (Ok(sessions), Ok(shell_out)) => {
+                        tracing::info!(%thread_id, sessions = sessions.len(), %shell_out, "ws: Interrupt dispatched");
+                    }
+                    (Err(e), _) => {
+                        tracing::error!(%thread_id, %e, "ws: runtime interrupt failed");
+                        exit_failure(tx, &req_id, &format!("thread interrupt failed: {e}"));
+                    }
+                    (_, Err(e)) => {
+                        tracing::error!(%thread_id, %e, "ws: terminal interrupt failed");
+                        exit_failure(tx, &req_id, &format!("terminal interrupt failed: {e}"));
+                    }
+                }
             } else {
                 tracing::warn!(?req_id,
                     "ws: Interrupt with no threadId — cannot route to a specific turn");
@@ -1918,7 +1957,10 @@ async fn handle_request(
             // Read the stored rules BEFORE taking the catalog lock: the config
             // body needs both, and holding the lock across an await would let a
             // concurrent settings write stall every boot handshake.
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             let cat = state.catalog.read().await;
             exit_success(tx, &id, server_config(&cat, &custom));
         }
@@ -2032,7 +2074,10 @@ async fn handle_request(
         // and a partial answer would blank every other binding.
         "server.upsertKeybinding" | "server.removeKeybinding" => {
             let input = keybindings::input_of(&payload);
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             let next = if method == "server.upsertKeybinding" {
                 keybindings::upsert(&custom, &input)
             } else {
@@ -2062,8 +2107,14 @@ async fn handle_request(
         // runtime routes. Each write persists to the do-rs store and reconciles
         // the SAME live catalog, then answers with the shape the UI decodes.
         "server.getSettings" => {
-            let instances = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
-            let other = settings::load_other(state.rt.store()).await;
+            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(instances) => instances,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             exit_success(tx, &id, settings::settings_wire(&instances, &other));
         }
         "server.updateSettings" => {
@@ -2075,7 +2126,10 @@ async fn handle_request(
                 exit_failure(tx, &id, &e);
                 return;
             }
-            let current = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(current) => current,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             let next = settings::apply_patch(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
@@ -2084,7 +2138,11 @@ async fn handle_request(
             // Persist every OTHER settings field the patch carried, so a saved
             // writing style / model selection / observability config round-trips
             // instead of resetting to defaults on the next getSettings (#87).
-            let other = settings::merge_other(&settings::load_other(state.rt.store()).await, &payload);
+            let existing_other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let other = settings::merge_other(&existing_other, &payload);
             if let Err(e) = settings::save_other(state.rt.store(), &other).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
                 return;
@@ -2092,7 +2150,10 @@ async fn handle_request(
             // Reconcile + answer with the EFFECTIVE set (saved re-merged under the
             // boot defaults), so a whole-map replace that removed a custom
             // provider drops it from the catalog while stock providers survive.
-            let effective = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let effective = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(effective) => effective,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             settings::reconcile(&mut *state.catalog.write().await, &effective);
             let wire = settings::settings_wire(&effective, &other);
             exit_success(tx, &id, wire.clone());
@@ -2106,7 +2167,10 @@ async fn handle_request(
         "server.refreshProviders" => {
             // re-reconcile from the durable set (re-probes availability), then
             // answer with the current provider snapshots the UI renders.
-            let instances = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(instances) => instances,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             // A refresh is exactly when to ASK each OpenAI-compatible endpoint
             // what it serves: the user pointed at an Ollama and expects its
             // models to appear without hand-typing slugs (#180).
@@ -2123,7 +2187,10 @@ async fn handle_request(
             publish_config(&state, config_event("providerStatuses", json!({"providers": providers}))).await;
         }
         "server.updateProvider" => {
-            let current = settings::load_instances(state.rt.store(), providers::configured_instances()).await;
+            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(current) => current,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
             let next = settings::apply_provider_update(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist provider failed: {e}"));
@@ -2522,7 +2589,10 @@ async fn handle_request(
         "subscribeServerConfig" => {
             // an initial snapshot, so a late subscriber is not stuck with
             // whatever it cached before connecting
-            let custom = keybindings::load_custom(state.rt.store()).await;
+            let custom = match keybindings::load_custom(state.rt.store()).await {
+                Ok(custom) => custom,
+                Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
+            };
             chunk(
                 tx,
                 &id,
@@ -3547,18 +3617,30 @@ async fn handle_request(
                         command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
                     // foreground-only: this never touches the shell itself, so a
                     // stop cannot kill the session's PTY out from under it.
-                    let shell_out = state.terminal.interrupt().await;
                     let stopped = if kind == "thread.session.stop" {
                         state.rt.stop(&thread_id).await
                     } else {
                         state.rt.interrupt(&thread_id).await
                     };
-                    match stopped {
-                        Ok(sessions) => tracing::info!(
-                            %thread_id, %kind, sessions = sessions.len(), %shell_out, "stop dispatched"
-                        ),
-                        Err(e) => tracing::error!(%thread_id, %kind, %e, "stop failed"),
-                    }
+                    let sessions = match stopped {
+                        Ok(sessions) => sessions,
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "stop failed");
+                            exit_failure(tx, &id, &format!("{kind} failed: {e}"));
+                            return;
+                        }
+                    };
+                    let shell_out = match interrupt_foreground_terminal(&state.terminal).await {
+                        Ok(out) => out,
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
+                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        %thread_id, %kind, sessions = sessions.len(), %shell_out, "stop dispatched"
+                    );
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
                 // and doing nothing was the worst available behaviour — the UI

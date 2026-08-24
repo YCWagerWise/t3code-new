@@ -46,10 +46,10 @@ type Hmac256 = SimpleHmac<Sha256>;
 /// every URL a client is holding on every restart, which is the bug this whole
 /// module exists to avoid.
 pub async fn signing_key(store: &OrchStore) -> Result<Vec<u8>, String> {
-    if let Some(hex) = store.kv(SIGNING_KEY).await {
-        if let Some(bytes) = from_hex(&hex) {
-            return Ok(bytes);
-        }
+    if let Some(hex) = store.kv(SIGNING_KEY).await? {
+        let bytes = from_hex(&hex)
+            .ok_or_else(|| format!("{SIGNING_KEY} is malformed; refusing to rotate asset signing key"))?;
+        return Ok(bytes);
     }
     let mut key = [0u8; 32];
     getrandom(&mut key)?;
