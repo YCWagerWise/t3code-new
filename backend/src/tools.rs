@@ -250,7 +250,7 @@ impl Action for InterruptShell {
             .await?
             .interrupt()
             .await
-            .map_err(|e| agent_sdk_core::Error::Action(format!("interrupt failed: {e}")))?;
+            .map_err(|e| agent_sdk_core::Error::action(e.to_string()))?;
         Ok(InterruptOut { result })
     }
 }

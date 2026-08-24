@@ -1533,7 +1533,11 @@ async fn stop_thread_checked(
     thread_id: &str,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    let shell_out = terminal::interrupt(&state.terminal).await;
+    // hearth's foreground interrupt is fallible; a PTY it could not write to
+    // means the command is still running, which must not settle the stop.
+    let shell_out = terminal::interrupt(&state.terminal)
+        .await
+        .map_err(|e| format!("hearth foreground interrupt failed: {e}"))?;
     let sessions = if kind == "thread.session.stop" {
         state.rt.stop(thread_id).await
     } else {
@@ -1887,13 +1891,14 @@ async fn revert_checkpoint(
     match outcome {
         Ok(()) => {
             tracing::info!(%thread_id, turn_count, "reverted to checkpoint");
-            let _ = emit_thread_event(
+            emit_thread_event(
                 &state.rt,
                 thread_id,
                 "thread.reverted",
                 json!({ "threadId": thread_id, "turnCount": turn_count }),
             )
-            .await;
+            .await
+            .map_err(|e| format!("checkpoint revert completed but thread.reverted could not be recorded: {e}"))?;
             // The worktree moved under every source-control subscriber too.
             publish_vcs_status(state, &cwd).await;
             Ok(())
@@ -1902,7 +1907,7 @@ async fn revert_checkpoint(
             // A revert the user asked for that did not happen must be VISIBLE.
             // Saying nothing leaves them believing their files were restored.
             tracing::error!(%thread_id, turn_count, %e, "revert failed");
-            let _ = emit_thread_event(
+            emit_thread_event(
                 &state.rt,
                 thread_id,
                 "thread.activity-appended",
@@ -1918,7 +1923,8 @@ async fn revert_checkpoint(
                     },
                 }),
             )
-            .await;
+            .await
+            .map_err(|emit| format!("checkpoint revert failed ({e}) and checkpoint.revert-failed could not be recorded: {emit}"))?;
             Err(e)
         }
     }
@@ -2448,8 +2454,8 @@ async fn handle_request(
                 // reconnect/reload while a turn is running or parked shows the
                 // running/idle/error affordance — not a spinner inferred from
                 // stale messages that the user could never clear (#92).
-                let session = match state.rt.session_status(thread_id).await.unwrap_or(None) {
-                    Some((_sid, st)) => {
+                let session = match state.rt.session_status(thread_id).await {
+                    Ok(Some((_sid, st))) => {
                         use agent_sdk_shell::TurnState;
                         let live = matches!(st, TurnState::Running | TurnState::AwaitingApproval);
                         let status = match st {
@@ -2471,7 +2477,13 @@ async fn handle_request(
                         json!({ "threadId": thread_id, "status": status, "providerName": null,
                             "activeTurnId": active_turn, "lastError": Value::Null, "updatedAt": now })
                     }
-                    None => Value::Null,
+                    Ok(None) => Value::Null,
+                    Err(e) => {
+                        snapshot_tail.close().await;
+                        chunk(tx, &id, json!({ "kind": "error",
+                            "error": { "message": format!("session status unreadable: {e}") } }));
+                        return;
+                    }
                 };
                 // `turnLimit` windows the fallback snapshot to the last N
                 // user-anchored turns and SAYS it is a window; absent means the
@@ -3644,7 +3656,11 @@ async fn handle_request(
                         Ok(sessions) => tracing::info!(
                             %thread_id, %kind, sessions = sessions.len(), "stop dispatched"
                         ),
-                        Err(e) => tracing::error!(%thread_id, %kind, %e, "stop failed"),
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "stop failed");
+                            exit_failure(tx, &id, &format!("{kind} failed: {e}"));
+                            return;
+                        }
                     }
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
@@ -3658,18 +3674,27 @@ async fn handle_request(
                     // Tell the thread the revert was REQUESTED before doing it:
                     // restoring a worktree takes git time, and a panel with no
                     // acknowledgement invites a second click.
-                    let _ = emit_thread_event(
+                    if let Err(e) = emit_thread_event(
                         &state.rt,
                         &thread_id,
                         "thread.checkpoint-revert-requested",
                         json!({ "threadId": thread_id, "turnCount": turn_count }),
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::error!(%thread_id, turn_count, %e, "checkpoint revert request event failed");
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!(
+                                "checkpoint revert refused before mutation: request event failed: {e}"
+                            ),
+                        );
+                        return;
+                    }
                     if let Err(e) = revert_checkpoint(&state, &thread_id, turn_count).await {
-                        exit_typed_failure(tx, &id, json!({
-                            "_tag": "OrchestrationDispatchCommandError",
-                            "message": format!("thread.checkpoint.revert failed: {e}"),
-                        }));
+                        tracing::error!(%thread_id, turn_count, %e, "checkpoint revert failed");
+                        exit_failure(tx, &id, &format!("checkpoint revert failed: {e}"));
                         return;
                     }
                 }

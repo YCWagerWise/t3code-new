@@ -180,14 +180,8 @@ pub async fn resize(runner: &Runner, rows: u16, cols: u16) {
 /// agent has a bash command running (Ctrl-C to the foreground, never the harness
 /// itself, since hearth owns the process group). This is what a stop control
 /// reaches (#52), distinct from `terminal.close` which only closes a pane.
-pub async fn interrupt(runner: &Runner) -> String {
-    // hearth's interrupt is fallible: a PTY it cannot write to means the command
-    // was NOT cancelled. Returning a bare string would make that indistinguishable
-    // from a successful stop, which is the settle-the-spinner bug in miniature.
-    match runner.interrupt().await {
-        Ok(s) => s,
-        Err(e) => format!("ERROR: interrupt failed: {e}"),
-    }
+pub async fn interrupt(runner: &Runner) -> Result<String, String> {
+    runner.interrupt().await.map_err(|e| e.to_string())
 }
 
 /// `terminal.clear` → empty the pane's screen, keeping its shell (cwd, env and
