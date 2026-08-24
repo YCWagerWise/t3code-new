@@ -538,14 +538,26 @@ async fn req_cwd(payload: &Value, state: &AppState) -> Result<String, String> {
 async fn asset_root(resource: &Value, state: &AppState) -> Result<String, String> {
     let requested = match resource.get("_tag").and_then(Value::as_str).unwrap_or_default() {
         "workspace-file" => {
-            let thread_id = resource.get("threadId").and_then(Value::as_str).unwrap_or_default();
-            state
+            let thread_id = resource
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "workspace-file asset requires threadId".to_string())?;
+            let thread = state
                 .rt
                 .threads()
                 .await
                 .into_iter()
                 .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-                .and_then(|t| t.get("worktreePath").and_then(Value::as_str).map(str::to_string))
+                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` was not found"))?;
+            let root = thread
+                .get("worktreePath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` has no worktree root"))?;
+            Some(root.to_string())
         }
         "project-favicon" => resource.get("cwd").and_then(Value::as_str).map(str::to_string),
         _ => None,
@@ -1819,10 +1831,15 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Result<Vec<Value>,
 /// The count → checkpoint mapping lives in the SDK (`revert_turns`, #376): the
 /// same source of truth `turn_summaries` uses to advertise `checkpointTurnCount`,
 /// so the round trip cannot drift. This function is thread-side notification.
-async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
+async fn revert_checkpoint(
+    state: &AppState,
+    thread_id: &str,
+    turn_count: i64,
+) -> Result<(), String> {
     let cwd = match thread_cwd(state, thread_id).await {
         Ok(cwd) => cwd,
         Err(e) => {
+            let reason = e.clone();
             let _ = emit_thread_event(
                 &state.rt,
                 thread_id,
@@ -1840,7 +1857,10 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
                 }),
             )
             .await;
-            return;
+            // The activity event tells the THREAD what happened; the caller
+            // still needs the failure so the command itself does not report
+            // success to the client that asked for the revert.
+            return Err(reason);
         }
     };
     // The MEANING of a revert — files, transcript, turn ordinals, in-flight
@@ -1876,6 +1896,7 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
             .await;
             // The worktree moved under every source-control subscriber too.
             publish_vcs_status(state, &cwd).await;
+            Ok(())
         }
         Err(e) => {
             // A revert the user asked for that did not happen must be VISIBLE.
@@ -1898,6 +1919,7 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
                 }),
             )
             .await;
+            Err(e)
         }
     }
 }
@@ -2426,7 +2448,7 @@ async fn handle_request(
                 // reconnect/reload while a turn is running or parked shows the
                 // running/idle/error affordance — not a spinner inferred from
                 // stale messages that the user could never clear (#92).
-                let session = match state.rt.session_status(thread_id).await {
+                let session = match state.rt.session_status(thread_id).await.unwrap_or(None) {
                     Some((_sid, st)) => {
                         use agent_sdk_shell::TurnState;
                         let live = matches!(st, TurnState::Running | TurnState::AwaitingApproval);
@@ -3130,10 +3152,14 @@ async fn handle_request(
                 Err(e) => { exit_failure(tx, &id, &e); return; }
             };
             match method {
-                "projects.listEntries" => exit_success(tx, &id, projects::list_entries(&cwd).await),
-                "projects.searchEntries" => {
-                    exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
-                }
+                "projects.listEntries" => match projects::list_entries(&cwd).await {
+                    Ok(v) => exit_success(tx, &id, v),
+                    Err(e) => exit_failure(tx, &id, &e),
+                },
+                "projects.searchEntries" => match projects::search_entries(&cwd, &payload).await {
+                    Ok(v) => exit_success(tx, &id, v),
+                    Err(e) => exit_failure(tx, &id, &e),
+                },
                 "projects.searchContents" => match projects::search_contents(&cwd, &payload).await {
                     Ok(v) => exit_success(tx, &id, v),
                     Err(e) => exit_failure(tx, &id, &e),
@@ -3639,7 +3665,13 @@ async fn handle_request(
                         json!({ "threadId": thread_id, "turnCount": turn_count }),
                     )
                     .await;
-                    revert_checkpoint(&state, &thread_id, turn_count).await;
+                    if let Err(e) = revert_checkpoint(&state, &thread_id, turn_count).await {
+                        exit_typed_failure(tx, &id, json!({
+                            "_tag": "OrchestrationDispatchCommandError",
+                            "message": format!("thread.checkpoint.revert failed: {e}"),
+                        }));
+                        return;
+                    }
                 }
                 // #73: metadata the frontend changes OUTSIDE a turn — model
                 // picker, runtime/interaction mode, title, branch. Acking these

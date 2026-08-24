@@ -244,7 +244,14 @@ impl Action for InterruptShell {
     async fn call(&self, _c: &dyn Ctx, _i: InterruptIn) -> agent_sdk_core::Result<InterruptOut> {
         // foreground only — never the harness's own process (that is the whole
         // point of hearth owning the process group).
-        Ok(InterruptOut { result: self.runner.get().await?.interrupt().await })
+        let result = self
+            .runner
+            .get()
+            .await?
+            .interrupt()
+            .await
+            .map_err(|e| agent_sdk_core::Error::Action(format!("interrupt failed: {e}")))?;
+        Ok(InterruptOut { result })
     }
 }
 

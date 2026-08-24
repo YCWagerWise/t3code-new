@@ -377,7 +377,7 @@ async fn a_turn_left_in_flight_by_a_crash_blocks_a_concurrent_redispatch() {
     // the process is gone; the durable claim is not.
     let rt = boot(&data).await;
     assert_eq!(
-        rt.claimed_turn("thread-1").await.as_deref(),
+        rt.claimed_turn("thread-1").await.unwrap().as_deref(),
         Some("turn-crashed"),
         "the durable claim survived the restart"
     );

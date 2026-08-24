@@ -421,7 +421,7 @@ fn same_rule(a: &Rule, b: &Rule) -> bool {
 /// EMPTY custom set (so the user falls back to working defaults) rather than an
 /// error that would make the settings page unopenable.
 pub async fn load_custom(store: &OrchStore) -> Vec<Rule> {
-    let Some(raw) = store.kv(KEYBINDINGS_KEY).await else {
+    let Ok(Some(raw)) = store.kv(KEYBINDINGS_KEY).await else {
         return Vec::new();
     };
     let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&raw) else {

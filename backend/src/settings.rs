@@ -27,11 +27,17 @@ const OTHER_KEY: &str = "server_settings:other";
 
 /// The stored non-provider settings fields (empty until the user saves one).
 pub async fn load_other(store: &OrchStore) -> Map<String, Value> {
-    store
-        .kv(OTHER_KEY)
-        .await
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    // `kv` is fallible now. An unreadable store is not "no settings saved", but
+    // this loader has no error channel, so keep the existing empty-map fallback
+    // and say WHY in the log rather than silently conflating the two.
+    match store.kv(OTHER_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        Ok(None) => Map::new(),
+        Err(e) => {
+            tracing::error!(%e, "settings store unreadable; serving empty settings");
+            Map::new()
+        }
+    }
 }
 
 pub async fn save_other(store: &OrchStore, other: &Map<String, Value>) -> Result<(), String> {
@@ -246,11 +252,14 @@ pub async fn load_instances(
     store: &OrchStore,
     defaults: Vec<ProviderInstanceConfig>,
 ) -> Vec<ProviderInstanceConfig> {
-    let saved: Vec<ProviderInstanceConfig> = store
-        .kv(INSTANCES_KEY)
-        .await
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let saved: Vec<ProviderInstanceConfig> = match store.kv(INSTANCES_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::error!(%e, "provider instance store unreadable; using defaults");
+            Vec::new()
+        }
+    };
     if saved.is_empty() {
         return defaults;
     }

@@ -46,7 +46,9 @@ type Hmac256 = SimpleHmac<Sha256>;
 /// every URL a client is holding on every restart, which is the bug this whole
 /// module exists to avoid.
 pub async fn signing_key(store: &OrchStore) -> Result<Vec<u8>, String> {
-    if let Some(hex) = store.kv(SIGNING_KEY).await {
+    // A store that cannot be read must not mint a NEW signing key: that would
+    // silently invalidate every URL a client is holding.
+    if let Some(hex) = store.kv(SIGNING_KEY).await? {
         if let Some(bytes) = from_hex(&hex) {
             return Ok(bytes);
         }
