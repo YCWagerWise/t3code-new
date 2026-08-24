@@ -180,8 +180,8 @@ pub async fn resize(runner: &Runner, rows: u16, cols: u16) {
 /// agent has a bash command running (Ctrl-C to the foreground, never the harness
 /// itself, since hearth owns the process group). This is what a stop control
 /// reaches (#52), distinct from `terminal.close` which only closes a pane.
-pub async fn interrupt(runner: &Runner) {
-    let _ = runner.interrupt().await;
+pub async fn interrupt(runner: &Runner) -> Result<String, String> {
+    runner.interrupt().await.map_err(|e| e.to_string())
 }
 
 /// `terminal.clear` → empty the pane's screen, keeping its shell (cwd, env and

@@ -1512,8 +1512,20 @@ pub(crate) async fn dispatch_ws_frame(
                 .map(str::to_string);
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
-                let _ = state.rt.interrupt(&thread_id).await;
-                let _ = state.terminal.interrupt().await;
+                if let Err(e) = state.rt.interrupt(&thread_id).await {
+                    tracing::error!(%thread_id, ?req_id, %e, "ws: Interrupt runtime cancel failed");
+                    if !req_id.is_null() {
+                        exit_failure(tx, &req_id, &format!("interrupt failed: {e}"));
+                    }
+                    return;
+                }
+                if let Err(e) = state.terminal.interrupt().await {
+                    tracing::error!(%thread_id, ?req_id, %e, "ws: Interrupt terminal foreground interrupt failed");
+                    if !req_id.is_null() {
+                        exit_failure(tx, &req_id, &format!("terminal interrupt failed: {e}"));
+                    }
+                    return;
+                }
             } else {
                 tracing::warn!(?req_id,
                     "ws: Interrupt with no threadId — cannot route to a specific turn");
@@ -1824,7 +1836,7 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
 /// The count → checkpoint mapping lives in the SDK (`revert_turns`, #376): the
 /// same source of truth `turn_summaries` uses to advertise `checkpointTurnCount`,
 /// so the round trip cannot drift. This function is thread-side notification.
-async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
+async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) -> Result<(), String> {
     let cwd = thread_cwd(state, thread_id).await;
     // The MEANING of a revert — files, transcript, turn ordinals, in-flight
     // marker, and the order they must move in — belongs to the runtime, not to
@@ -1850,21 +1862,23 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
     match outcome {
         Ok(()) => {
             tracing::info!(%thread_id, turn_count, "reverted to checkpoint");
-            let _ = emit_thread_event(
+            emit_thread_event(
                 &state.rt,
                 thread_id,
                 "thread.reverted",
                 json!({ "threadId": thread_id, "turnCount": turn_count }),
             )
-            .await;
+            .await
+            .map_err(|e| format!("checkpoint revert completed but thread.reverted could not be recorded: {e}"))?;
             // The worktree moved under every source-control subscriber too.
             publish_vcs_status(state, &cwd).await;
+            Ok(())
         }
         Err(e) => {
             // A revert the user asked for that did not happen must be VISIBLE.
             // Saying nothing leaves them believing their files were restored.
             tracing::error!(%thread_id, turn_count, %e, "revert failed");
-            let _ = emit_thread_event(
+            emit_thread_event(
                 &state.rt,
                 thread_id,
                 "thread.activity-appended",
@@ -1880,7 +1894,9 @@ async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
                     },
                 }),
             )
-            .await;
+            .await
+            .map_err(|emit| format!("checkpoint revert failed ({e}) and checkpoint.revert-failed could not be recorded: {emit}"))?;
+            Err(e)
         }
     }
 }
@@ -2410,7 +2426,7 @@ async fn handle_request(
                 // running/idle/error affordance — not a spinner inferred from
                 // stale messages that the user could never clear (#92).
                 let session = match state.rt.session_status(thread_id).await {
-                    Some((_sid, st)) => {
+                    Ok(Some((_sid, st))) => {
                         use agent_sdk_shell::TurnState;
                         let live = matches!(st, TurnState::Running | TurnState::AwaitingApproval);
                         let status = match st {
@@ -2432,7 +2448,13 @@ async fn handle_request(
                         json!({ "threadId": thread_id, "status": status, "providerName": null,
                             "activeTurnId": active_turn, "lastError": Value::Null, "updatedAt": now })
                     }
-                    None => Value::Null,
+                    Ok(None) => Value::Null,
+                    Err(e) => {
+                        snapshot_tail.close().await;
+                        chunk(tx, &id, json!({ "kind": "error",
+                            "error": { "message": format!("session status unreadable: {e}") } }));
+                        return;
+                    }
                 };
                 // `turnLimit` windows the fallback snapshot to the last N
                 // user-anchored turns and SAYS it is a window; absent means the
@@ -3553,11 +3575,23 @@ async fn handle_request(
                     } else {
                         state.rt.interrupt(&thread_id).await
                     };
+                    let shell_out = match shell_out {
+                        Ok(out) => out,
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "terminal foreground interrupt failed");
+                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
+                            return;
+                        }
+                    };
                     match stopped {
                         Ok(sessions) => tracing::info!(
                             %thread_id, %kind, sessions = sessions.len(), %shell_out, "stop dispatched"
                         ),
-                        Err(e) => tracing::error!(%thread_id, %kind, %e, "stop failed"),
+                        Err(e) => {
+                            tracing::error!(%thread_id, %kind, %e, "stop failed");
+                            exit_failure(tx, &id, &format!("{kind} failed: {e}"));
+                            return;
+                        }
                     }
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
@@ -3571,14 +3605,29 @@ async fn handle_request(
                     // Tell the thread the revert was REQUESTED before doing it:
                     // restoring a worktree takes git time, and a panel with no
                     // acknowledgement invites a second click.
-                    let _ = emit_thread_event(
+                    if let Err(e) = emit_thread_event(
                         &state.rt,
                         &thread_id,
                         "thread.checkpoint-revert-requested",
                         json!({ "threadId": thread_id, "turnCount": turn_count }),
                     )
-                    .await;
-                    revert_checkpoint(&state, &thread_id, turn_count).await;
+                    .await
+                    {
+                        tracing::error!(%thread_id, turn_count, %e, "checkpoint revert request event failed");
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!(
+                                "checkpoint revert refused before mutation: request event failed: {e}"
+                            ),
+                        );
+                        return;
+                    }
+                    if let Err(e) = revert_checkpoint(&state, &thread_id, turn_count).await {
+                        tracing::error!(%thread_id, turn_count, %e, "checkpoint revert failed");
+                        exit_failure(tx, &id, &format!("checkpoint revert failed: {e}"));
+                        return;
+                    }
                 }
                 // #73: metadata the frontend changes OUTSIDE a turn — model
                 // picker, runtime/interaction mode, title, branch. Acking these

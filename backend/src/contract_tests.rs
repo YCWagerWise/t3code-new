@@ -2106,6 +2106,79 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
     assert!(after.output.contains("alive"), "the shell is still usable: {after:?}");
 }
 
+async fn drop_thread_session_table(dir: &std::path::Path) {
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE thread_session", vec![]).await.unwrap();
+}
+
+fn exit_is_success(frame: &Value) -> bool {
+    frame["_tag"] == "Exit" && frame["exit"]["_tag"] == "Success"
+}
+
+/// #108: a stop command whose SDK durable cancellation cannot be read/written
+/// must fail the RPC. Logging and then falling through to Success leaves the
+/// client believing the turn stopped while the runtime still owns the cancel
+/// authority.
+#[tokio::test]
+async fn stop_command_fails_when_sdk_interrupt_state_is_unreadable() {
+    let (state, dir) = test_state().await;
+
+    // Keep the shared Hearth shell live so this test faults only the SDK side.
+    let opened = state.terminal.run("true", false, Some(5), false).await;
+    assert_eq!(opened.exit_code, 0, "precondition: terminal opened cleanly: {opened:?}");
+
+    state.rt.save_thread(&thread_row_ck("t-stop-sdk-fail")).await.unwrap();
+    drop_thread_session_table(&dir).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.turn.interrupt", "threadId": "t-stop-sdk-fail",
+    }})).await;
+    let frames = drain(&mut rx);
+    let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "a failed stop must produce exactly one terminal frame: {frames:?}");
+    assert_eq!(exits[0]["exit"]["_tag"], "Failure", "SDK stop failure must not ack success: {frames:?}");
+    assert!(
+        !frames.iter().any(|f| exit_is_success(f)),
+        "SDK stop failure sent a success ack as well as failure: {frames:?}"
+    );
+    let defect = exit_defect(exits[0]);
+    assert!(
+        defect.contains("thread.turn.interrupt failed"),
+        "failure must name the SDK stop path: {frames:?}"
+    );
+}
+
+/// #108: a stop command whose Hearth foreground interrupt cannot be delivered
+/// must fail the RPC before the generic synchronous-command Success ack.
+#[tokio::test]
+async fn stop_command_fails_when_hearth_foreground_interrupt_fails() {
+    let (state, _d) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-stop-hearth-fail")).await.unwrap();
+
+    let shutdown = state.terminal.shutdown().await;
+    assert!(shutdown.contains("shut down"), "precondition: shared shell shut down: {shutdown}");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.turn.interrupt", "threadId": "t-stop-hearth-fail",
+    }})).await;
+    let frames = drain(&mut rx);
+    let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "a failed stop must produce exactly one terminal frame: {frames:?}");
+    assert_eq!(exits[0]["exit"]["_tag"], "Failure", "Hearth stop failure must not ack success: {frames:?}");
+    assert!(
+        !frames.iter().any(|f| exit_is_success(f)),
+        "Hearth stop failure sent a success ack as well as failure: {frames:?}"
+    );
+    let defect = exit_defect(exits[0]);
+    assert!(
+        defect.contains("terminal interrupt failed") && defect.contains("no live shell"),
+        "failure must name the Hearth interrupt path: {frames:?}"
+    );
+}
+
 /// #68: a settings/provider write must reach the UI's shared config
 /// projection, which only advances when `subscribeServerConfig` emits.
 /// Returning the new value from the command is not enough — every passive
@@ -5476,7 +5549,7 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     // "v2" — not "v0". Under the inversion this restored v0 and threw away
     // two turns of work.
     state.rt.save_thread(&thread_row_ck("t-order")).await.unwrap();
-    revert_checkpoint(&state, "t-order", 1).await;
+    revert_checkpoint(&state, "t-order", 1).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap().trim(),
         "v2",
@@ -5697,7 +5770,7 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     );
 
     // And the revert round-trips from the new process.
-    revert_checkpoint(&state2, "t-oob", 1).await;
+    revert_checkpoint(&state2, "t-oob", 1).await.unwrap();
     for _ in 0..50 {
         if std::fs::read_to_string(&file).unwrap_or_default() == "before\n" {
             break;
@@ -5771,7 +5844,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 
     // ...AND the revert leaves them alone. This is the assertion a display
     // filter cannot pass.
-    revert_checkpoint(&state, "t-scope", 1).await;
+    revert_checkpoint(&state, "t-scope", 1).await.unwrap();
     for _ in 0..50 {
         if std::fs::read_to_string(&src).unwrap_or_default() == "v1\n" {
             break;
@@ -5792,6 +5865,118 @@ fn thread_row_ck(id: &str) -> Value {
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
+}
+
+fn init_git_repo(cwd: &str) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        std::process::Command::new("git").args(&args).current_dir(cwd).output().unwrap();
+    }
+}
+
+async fn drop_thread_event_table(dir: &std::path::Path) {
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE thread_event", vec![]).await.unwrap();
+}
+
+fn exit_defect(exit: &Value) -> &str {
+    exit["exit"]["cause"][0]["defect"]
+        .as_str()
+        .or_else(|| exit["exit"]["cause"][0]["error"]["defect"].as_str())
+        .or_else(|| exit["exit"]["cause"][0]["error"]["message"].as_str())
+        .unwrap_or("")
+}
+
+/// #107: the destructive checkpoint revert command must not mutate files if
+/// the durable "requested" lifecycle event cannot be recorded. A visible
+/// failure before mutation is the only retry-safe state.
+#[tokio::test]
+async fn checkpoint_revert_refuses_before_mutation_when_request_event_cannot_be_recorded() {
+    let (state, dir) = test_state().await;
+    init_git_repo(&state.cwd);
+    let file = std::path::Path::new(&state.cwd).join("requested.txt");
+    std::fs::write(&file, "before\n").unwrap();
+
+    state.rt.save_thread(&thread_row_ck("t-req-fail")).await.unwrap();
+    checkpoint_turn_start(&state, &state.cwd.clone(), "turn-1").await;
+    std::fs::write(&file, "after\n").unwrap();
+
+    drop_thread_event_table(&dir).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "type": "thread.checkpoint.revert", "threadId": "t-req-fail", "turnCount": 1 }),
+    )
+    .await;
+    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exit");
+    assert_eq!(exit["exit"]["_tag"], "Failure", "request event failure must not ack success: {exit}");
+    let defect = exit_defect(&exit);
+    assert!(
+        defect.contains("refused before mutation") && defect.contains("request event failed"),
+        "failure must name the pre-mutation lifecycle write: {exit}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "after\n",
+        "files must not move when the requested event cannot be durably recorded"
+    );
+}
+
+/// #107: after the SDK/cairn revert mutates the thread/worktree, failure to
+/// durably record the completed lifecycle event must still be returned to the
+/// caller. Falling through to Success here is the exact split-brain the review
+/// packet named.
+#[tokio::test]
+async fn checkpoint_revert_reports_completed_event_failure_after_mutation() {
+    let (state, dir) = test_state().await;
+    init_git_repo(&state.cwd);
+    let file = std::path::Path::new(&state.cwd).join("completed.txt");
+    std::fs::write(&file, "before\n").unwrap();
+
+    state.rt.save_thread(&thread_row_ck("t-complete-fail")).await.unwrap();
+    checkpoint_turn_start(&state, &state.cwd.clone(), "turn-1").await;
+    std::fs::write(&file, "after\n").unwrap();
+
+    drop_thread_event_table(&dir).await;
+
+    let err = revert_checkpoint(&state, "t-complete-fail", 1)
+        .await
+        .expect_err("completed event write failure must be returned");
+    assert!(
+        err.contains("thread.reverted could not be recorded"),
+        "error must name the dropped completion lifecycle event: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "before\n",
+        "the substrate revert already happened, so the caller must see the lifecycle failure"
+    );
+}
+
+/// #107: if the revert itself fails, the failure activity is also a durable
+/// lifecycle write. If that write fails too, the caller must see that second
+/// failure instead of a quiet log-only drop.
+#[tokio::test]
+async fn checkpoint_revert_reports_failed_event_write_failure() {
+    let (state, dir) = test_state().await;
+    init_git_repo(&state.cwd);
+    state.rt.save_thread(&thread_row_ck("t-failed-event")).await.unwrap();
+    drop_thread_event_table(&dir).await;
+
+    let err = revert_checkpoint(&state, "t-failed-event", 0)
+        .await
+        .expect_err("failed-event write failure must be returned");
+    assert!(
+        err.contains("checkpoint.revert-failed could not be recorded"),
+        "error must name the dropped failure lifecycle event: {err}"
+    );
 }
 
 /// #349: a thread whose `worktreePath` is NOT `state.cwd` must checkpoint
@@ -5853,7 +6038,8 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
         revert_checkpoint(&state, "t-wt", 1),
     )
     .await
-    .expect("revert_checkpoint must not hang");
+    .expect("revert_checkpoint must not hang")
+    .unwrap();
 
     let workspace_after = std::fs::read_to_string(&workspace_file).unwrap();
     let worktree_after = std::fs::read_to_string(&worktree_file).unwrap();
@@ -6128,7 +6314,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
     // the one the old test never created.
     state.rt.session_for(&binding, def.clone()).await.unwrap();
     assert!(
-        !state.rt.sessions_for_thread("t-int-live").await.is_empty(),
+        !state.rt.sessions_for_thread("t-int-live").await.unwrap().is_empty(),
         "PRECONDITION: the interrupt has a session to reach. Without this the \
          test passes against a no-op, which is exactly how the previous one did."
     );
@@ -6146,7 +6332,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
     for _ in 0..200 {
         if matches!(
             state.rt.session_status("t-int-live").await,
-            Some((_, agent_sdk_shell::TurnState::Running))
+            Ok(Some((_, agent_sdk_shell::TurnState::Running)))
         ) {
             running = true;
             break;
@@ -6418,7 +6604,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     for _ in 0..200 {
         if matches!(
             state.rt.session_status("t-int-neg").await,
-            Some((_, agent_sdk_shell::TurnState::Running))
+            Ok(Some((_, agent_sdk_shell::TurnState::Running)))
         ) {
             running = true;
             break;
@@ -6619,7 +6805,8 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
         revert_checkpoint(&state, "t-rev", 1),
     )
     .await
-    .expect("revert_checkpoint must not hang");
+    .expect("revert_checkpoint must not hang")
+    .unwrap();
 
     // 1. FILES — the half that already worked.
     assert_eq!(
