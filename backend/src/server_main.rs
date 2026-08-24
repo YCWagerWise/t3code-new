@@ -1509,8 +1509,12 @@ pub(crate) async fn dispatch_ws_frame(
                 .map(str::to_string);
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
-                let _ = state.rt.interrupt(&thread_id).await;
-                let _ = state.terminal.interrupt().await;
+                if let Err(e) = stop_thread_checked(state, &thread_id, "thread.turn.interrupt").await {
+                    tracing::error!(%thread_id, ?req_id, %e, "ws interrupt failed");
+                    if !req_id.is_null() {
+                        exit_failure(tx, &req_id, &format!("interrupt failed: {e}"));
+                    }
+                }
             } else {
                 tracing::warn!(?req_id,
                     "ws: Interrupt with no threadId — cannot route to a specific turn");
@@ -1543,6 +1547,23 @@ pub(crate) async fn dispatch_ws_frame(
             }
         }
     }
+}
+
+async fn stop_thread_checked(
+    state: &AppState,
+    thread_id: &str,
+    kind: &str,
+) -> Result<Vec<String>, String> {
+    let shell_out = terminal::interrupt(&state.terminal).await;
+    let sessions = if kind == "thread.session.stop" {
+        state.rt.stop(thread_id).await
+    } else {
+        state.rt.interrupt(thread_id).await
+    }?;
+    if shell_out.starts_with("ERROR:") {
+        return Err(format!("hearth foreground interrupt failed: {shell_out}"));
+    }
+    Ok(sessions)
 }
 
 /// Send the terminal Exit(Success{value}) for a non-stream RPC.
@@ -1599,16 +1620,22 @@ fn snippet_around(text: &str, at: usize, len: usize) -> String {
 
 /// The worktree a thread's turns edit — its own when it has one, else the
 /// workspace. The diff has to be read from the tree the agent wrote to.
-async fn thread_cwd(state: &AppState, thread_id: &str) -> String {
-    state
+async fn thread_cwd(state: &AppState, thread_id: &str) -> Result<String, String> {
+    if thread_id.trim().is_empty() {
+        return Err("threadId is required".into());
+    }
+    let Some(record) = state
         .rt
-        .threads()
+        .thread_record(thread_id)
         .await
-        .into_iter()
-        .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-        .and_then(|t| t.get("worktreePath").and_then(Value::as_str).map(str::to_string))
+        .map_err(|e| format!("thread mapping unreadable: {e}"))?
+    else {
+        return Err(format!("unknown thread: {thread_id}"));
+    };
+    Ok(record
+        .worktree_path
         .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| state.cwd.clone())
+        .unwrap_or_else(|| state.cwd.clone()))
 }
 
 /// Turn checkpoints (#65/#376) — review and revert, on CAIRN.
@@ -1736,6 +1763,7 @@ impl agent_sdk_shell::TurnCheckpointer for WorkspaceCheckpointer {
         let doomed: Vec<String> = cp
             .turn_summaries()
             .await
+            .map_err(|e| format!("checkpoint history unreadable: {e}"))?
             .into_iter()
             .filter(|t| t.turn_count <= turn_count)
             .map(|t| t.turn_id)
@@ -1771,13 +1799,16 @@ fn turn_projector(
 /// counting, which snapshots count as turns, and how the count round-trips a
 /// revert — lives in `agent_sdk_branch::Checkpoints::turn_summaries` (#376).
 /// This function is pure wire-shape marshalling onto the T3 contract.
-async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
-    let Ok(Some(checkpoints)) = checkpoint_stack(state, cwd).await else {
-        return Vec::new();
+async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Result<Vec<Value>, String> {
+    let checkpoints = match checkpoint_stack(state, cwd).await {
+        Ok(Some(checkpoints)) => checkpoints,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => return Err(format!("checkpoint substrate unavailable: {e}")),
     };
-    checkpoints
+    Ok(checkpoints
         .turn_summaries()
         .await
+        .map_err(|e| format!("checkpoint history unreadable: {e}"))?
         .into_iter()
         .map(|t| {
             let (status, files) = if t.readable {
@@ -1813,7 +1844,7 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
                 "completedAt": iso_ms(t.ts),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Revert the worktree `turn_count` turns back and tell the thread.
@@ -1822,7 +1853,29 @@ async fn checkpoint_summaries(state: &AppState, cwd: &str) -> Vec<Value> {
 /// same source of truth `turn_summaries` uses to advertise `checkpointTurnCount`,
 /// so the round trip cannot drift. This function is thread-side notification.
 async fn revert_checkpoint(state: &AppState, thread_id: &str, turn_count: i64) {
-    let cwd = thread_cwd(state, thread_id).await;
+    let cwd = match thread_cwd(state, thread_id).await {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            let _ = emit_thread_event(
+                &state.rt,
+                thread_id,
+                "thread.activity-appended",
+                json!({
+                    "threadId": thread_id,
+                    "activity": {
+                        "id": format!("revert:{thread_id}:{turn_count}"),
+                        "tone": "error",
+                        "kind": "checkpoint.revert-failed",
+                        "summary": format!("Could not revert: {e}"),
+                        "payload": { "turnCount": turn_count, "error": e },
+                        "createdAt": now_iso(),
+                    },
+                }),
+            )
+            .await;
+            return;
+        }
+    };
     // The MEANING of a revert — files, transcript, turn ordinals, in-flight
     // marker, and the order they must move in — belongs to the runtime, not to
     // this handler (#65/#376). This function's whole job is the T3 wire shape:
@@ -2458,13 +2511,20 @@ async fn handle_request(
                         } else {
                             Value::Null
                         };
+                        let thread_sequence = match state.rt.thread_sequence(thread_id).await {
+                            Ok(seq) => seq,
+                            Err(e) => {
+                                exit_failure(tx, &id, &format!("thread sequence unreadable: {e}"));
+                                return;
+                            }
+                        };
                         (
                             messages[from..].to_vec(),
                             json!({
                                 "beforeCursor": before_cursor,
                                 "hasMore": has_more,
                                 "snapshotSequence": seq0,
-                                "threadSequence": state.rt.thread_sequence(thread_id).await,
+                                "threadSequence": thread_sequence,
                             }),
                         )
                     }
@@ -2474,6 +2534,13 @@ async fn handle_request(
                     record.worktree_path.as_deref().unwrap_or(&state.cwd),
                 )
                 .await;
+                let checkpoints = match checkpoints {
+                    Ok(checkpoints) => checkpoints,
+                    Err(e) => {
+                        exit_failure(tx, &id, &format!("checkpoint summaries unavailable: {e}"));
+                        return;
+                    }
+                };
                 // The product-owned parts only. Everything a reducer reads as
                 // thread IDENTITY/LIFECYCLE comes from the record.
                 let parts = json!({
@@ -2569,7 +2636,17 @@ async fn handle_request(
                 }));
                 return;
             }
-            let cwd = thread_cwd(&state, &thread_id).await;
+            let cwd = match thread_cwd(&state, &thread_id).await {
+                Ok(cwd) => cwd,
+                Err(e) => {
+                    exit_typed_failure(tx, &id, json!({
+                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                else { "OrchestrationGetFullThreadDiffError" },
+                        "message": format!("thread mapping unavailable: {e}"),
+                    }));
+                    return;
+                }
+            };
             // CAIRN owns the diff (#376). `to` is the older boundary (a larger
             // turn count is further back) and `from` is the newer one; `from ==
             // 0` means the working tree, which is what cairn's `None` end is.
@@ -2583,9 +2660,9 @@ async fn handle_request(
                 if to <= 0 {
                     return Ok(None);
                 }
-                Ok(checkpoints
+                checkpoints
                     .diff_turns(from.max(0) as usize, to as usize, ws)
-                    .await)
+                    .await
             }
             .await;
             match patch {
@@ -3070,8 +3147,8 @@ async fn handle_request(
                 }
                 p
             };
-            match projects::open_in_editor(&admitted, &state.cwd) {
-                Ok(()) => exit_success(tx, &id, Value::Null),
+            match projects::open_in_editor(&admitted, &state.cwd, &state.terminal).await {
+                Ok(job_id) => exit_success(tx, &id, json!({ "jobId": job_id })),
                 Err(e) => exit_failure(tx, &id, &e),
             }
         }
@@ -3134,12 +3211,15 @@ async fn handle_request(
         // environment. They are different verbs on purpose: aliasing restart to
         // open left a "fresh" pane carrying the previous launch's exports (#98).
         "terminal.open" | "terminal.restart" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.open: {e}")),
+            };
+            let thread = owner.thread_id().unwrap_or("").to_string();
             let (cwd, worktree) = match state
                 .admit_pane_dir(payload.get("cwd").and_then(Value::as_str), terminal::worktree_of(&payload).as_deref())
                 .await
@@ -3175,12 +3255,14 @@ async fn handle_request(
             exit_success(tx, &id, snap);
         }
         "terminal.write" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
+            };
             let runner = state.pane_runner(&owner, &term).await;
             if let Some(data) = payload.get("data").and_then(Value::as_str) {
                 terminal::write(&runner, data).await;
@@ -3188,12 +3270,14 @@ async fn handle_request(
             exit_success(tx, &id, Value::Null);
         }
         "terminal.resize" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("");
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
+            };
             let runner = state.pane_runner(&owner, &term).await;
             if let (Some(cols), Some(rows)) = (payload.get("cols").and_then(Value::as_u64), payload.get("rows").and_then(Value::as_u64)) {
                 terminal::resize(&runner, rows as u16, cols as u16).await;
@@ -3204,12 +3288,15 @@ async fn handle_request(
         // ends that pane. Neither is a no-op ack any more, and neither kills the
         // agent's shared shell (#105).
         "terminal.clear" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
+            };
+            let thread = owner.thread_id().unwrap_or("").to_string();
             let runner = state.pane_runner(&owner, &term).await;
             terminal::clear(&runner).await;
             broadcast_terminal_event(
@@ -3221,12 +3308,15 @@ async fn handle_request(
             exit_success(tx, &id, Value::Null);
         }
         "terminal.close" => {
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
+            };
+            let thread = owner.thread_id().unwrap_or("").to_string();
             let killed = state.terminals.close(&owner, &term).await;
             broadcast_terminal_event(
                 &state,
@@ -3238,12 +3328,15 @@ async fn handle_request(
         "terminal.attach" => {
             // stream: initial snapshot, then a full-repaint output on every screen
             // change, until the socket closes or the shell dies.
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("terminal.attach: {e}")),
+            };
+            let thread = owner.thread_id().unwrap_or("").to_string();
             let (cwd, worktree) = match state
                 .admit_pane_dir(payload.get("cwd").and_then(Value::as_str), terminal::worktree_of(&payload).as_deref())
                 .await
@@ -3282,12 +3375,15 @@ async fn handle_request(
             // workspace default cwd/env permanently — the UI believes it opened
             // a worktree or subagent shell while the backend already decided
             // otherwise. Identity belongs to whoever supplies cwd/worktree/env.
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let term = terminal::terminal_id(&payload);
             // WHO this pane belongs to (#149): a child session when the request
             // names one, otherwise the thread. Parsed per request so a subagent
             // addresses its own PTY instead of silently getting the parent's.
-            let owner = terminal::TerminalOwner::parse(&payload);
+            let owner = match terminal::TerminalOwner::parse(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalEvents: {e}")),
+            };
+            let thread = owner.thread_id().unwrap_or("").to_string();
             // Terminal-events fanout is on the SDK's generic named-topic
             // seam; the pump below carries every lifecycle frame to this
             // subscriber. Attach BEFORE snapshotting so no frame published
@@ -3331,7 +3427,11 @@ async fn handle_request(
         "subscribeTerminalMetadata" => {
             // EVERY pane open for this thread, not a hard-coded single id: a
             // multi-pane UI lists what actually exists (#118).
-            let thread = payload.get("threadId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let thread_owner = match terminal::TerminalOwner::parse_thread(&payload) {
+                Ok(owner) => owner,
+                Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}")),
+            };
+            let thread = thread_owner.thread_id().unwrap_or("").to_string();
             // the agent's shell is always listed — it is the pane a human most
             // wants to find, and it exists whether or not anyone opened it.
             // This subscription is thread-scoped by contract: it projects the
@@ -3339,7 +3439,6 @@ async fn handle_request(
             // owner and are deliberately not folded in here (#149) — doing so
             // would put them in the parent's drawer, which is the ownership
             // boundary the finding is about.
-            let thread_owner = terminal::TerminalOwner::thread(&thread);
             let _ = state.terminals.open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[]).await;
             let now = now_iso();
             let mut rows = Vec::new();
@@ -3382,7 +3481,13 @@ async fn handle_request(
             // rule the live shell snapshot follows, #299): a client that
             // resumes from this mark reads events at seq > mark, whether
             // this snapshot was taken from process A or process B.
-            let mark = state.rt.current_sequence().await;
+            let mark = match state.rt.current_sequence().await {
+                Ok(mark) => mark,
+                Err(e) => {
+                    exit_failure(tx, &id, &format!("getArchivedShellSnapshot: sequence unreadable: {e}"));
+                    return;
+                }
+            };
             // Same durable source as the live shell snapshot (#370),
             // fail-closed on a read error (#374). Silent `projects: []`
             // in a schema-valid archived snapshot alongside durable
@@ -3539,17 +3644,9 @@ async fn handle_request(
                 Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
                     let thread_id =
                         command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                    // foreground-only: this never touches the shell itself, so a
-                    // stop cannot kill the session's PTY out from under it.
-                    let shell_out = state.terminal.interrupt().await;
-                    let stopped = if kind == "thread.session.stop" {
-                        state.rt.stop(&thread_id).await
-                    } else {
-                        state.rt.interrupt(&thread_id).await
-                    };
-                    match stopped {
+                    match stop_thread_checked(&state, &thread_id, kind).await {
                         Ok(sessions) => tracing::info!(
-                            %thread_id, %kind, sessions = sessions.len(), %shell_out, "stop dispatched"
+                            %thread_id, %kind, sessions = sessions.len(), "stop dispatched"
                         ),
                         Err(e) => tracing::error!(%thread_id, %kind, %e, "stop failed"),
                     }

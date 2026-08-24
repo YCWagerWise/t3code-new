@@ -258,6 +258,7 @@ fn checkpoint_thread(id: &str) -> Value {
         "id": id,
         "projectId": "p-workspace",
         "title": id,
+        "runtimeMode": "full-access",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     })
@@ -864,6 +865,64 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
     assert!(f.iter().all(|x| x["_tag"] != "Exit"), "attach is a stream, not terminated");
 }
 
+/// Terminal owner is a backend contract boundary. A request without a
+/// non-empty `sessionId` or `threadId` must not fall into the durable `thread:`
+/// namespace, because that scope is shared by every malformed caller.
+#[tokio::test]
+async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty() {
+    let (state, _d) = test_state().await;
+    let empty_owner = terminal::TerminalOwner::Thread { thread_id: String::new() };
+
+    for (method, payload) in [
+        ("terminal.open", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
+        ("terminal.restart", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
+        ("terminal.attach", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
+        ("terminal.write", json!({ "terminalId": "term-missing", "data": "echo should-not-run\n" })),
+        ("terminal.resize", json!({ "terminalId": "term-missing", "cols": 100, "rows": 40 })),
+        ("terminal.clear", json!({ "terminalId": "term-missing" })),
+        ("terminal.close", json!({ "terminalId": "term-missing" })),
+        ("subscribeTerminalEvents", json!({ "terminalId": "term-missing" })),
+        ("subscribeTerminalMetadata", json!({})),
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, payload).await;
+        let frames = drain(&mut rx);
+        let exit = frames.iter().find(|f| f["_tag"] == "Exit").unwrap_or_else(|| {
+            panic!("{method} must fail immediately instead of parking or mutating thread:: {frames:?}")
+        });
+        assert_eq!(exit["exit"]["_tag"], "Failure", "{method}: {exit}");
+        let why = exit["exit"]["cause"].to_string();
+        assert!(
+            why.contains("sessionId") && why.contains("threadId"),
+            "{method} names the missing owner fields: {why}"
+        );
+        assert!(
+            state.terminals.get(&empty_owner, "term-missing").await.is_none(),
+            "{method} created or mutated a pane under the shared thread: scope"
+        );
+    }
+
+    for method in ["terminal.open", "terminal.attach", "terminal.write", "subscribeTerminalEvents"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            method,
+            json!({ "threadId": "   ", "terminalId": "term-blank", "cwd": state.cwd.clone() }),
+        )
+        .await;
+        let frames = drain(&mut rx);
+        let exit = frames.iter().find(|f| f["_tag"] == "Exit").unwrap_or_else(|| {
+            panic!("{method} with a blank threadId must fail, not park: {frames:?}")
+        });
+        assert_eq!(exit["exit"]["_tag"], "Failure", "{method}: {exit}");
+        assert!(
+            state.terminals.get(&empty_owner, "term-blank").await.is_none(),
+            "{method} treated a blank threadId as thread:"
+        );
+    }
+}
+
 /// The attached pane is EDGE-DRIVEN, and a RECONNECTING pane is too.
 ///
 /// The tails used to sample the screen on a 200ms/500ms timer, which both
@@ -1248,7 +1307,7 @@ async fn model_selection_with_invalid_option_is_refused_visibly() {
 async fn a_whitespace_only_turn_is_refused_before_anything_mutates() {
     let (state, _d) = test_state().await;
     let threads_before = state.rt.threads().await.len();
-    let seq_before = state.rt.current_sequence().await;
+    let seq_before = state.rt.current_sequence().await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -1273,7 +1332,7 @@ async fn a_whitespace_only_turn_is_refused_before_anything_mutates() {
         "a refused turn must not announce a thread"
     );
     assert_eq!(
-        state.rt.current_sequence().await,
+        state.rt.current_sequence().await.unwrap(),
         seq_before,
         "a refused turn must not consume an event sequence"
     );
@@ -2057,7 +2116,7 @@ async fn an_unimplemented_subscription_fails_instead_of_hanging() {
 
     // and the implemented terminal streams answer for real
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({})).await;
+    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-implemented" })).await;
     assert!(!drain(&mut rx).is_empty(), "terminal metadata is implemented and emits");
 }
 
@@ -2826,7 +2885,7 @@ async fn a_successful_command_acks_once_and_the_change_is_durable() {
 #[tokio::test]
 async fn a_project_update_is_replayable_by_a_client_that_was_away() {
     let (state, _d) = test_state().await;
-    let mark = state.rt.shell_sequence().await;
+    let mark = state.rt.shell_sequence().await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "orchestration.dispatchCommand", json!({
@@ -4137,7 +4196,41 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
 /// failures are DISTINGUISHABLE.
 #[tokio::test]
 async fn filesystem_browse_and_open_in_editor_are_implemented() {
-    let (state, dir) = test_state().await;
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_editor = bin.join("mate");
+    std::fs::write(&fake_editor, "#!/bin/sh\necho editor \"$1\"\nsleep 30\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake_editor).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_editor, perms).unwrap();
+    }
+    let old_path = std::env::var_os("PATH");
+    let mut paths = vec![bin.clone()];
+    if let Some(old) = old_path.clone() {
+        paths.extend(std::env::split_paths(&old));
+    }
+    let joined = std::env::join_paths(paths).unwrap();
+    std::env::set_var("PATH", &joined);
+    let _path_guard = EnvGuard { key: "PATH", old: old_path };
+
+    let state = state_at(&dir).await;
     std::fs::create_dir_all(dir.join("alpha")).unwrap();
     std::fs::create_dir_all(dir.join("albatross")).unwrap();
     std::fs::create_dir_all(dir.join("beta")).unwrap();
@@ -4178,19 +4271,22 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
     let msg = bad[0]["exit"]["cause"].to_string();
     assert!(msg.contains("read_directory_failed"), "the failure is classified: {msg}");
 
-    // open-in-editor: an editor this box does not have is a NAMED failure,
-    // not a generic "could not open"
+    // open-in-editor: an installed editor launch crosses hearth, so the result
+    // is a durable job id and the process is observable/killable through the
+    // same background lane as agent commands.
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "shell.openInEditor",
         json!({ "cwd": dir.to_string_lossy(), "editor": "textmate" })).await;
     let f = drain(&mut rx);
-    if f[0]["exit"]["_tag"] == "Failure" {
-        let msg = f[0]["exit"]["cause"].to_string();
-        assert!(
-            msg.contains("not installed") || msg.contains("failed to launch"),
-            "an install problem is distinguishable from a launch problem: {msg}"
-        );
-    }
+    assert_eq!(f[0]["exit"]["_tag"], "Success", "fake textmate is installed: {f:?}");
+    let job_id = f[0]["exit"]["value"]["jobId"].as_str().expect("hearth job id");
+    let jobs = state.terminal.list_jobs().await;
+    assert!(
+        jobs.contains(job_id) && jobs.contains("mate"),
+        "editor launch is visible in hearth jobs: {jobs}"
+    );
+    let killed = state.terminal.kill_job(job_id).await;
+    assert!(killed.contains("killed job"), "editor job is cleanable through hearth: {killed}");
 
     // an editor id the contract does not define is refused outright
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4989,7 +5085,7 @@ async fn a_metadata_change_is_in_the_replay_log_not_only_on_the_bus() {
         "createdAt": now_iso(), "updatedAt": now_iso(),
     });
     state.rt.save_thread(&thread).await.unwrap();
-    let before = state.rt.current_sequence().await;
+    let before = state.rt.current_sequence().await.unwrap();
 
     update_thread_meta(&state, "t-meta", &json!({ "title": "after" }))
         .await
@@ -5028,7 +5124,7 @@ async fn a_settled_approval_is_a_replayable_resolved_activity() {
         "createdAt": now_iso(), "updatedAt": now_iso(),
     });
     state.rt.save_thread(&thread).await.unwrap();
-    let before = state.rt.current_sequence().await;
+    let before = state.rt.current_sequence().await.unwrap();
 
     publish_approval_resolved(&state, "t-appr", "sess|0|call-1", "accept", true).await;
 
@@ -5071,7 +5167,7 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
         "createdAt": now_iso(), "updatedAt": now_iso(),
     });
     state.rt.save_thread(&thread).await.unwrap();
-    let before = state.rt.current_sequence().await;
+    let before = state.rt.current_sequence().await.unwrap();
 
     publish_user_input_resolved(&state, "t-ui", "sess-9").await;
 
@@ -5138,7 +5234,11 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
     // snapshot taken after that read does not contain it, so a tail
     // suppressing `<= mark` would swallow it.
     let mark = snap["values"][0]["snapshot"]["snapshotSequence"].as_i64().unwrap();
-    assert_eq!(mark, state.rt.shell_sequence().await, "the mark is the recorded shell watermark");
+    assert_eq!(
+        mark,
+        state.rt.shell_sequence().await.unwrap(),
+        "the mark is the recorded shell watermark"
+    );
 }
 
 /// PROOF (#370): the shell snapshot's `projects` field comes from the
@@ -5331,7 +5431,7 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
         .as_i64()
         .expect("the fallback snapshot carries a resume mark");
     assert!(
-        mark >= state.rt.thread_sequence("t-big").await,
+        mark >= state.rt.thread_sequence("t-big").await.unwrap(),
         "the mark ({mark}) sits below the thread's recorded watermark — the client would \
          re-request events already in its snapshot"
     );
@@ -5453,7 +5553,9 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     checkpoint_turn_start(&state, &state.cwd, "turn-3").await;
     std::fs::write(&file, "v3\n").unwrap();
 
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd)
+        .await
+        .expect("checkpoint summaries are readable");
     assert_eq!(summaries.len(), 3, "three turns, three checkpoints: {summaries:#?}");
 
     // ORDER: newest first, and turnCount counts from 1 at the newest.
@@ -5576,7 +5678,7 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
     assert_eq!(created["additions"], 1);
 
     // The REVERT the destructive button sends.
-    let before = state.rt.current_sequence().await;
+    let before = state.rt.current_sequence().await.unwrap();
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     request(
         &state,
@@ -5674,7 +5776,9 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
 
     // It is in the summary, because cairn diffs the WORKTREE and not a
     // journal of what the runtime believes it wrote.
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd)
+        .await
+        .expect("checkpoint summaries are readable");
     let cp = summaries.iter().find(|c| c["turnId"] == "turn-oob").expect("the turn's checkpoint");
     let named: Vec<&str> = cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
     assert!(named.contains(&"oob.txt"), "an out-of-band edit must be reviewable: {named:?}");
@@ -5683,7 +5787,9 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     // would see it. The stack is in the repository, so it is still there.
     drop(state);
     let state2 = state_at(&dir).await;
-    let after_restart = checkpoint_summaries(&state2, &state2.cwd).await;
+    let after_restart = checkpoint_summaries(&state2, &state2.cwd)
+        .await
+        .expect("checkpoint summaries survive restart");
     assert!(
         after_restart.iter().any(|c| c["turnId"] == "turn-oob"),
         "the checkpoint must survive the process that took it: {after_restart:?}"
@@ -5752,7 +5858,9 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
     std::fs::write(&marker, "advanced-since\n").unwrap();
 
     // The review does not mention the runtime's files...
-    let summaries = checkpoint_summaries(&state, &state.cwd).await;
+    let summaries = checkpoint_summaries(&state, &state.cwd)
+        .await
+        .expect("checkpoint summaries are readable");
     let cp = summaries.iter().find(|c| c["turnId"] == "turn-scope").expect("the checkpoint");
     let named: Vec<&str> =
         cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
@@ -5933,6 +6041,24 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         json!({ "threadId": "t-q", "fromTurnCount": 0, "toTurnCount": 99 })).await;
     assert_eq!(ex["exit"]["_tag"], "Failure", "a missing checkpoint must not read as no-changes: {ex}");
     assert_eq!(ex["exit"]["cause"][0]["error"]["_tag"], "OrchestrationGetTurnDiffError");
+
+    // A stale thread id is not permission to diff the environment root. The
+    // root has a valid checkpoint above, so the old `thread_cwd` fallback would
+    // have returned Success with t-stale attached to t-q's workspace diff.
+    let ex = call("orchestration.getTurnDiff",
+        json!({ "threadId": "t-stale", "fromTurnCount": 0, "toTurnCount": 1 })).await;
+    assert_eq!(ex["exit"]["_tag"], "Failure", "stale thread must fail before root diff: {ex}");
+    let stale_msg = ex["exit"]["cause"].to_string();
+    assert!(
+        stale_msg.contains("unknown thread") || stale_msg.contains("thread mapping"),
+        "failure names thread mapping authority: {stale_msg}"
+    );
+    revert_checkpoint(&state, "t-stale", 1).await;
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "second\n",
+        "stale-thread revert must not fall back to and rewind the environment root"
+    );
 
     // searchThreads: over the DURABLE message store.
     let ex = call("orchestration.searchThreads", json!({ "query": "parser" })).await;
@@ -6500,6 +6626,71 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
                     .unwrap_or(false)
         }),
         "Interrupt must not exit_failure through the unknown-tag path; got {frames:?}"
+    );
+}
+
+/// #112: the raw Effect `Interrupt` frame is still a request. If the durable
+/// SDK cancel cannot be written, the frame must produce a visible failure
+/// instead of dropping the error while the UI already believes stop landed.
+#[tokio::test]
+async fn ws_interrupt_frame_reports_runtime_interrupt_failure() {
+    use super::dispatch_ws_frame;
+    let (state, dir) = test_state().await;
+
+    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
+        "id": "t-int-fail", "projectId": "p-workspace", "title": "int-fail",
+        "createdAt": now_iso(), "updatedAt": now_iso(),
+    })).await.unwrap();
+
+    let binding = SessionBinding {
+        thread_id: "t-int-fail".into(),
+        provider_instance_id: "claude_resume:test".into(),
+        model_key: "k".into(),
+    };
+    let def = AgentDefinition {
+        name: "t3code".into(),
+        instructions: String::new(),
+        model: ModelRef::ClaudeResume { model: "test".into() },
+        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
+        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+    };
+    state.rt.session_for(&binding, def).await.unwrap();
+    let sid = state
+        .rt
+        .sessions_for_thread("t-int-fail")
+        .await
+        .into_iter()
+        .next()
+        .expect("the interrupt has a bound SDK session to cancel");
+
+    let pool = do_storage::DbPool::new(dir.join("data"));
+    let db = pool.object_db("ShellSession", &sid).await.unwrap();
+    db.execute("DROP TABLE agent_control", vec![]).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    dispatch_ws_frame(
+        json!({
+            "_tag": "Interrupt",
+            "requestId": "r-int-fail",
+            "payload": { "input": { "threadId": "t-int-fail" } },
+        }),
+        &tx,
+        &state,
+    )
+    .await;
+
+    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|(s, _)| serde_json::from_str(&s).unwrap())
+        .collect();
+    let failure = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit" && f["requestId"] == json!("r-int-fail"))
+        .unwrap_or_else(|| panic!("raw Interrupt must answer failure on stop error: {frames:?}"));
+    assert_eq!(failure["exit"]["_tag"], "Failure", "{failure}");
+    let defect = failure["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("interrupt failed") && defect.contains("agent_control"),
+        "failure must name the durable cancel failure, got {failure}"
     );
 }
 

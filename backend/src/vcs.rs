@@ -641,20 +641,23 @@ pub async fn run_stacked_action_with(
 /// store's kv, which would be a second cancellation mechanism sitting next to
 /// the real one with none of its terminate/deadline semantics.
 ///
-/// A read error CONTINUES rather than cancelling. That is the asymmetric
-/// choice on purpose: missing a cancel costs the user a stale progress bar,
-/// while spuriously aborting a `commit_push` between its commit and its push
-/// leaves the repository in the half-done state #138 exists to prevent.
-async fn action_cancelled(cancel: Option<&Control>, action_id: &str) -> bool {
-    let Some(control) = cancel else { return false };
+/// A read error is a refusal, not "not cancelled". This gate is checked only
+/// at phase boundaries, so refusing on unreadable control state does not
+/// interrupt an in-flight git operation; it prevents the next irreversible
+/// phase from starting under unknown cancellation authority.
+async fn action_cancelled(cancel: Option<&Control>, action_id: &str) -> Result<bool, String> {
+    let Some(control) = cancel else { return Ok(false) };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    !matches!(
-        control.check(action_id, now).await,
-        Ok(agent_sdk_do::Checkpoint::Continue) | Err(_)
-    )
+    Ok(!matches!(
+        control
+            .check(action_id, now)
+            .await
+            .map_err(|e| format!("cancel state unreadable for {action_id}: {e}"))?,
+        agent_sdk_do::Checkpoint::Continue
+    ))
 }
 
 /// [`run_stacked_action_streaming`] with the PR provider injected.
@@ -696,6 +699,30 @@ pub async fn run_stacked_action_streaming_with(
     let failed = |phase: Value, message: String| -> Vec<Value> {
         vec![frame(json!({"kind": "action_failed", "phase": phase, "message": message}))]
     };
+    macro_rules! gate_cancel {
+        ($phase:literal) => {
+            match action_cancelled(cancel, &action_id).await {
+                Ok(true) => {
+                    sink(frame(json!({"kind": "action_cancelled", "phase": $phase})));
+                    return Ok(Some((
+                        json!($phase),
+                        "cancelled before this phase started".to_string(),
+                    )));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let (p, m): (Value, String) = (
+                        json!($phase),
+                        format!("could not read cancellation state: {e}"),
+                    );
+                    for f in failed(p.clone(), m.clone()) {
+                        sink(f);
+                    }
+                    return Ok(Some((p, m)));
+                }
+            }
+        };
+    }
     // THE ACTION'S VERDICT, separate from "did the pipeline run" (fail-open fix).
     //
     // Every failure path below emits an `action_failed` FRAME and then returned
@@ -762,10 +789,7 @@ pub async fn run_stacked_action_streaming_with(
     if feature_branch {
         // #278 cancel gate, BEFORE the phase starts. Emitting
         // `phase_started` first would tell the UI a phase began that never ran.
-        if action_cancelled(cancel, &action_id).await {
-            sink(frame(json!({"kind": "action_cancelled", "phase": "branch"})));
-            return Ok(Some((json!("branch"), "cancelled before this phase started".to_string())));
-        }
+        gate_cancel!("branch");
         sink(frame(json!({"kind": "phase_started", "phase": "branch", "label": "Preparing feature ref"})));
         let status = repo.status().await.map_err(|e| e.to_string());
         let Ok(status) = status else {
@@ -808,10 +832,7 @@ pub async fn run_stacked_action_streaming_with(
     if do_commit {
         // #278 cancel gate, BEFORE the phase starts. Emitting
         // `phase_started` first would tell the UI a phase began that never ran.
-        if action_cancelled(cancel, &action_id).await {
-            sink(frame(json!({"kind": "action_cancelled", "phase": "commit"})));
-            return Ok(Some((json!("commit"), "cancelled before this phase started".to_string())));
-        }
+        gate_cancel!("commit");
         sink(frame(json!({"kind": "phase_started", "phase": "commit", "label": "Committing"})));
         let (subject, body) = message.split_once("\n\n").unwrap_or((message, ""));
         if subject.trim().is_empty() {
@@ -856,10 +877,7 @@ pub async fn run_stacked_action_streaming_with(
     if do_push {
         // #278 cancel gate, BEFORE the phase starts. Emitting
         // `phase_started` first would tell the UI a phase began that never ran.
-        if action_cancelled(cancel, &action_id).await {
-            sink(frame(json!({"kind": "action_cancelled", "phase": "push"})));
-            return Ok(Some((json!("push"), "cancelled before this phase started".to_string())));
-        }
+        gate_cancel!("push");
         sink(frame(json!({"kind": "phase_started", "phase": "push", "label": "Pushing"})));
         match repo.push(None).await {
             Ok(r) => push_step = json!({"status": "pushed", "branch": r.branch, "setUpstream": true}),
@@ -880,10 +898,7 @@ pub async fn run_stacked_action_streaming_with(
     if do_pr {
         // #278 cancel gate, BEFORE the phase starts. Emitting
         // `phase_started` first would tell the UI a phase began that never ran.
-        if action_cancelled(cancel, &action_id).await {
-            sink(frame(json!({"kind": "action_cancelled", "phase": "pr"})));
-            return Ok(Some((json!("pr"), "cancelled before this phase started".to_string())));
-        }
+        gate_cancel!("pr");
         sink(frame(json!({"kind": "phase_started", "phase": "pr", "label": "Opening pull request"})));
         // The head ref is read from the repository rather than taken from the
         // request: after the branch phase this is the ref the work is actually
@@ -927,6 +942,50 @@ pub async fn run_stacked_action_streaming_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_do::do_rs::{Error as DoError, Param, Result as DoResult};
+    use agent_sdk_do::ObjectDb;
+    use std::sync::Arc;
+
+    struct FailsControlCheck {
+        inner: Arc<dyn ObjectDb>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectDb for FailsControlCheck {
+        async fn execute(&self, sql: &str, params: Vec<Value>) -> DoResult<u64> {
+            self.inner.execute(sql, params).await
+        }
+
+        async fn execute_typed(&self, sql: &str, params: Vec<Param>) -> DoResult<u64> {
+            self.inner.execute_typed(sql, params).await
+        }
+
+        async fn query_blob(&self, sql: &str, params: Vec<Param>) -> DoResult<Option<Vec<u8>>> {
+            self.inner.query_blob(sql, params).await
+        }
+
+        async fn query(&self, sql: &str, params: Vec<Value>) -> DoResult<Vec<Value>> {
+            if sql.contains(
+                "SELECT cancel_requested, terminated, deadline_ms FROM agent_control",
+            ) {
+                return Err(DoError::Backend("agent_control read failed".into()));
+            }
+            self.inner.query(sql, params).await
+        }
+
+        async fn execute_batch(&self, sql: &str) -> DoResult<()> {
+            self.inner.execute_batch(sql).await
+        }
+
+        fn query_stream<'a>(
+            &'a self,
+            sql: &'a str,
+            params: Vec<Value>,
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = DoResult<Value>> + Send + 'a>>
+        {
+            self.inner.query_stream(sql, params)
+        }
+    }
 
     /// A `Control` over a throwaway isolate, so the cancel flag under test is a
     /// REAL durable row and not a bool the test made up.
@@ -938,6 +997,16 @@ mod tests {
         let db = store.db().clone();
         agent_sdk_do::Control::ensure_schema(&db).await.expect("control schema");
         agent_sdk_do::Control::new(db)
+    }
+
+    async fn scratch_control_db(tag: &str) -> (agent_sdk_do::Control, Arc<dyn ObjectDb>) {
+        let dir = std::env::temp_dir().join(format!("t3-cancel-{tag}-{}", uuid::Uuid::new_v4()));
+        let store = agent_sdk_shell::OrchStore::open_at(dir.to_str().unwrap(), "test")
+            .await
+            .expect("open a scratch orchestration store");
+        let db = store.db().clone();
+        agent_sdk_do::Control::ensure_schema(&db).await.expect("control schema");
+        (agent_sdk_do::Control::new(db.clone()), db)
     }
 
     /// PROOF (#278, cancel half): a cancel requested for an action's id STOPS it
@@ -1023,6 +1092,50 @@ mod tests {
         let kinds: Vec<&str> = frames.iter().filter_map(|f| f["kind"].as_str()).collect();
         assert!(kinds.contains(&"phase_started"), "frames: {frames:?}");
         assert!(!kinds.contains(&"action_cancelled"), "frames: {frames:?}");
+    }
+
+    /// If the durable cancel row cannot be read at a phase boundary, the action
+    /// refuses that phase. Treating the read failure as `Continue` starts work
+    /// after the user has already requested cancellation.
+    #[tokio::test]
+    async fn an_unreadable_cancel_state_fails_closed_before_the_next_phase() {
+        let dir = scratch_repo().await;
+        let cwd = dir.to_str().unwrap();
+        let (control, db) = scratch_control_db("read-fails").await;
+        control.cancel("a-unreadable").await.unwrap();
+        let broken = agent_sdk_do::Control::new(Arc::new(FailsControlCheck { inner: db }));
+
+        let mut frames = Vec::new();
+        let verdict = run_stacked_action_streaming(
+            cwd,
+            &json!({
+                "actionId": "a-unreadable", "cwd": cwd,
+                "action": "commit", "commitMessage": "must not land",
+            }),
+            &mut |f| frames.push(f),
+            Some(&broken),
+        )
+        .await
+        .unwrap();
+
+        let (phase, message) =
+            verdict.expect("unreadable cancel state must be a terminal refusal");
+        assert_eq!(phase, json!("commit"));
+        assert!(
+            message.contains("cancellation state") && message.contains("agent_control"),
+            "verdict reports the unreadable control row: {message}"
+        );
+        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["kind"].as_str()).collect();
+        assert!(kinds.contains(&"action_failed"), "frames: {frames:?}");
+        assert!(
+            !kinds.contains(&"phase_started"),
+            "the commit phase must not start after the cancel-state read failed: {frames:?}"
+        );
+
+        let repo = repo(cwd).await.unwrap();
+        let status = repo.status().await.unwrap();
+        assert!(status.is_dirty(), "the dirty work was not committed: {status:?}");
+        assert!(status.head_commit.is_none(), "no commit was created: {status:?}");
     }
 
     async fn scratch_repo() -> std::path::PathBuf {
