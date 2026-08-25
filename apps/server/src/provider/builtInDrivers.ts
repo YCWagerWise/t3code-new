@@ -1,12 +1,18 @@
 /**
  * BUILT_IN_DRIVERS — the static set of `ProviderDriver`s this build ships with.
  *
- * Every driver here is agent-sdk-rs over ACP: "Claude" and "Codex" are the same
- * runtime (`t3code-agent`) with a different model. There are no vendor-CLI
- * drivers anymore — the provider layer is one model-neutral ACP backend.
+ * "Claude" and "Codex" are one runtime: agent-sdk-rs over ACP (`t3code-agent`) with a
+ * different model. There are no vendor-CLI drivers.
+ *
+ * "Atlas" is not that. It spawns nothing and talks to a running atlas-host over its console
+ * API, with Atlas as the authority for runs, turns and workspaces. It is here because the ACP
+ * runtime the other two need cannot currently be built at all — `cargo build --bin
+ * t3code-agent` fails at manifest resolution on missing `agent-sdk-*` crates — so a host that
+ * already serves a durable contract is the seam that actually works.
  *
  * @module provider/builtInDrivers
  */
+import { AtlasDriver } from "./Drivers/AtlasDriver.ts";
 import { ClaudeDriver, type ClaudeDriverEnv } from "./Drivers/ClaudeDriver.ts";
 import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
 import type { AnyProviderDriver } from "./ProviderDriver.ts";
@@ -24,4 +30,8 @@ export type BuiltInDriversEnv = ClaudeDriverEnv | CodexDriverEnv;
 export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
   CodexDriver,
   ClaudeDriver,
+  // Atlas is not a fourth flavour of the ACP runtime — it is a running host this server talks
+  // to over `/console/v1`, with Atlas as the authority for runs and turns. It spawns nothing,
+  // so it needs none of the agent-sdk env the other two require.
+  AtlasDriver,
 ];
