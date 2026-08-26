@@ -432,7 +432,21 @@ pub async fn load_custom(store: &OrchStore) -> Result<Vec<Rule>, String> {
     else {
         return Err(format!("{KEYBINDINGS_KEY} is malformed: expected an array"));
     };
-    Ok(items.iter().filter_map(Rule::from_wire).collect())
+    // #204: the store-read and top-level-JSON-shape failures above already
+    // fail closed, but this last step used to be `filter_map(Rule::from_wire)`
+    // — a single malformed inner rule silently vanished from the returned set
+    // instead of refusing the whole load. That collapses "storage is
+    // corrupt/migrated wrong" into "the user has fewer bindings than they
+    // saved", with no issue surfaced anywhere the settings UI can show. Name
+    // the first bad rule by index and refuse the whole load, matching the
+    // store/JSON-shape failures above.
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            Rule::from_wire(v).ok_or_else(|| format!("{KEYBINDINGS_KEY} is malformed: rule {i} did not decode"))
+        })
+        .collect()
 }
 
 pub async fn save_custom(store: &OrchStore, rules: &[Rule]) -> Result<(), String> {
@@ -750,13 +764,41 @@ mod tests {
         assert_eq!(last.when.as_deref(), Some(format!("ctx{}", MAX_KEYBINDINGS_COUNT + 9).as_str()));
     }
 
-    /// A corrupt stored blob must not take out the settings page: fall back to
-    /// the working default keyboard.
-    #[test]
-    fn a_corrupt_stored_blob_falls_back_to_defaults() {
-        // `load_custom` decodes exactly this shape; the non-array/garbage paths
-        // return an empty custom set, which `resolved` turns into the defaults.
-        assert!(!default_resolved().is_empty());
+    /// #204: a store that cannot be read, or whose top-level JSON is not an
+    /// array, must refuse the load rather than silently report "no custom
+    /// bindings" — a restart or storage corruption must not make a user's
+    /// saved bindings quietly vanish with no error for the settings UI.
+    #[tokio::test]
+    async fn an_unparseable_stored_blob_refuses_the_load_rather_than_defaulting() {
+        let dir = std::env::temp_dir().join(format!("t3-keybindings-corrupt-{}", uuid::Uuid::new_v4()));
+        let store = OrchStore::open_at(dir.to_str().unwrap(), "test")
+            .await
+            .expect("open a scratch orchestration store");
+        store.put_kv(KEYBINDINGS_KEY, "not json at all").await.unwrap();
+        let err = load_custom(&store)
+            .await
+            .expect_err("malformed top-level JSON must refuse, not default");
+        assert!(err.contains("malformed"), "{err}");
+    }
+
+    /// #204's remaining half: the top-level array can parse fine while ONE
+    /// element inside it does not decode as a `Rule` — that must also refuse
+    /// the whole load (naming which rule), not silently drop just that entry.
+    #[tokio::test]
+    async fn a_single_malformed_rule_refuses_the_whole_load() {
+        let dir = std::env::temp_dir().join(format!("t3-keybindings-badrule-{}", uuid::Uuid::new_v4()));
+        let store = OrchStore::open_at(dir.to_str().unwrap(), "test")
+            .await
+            .expect("open a scratch orchestration store");
+        let blob = json!([
+            {"key": "mod+b", "command": "sidebar.toggle"},
+            {"key": "mod+k"}, // missing `command` — Rule::from_wire returns None
+        ]);
+        store.put_kv(KEYBINDINGS_KEY, &blob.to_string()).await.unwrap();
+        let err = load_custom(&store)
+            .await
+            .expect_err("a rule that cannot decode must refuse the load, not vanish silently");
+        assert!(err.contains("rule 1"), "{err}");
     }
 
     #[test]

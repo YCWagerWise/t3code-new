@@ -162,30 +162,40 @@ fn wire_instance(c: &ProviderInstanceConfig) -> Value {
 }
 
 /// Decode the wire `environment` map into SDK secrets.
-fn parse_environment(v: &Value) -> std::collections::HashMap<String, agent_sdk_provider::SecretValue> {
+/// #263: a malformed secret entry used to be silently DROPPED (`filter_map`)
+/// while the provider instance it belongs to was still accepted — a saved API
+/// key whose shape got corrupted (a bad migration, a client bug) vanished
+/// from the config with no error, and the provider was then reported
+/// "configured" while missing the credential it needs. Fail the whole load
+/// instead: only a genuinely absent `environment` object means "no secrets",
+/// never an entry this function could not decode.
+fn parse_environment(
+    v: &Value,
+) -> Result<std::collections::HashMap<String, agent_sdk_provider::SecretValue>, String> {
     use agent_sdk_provider::SecretValue;
-    v.get("environment")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, val)| {
-                    let secret = match val {
-                        // `{"envVar": "NAME"}` — read from the host at
-                        // construction, which fails closed rather than falling
-                        // through to ambient credentials at call time.
-                        Value::Object(o) => {
-                            let name = o.get("envVar").and_then(Value::as_str)?;
-                            SecretValue::EnvVar { name: name.to_string() }
-                        }
-                        Value::String(s) if s == REDACTED => SecretValue::Redacted,
-                        Value::String(s) => SecretValue::Literal { value: s.clone() },
-                        _ => return None,
-                    };
-                    Some((k.clone(), secret))
-                })
-                .collect()
+    let Some(m) = v.get("environment").and_then(Value::as_object) else {
+        return Ok(std::collections::HashMap::new());
+    };
+    m.iter()
+        .map(|(k, val)| {
+            let secret = match val {
+                // `{"envVar": "NAME"}` — read from the host at construction,
+                // which fails closed rather than falling through to ambient
+                // credentials at call time.
+                Value::Object(o) => {
+                    let name = o
+                        .get("envVar")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("environment.{k} is missing a string envVar"))?;
+                    SecretValue::EnvVar { name: name.to_string() }
+                }
+                Value::String(s) if s == REDACTED => SecretValue::Redacted,
+                Value::String(s) => SecretValue::Literal { value: s.clone() },
+                other => return Err(format!("environment.{k} is not a string or {{envVar}}: {other}")),
+            };
+            Ok((k.clone(), secret))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// A minimal `ServerSettings` wire object: `providerInstances` only. Every other
@@ -210,7 +220,7 @@ pub fn settings_wire(instances: &[ProviderInstanceConfig], other: &Map<String, V
 /// the settings UI keys `providerInstances` BY instance id and does not always
 /// repeat it inside the value, so requiring the inner field silently DROPS a
 /// provider the user just added and answers Success anyway.
-fn parse_instance_keyed(key: &str, v: &Value) -> Option<ProviderInstanceConfig> {
+fn parse_instance_keyed(key: &str, v: &Value) -> Result<Option<ProviderInstanceConfig>, String> {
     let instance_id = v
         .get("instanceId")
         .and_then(Value::as_str)
@@ -219,23 +229,26 @@ fn parse_instance_keyed(key: &str, v: &Value) -> Option<ProviderInstanceConfig> 
         .unwrap_or(key)
         .to_string();
     if instance_id.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let driver = v.get("driver").and_then(Value::as_str)?.to_string();
+    let Some(driver) = v.get("driver").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let driver = driver.to_string();
     let mut config = v.get("config").and_then(Value::as_object).cloned().unwrap_or_default();
     // keep accentColor durable alongside the driver's own config
     if let Some(accent) = v.get("accentColor").and_then(Value::as_str) {
         config.insert("accentColor".into(), json!(accent));
     }
-    Some(ProviderInstanceConfig {
+    Ok(Some(ProviderInstanceConfig {
         instance_id,
         driver: ProviderDriverKind(driver),
         display_name: v.get("displayName").and_then(Value::as_str).map(String::from),
         enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         config,
-        secrets: parse_environment(v),
+        secrets: parse_environment(v)?,
         options: Default::default(),
-    })
+    }))
 }
 
 /// The provider instances to reconcile: the user's saved set if any, else the
@@ -276,14 +289,17 @@ pub async fn save_instances(
 /// Apply an `updateSettings` patch's `providerInstances` over the current set.
 /// The frontend sends the full instance map it wants; each entry replaces (or
 /// adds) by id, and an entry absent from the patch is left untouched.
-pub fn apply_patch(current: &[ProviderInstanceConfig], patch: &Value) -> Vec<ProviderInstanceConfig> {
+pub fn apply_patch(
+    current: &[ProviderInstanceConfig],
+    patch: &Value,
+) -> Result<Vec<ProviderInstanceConfig>, String> {
     let Some(obj) = patch
         .pointer("/patch/providerInstances")
         .or_else(|| patch.get("providerInstances"))
         .and_then(Value::as_object)
     else {
         // `providerInstances` absent from the patch → the set is unchanged.
-        return current.to_vec();
+        return Ok(current.to_vec());
     };
     // PRESENT `providerInstances` is a WHOLE-MAP REPLACEMENT, not a merge: the
     // UI deletes/resets a provider by sending the map WITHOUT that key
@@ -292,17 +308,22 @@ pub fn apply_patch(current: &[ProviderInstanceConfig], patch: &Value) -> Vec<Pro
     // provider stays saved, stays in the reconciled catalog, and reappears in
     // the picker (#94). Boot defaults are re-established under this set at
     // load/reconcile, so stock providers can't be lost, only customs.
+    //
+    // #263: a malformed entry (bad secret shape) must FAIL the whole patch,
+    // not be silently dropped — a `filter_map` here would accept the request
+    // while quietly discarding the one instance whose secrets did not decode.
     obj.iter()
-        .filter_map(|(key, entry)| parse_instance_keyed(key, entry))
+        .filter_map(|(key, entry)| parse_instance_keyed(key, entry).transpose())
         .map(|incoming| {
+            let incoming = incoming?;
             // A REDACTED secret coming back means "unchanged", so merge it
             // against what we already hold. Without this a settings round trip
             // through a client that never saw the secret would CLEAR it — the
             // exact data loss the redaction placeholder exists to prevent.
-            match current.iter().find(|c| c.instance_id == incoming.instance_id) {
+            Ok(match current.iter().find(|c| c.instance_id == incoming.instance_id) {
                 Some(stored) => incoming.rehydrate_from(stored),
                 None => incoming,
-            }
+            })
         })
         .collect()
 }
@@ -355,7 +376,7 @@ mod env_tests {
     fn provider_environment_round_trips_without_leaking_or_clearing() {
         let saved = apply_patch(&[], &json!({"patch": {"providerInstances": {
             "ollama_local": wire(json!({"OPENAI_API_KEY": "sk-secret"})),
-        }}}));
+        }}})).unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].secrets.len(), 1, "the env var was stored: {:?}", saved[0].secrets);
         assert_eq!(saved[0].config.get("accentColor").and_then(Value::as_str), Some("#ff8800"));
@@ -370,7 +391,7 @@ mod env_tests {
         // the client re-saves what it was shown (redacted) — the key SURVIVES
         let round = apply_patch(&saved, &json!({"patch": {"providerInstances": {
             "ollama_local": inst,
-        }}}));
+        }}})).unwrap();
         match round[0].secrets.get("OPENAI_API_KEY") {
             Some(agent_sdk_provider::SecretValue::Literal { value }) => {
                 assert_eq!(value, "sk-secret", "a redacted round trip must not clear the key")
@@ -381,7 +402,7 @@ mod env_tests {
         // an explicit deletion IS honoured — removal is not redaction
         let cleared = apply_patch(&round, &json!({"patch": {"providerInstances": {
             "ollama_local": wire(json!({})),
-        }}}));
+        }}})).unwrap();
         assert!(cleared[0].secrets.is_empty(), "an explicit deletion is honoured");
     }
 
@@ -425,12 +446,31 @@ mod env_tests {
     fn an_env_var_reference_stays_a_reference() {
         let saved = apply_patch(&[], &json!({"patch": {"providerInstances": {
             "x": wire(json!({"KEY": {"envVar": "MY_HOST_VAR"}})),
-        }}}));
+        }}})).unwrap();
         match saved[0].secrets.get("KEY") {
             Some(agent_sdk_provider::SecretValue::EnvVar { name }) => assert_eq!(name, "MY_HOST_VAR"),
             other => panic!("{other:?}"),
         }
         let shown = settings_wire(&saved, &Map::new());
         assert_eq!(shown["providerInstances"]["x"]["environment"]["KEY"]["envVar"], "MY_HOST_VAR");
+    }
+
+    /// #263: a malformed secret entry must fail the WHOLE patch, not be
+    /// silently dropped while the provider instance is still accepted.
+    #[test]
+    fn a_malformed_secret_entry_refuses_the_whole_patch() {
+        // number, not a string or {envVar}
+        let err = apply_patch(&[], &json!({"patch": {"providerInstances": {
+            "x": wire(json!({"KEY": 12345})),
+        }}}))
+        .expect_err("a malformed secret value must not be silently dropped");
+        assert!(err.contains("KEY"), "{err}");
+
+        // object missing the required envVar field
+        let err2 = apply_patch(&[], &json!({"patch": {"providerInstances": {
+            "x": wire(json!({"KEY": {"notEnvVar": "x"}})),
+        }}}))
+        .expect_err("a malformed envVar object must not be silently dropped");
+        assert!(err2.contains("KEY"), "{err2}");
     }
 }

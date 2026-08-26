@@ -506,6 +506,7 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .ok_or("repository is required")?;
+    validate_repository_name(repository)?;
     let provider = input.get("provider").and_then(Value::as_str).unwrap_or("github");
     if provider != "github" {
         return Err(format!(
@@ -513,7 +514,9 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         ));
     }
     let visibility = input.get("visibility").and_then(Value::as_str).unwrap_or("private");
+    validate_visibility(visibility)?;
     let remote_name = input.get("remoteName").and_then(Value::as_str).unwrap_or("origin");
+    validate_remote_name(remote_name)?;
 
     let repo = crate::vcs::open(cwd).await.ok_or("cwd is not a git repository")?;
     let branch = repo
@@ -667,6 +670,64 @@ mod tests {
         assert_eq!(v["auth"]["status"], "unknown", "not unauthenticated");
         assert_eq!(opt(&v["detail"]), Some("install the thing"));
         assert_eq!(v["version"]["_tag"], "None");
+    }
+
+    // #172/#189/#225: flag-shaped `repository`/`visibility`/`remoteName` must
+    // never reach `gh repo create` argv construction.
+    #[test]
+    fn flag_shaped_repository_names_are_refused() {
+        for bad in ["--template", "--add-readme", "-x", ""] {
+            assert!(validate_repository_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        for ok in ["my-repo", "owner/my-repo", "a.b_c-d"] {
+            assert!(validate_repository_name(ok).is_ok(), "{ok:?} should be admitted");
+        }
+    }
+
+    #[test]
+    fn only_the_closed_visibility_enum_is_admitted() {
+        for ok in ["public", "private", "internal"] {
+            assert!(validate_visibility(ok).is_ok());
+        }
+        for bad in ["disable-issues", "disable-wiki", "--template", ""] {
+            assert!(validate_visibility(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn flag_shaped_remote_names_are_refused() {
+        for bad in ["--add-readme", "--template", "bad name", "", "  origin", "a..b", "x/"] {
+            assert!(validate_remote_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        for ok in ["origin", "upstream", "my-remote_1"] {
+            assert!(validate_remote_name(ok).is_ok(), "{ok:?} should be admitted");
+        }
+    }
+
+    /// End-to-end: `publish_repository` itself must refuse a flag-shaped field
+    /// before it ever reaches `gh`, not merely at the unit-tested helper.
+    #[tokio::test]
+    async fn publish_repository_refuses_flag_shaped_fields_before_running_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        for (field, value) in [
+            ("repository", "--template"),
+            ("visibility", "disable-issues"),
+            ("remoteName", "--add-readme"),
+        ] {
+            let mut input = json!({
+                "cwd": cwd,
+                "repository": "safe-repo",
+                "provider": "github",
+                "visibility": "private",
+                "remoteName": "origin",
+            });
+            input[field] = json!(value);
+            let err = publish_repository(&input, &cwd)
+                .await
+                .expect_err(&format!("{field}={value:?} must be refused"));
+            assert!(!err.is_empty());
+        }
     }
 
     /// Configured-but-unverified credentials are `unknown`, not authenticated —

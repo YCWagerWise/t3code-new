@@ -2433,7 +2433,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(current) => current,
                 Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
             };
-            let next = settings::apply_patch(&current, &payload);
+            let next = match settings::apply_patch(&current, &payload) {
+                Ok(next) => next,
+                Err(e) => return exit_failure(tx, &id, &format!("malformed providerInstances patch: {e}")),
+            };
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
                 return;
@@ -2752,7 +2755,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // no approvals when the store is damaged hides a parked run
                 // behind a UI that looks idle, so the subscription errors
                 // instead of quietly rendering a lie.
-                let pending = match state.rt.pending_approvals(thread_id).await {
+                // #293: the TYPED projection, not raw row access. Every field
+                // is decoded and validated in the SDK (agent-sdk-shell); a row
+                // this cannot decode is a projection error here, not a shaped
+                // lie with sessionId="" turn=0 and a fabricated createdAt.
+                let pending = match state.rt.pending_approvals_typed(thread_id).await {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::error!(%e, %thread_id, "pending approvals unreadable");
@@ -2777,17 +2784,17 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 let mut activities: Vec<Value> = pending
                     .iter()
                     .map(|a| {
+                        let created_at = chrono::DateTime::from_timestamp(a.created_at_secs, 0)
+                            .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                            .unwrap_or_else(|| now.clone());
                         approval_requested_activity(
-                            a["sessionId"].as_str().unwrap_or(""),
-                            a["turn"].as_i64().unwrap_or(0),
-                            a["call_id"]
-                                .as_str()
-                                .or_else(|| a["callId"].as_str())
-                                .unwrap_or(""),
-                            a["tool"].as_str().unwrap_or(""),
-                            a.get("args").unwrap_or(&Value::Null),
+                            &a.session_id,
+                            a.turn,
+                            &a.call_id,
+                            a.tool.as_deref().unwrap_or(""),
+                            &a.args,
                             None,
-                            &now,
+                            &created_at,
                         )
                     })
                     .collect();
@@ -3441,18 +3448,24 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 // and reports whether it was the last one
                                 // anywhere; it releases the mark itself in that
                                 // case, so the claim and the mark cannot drift.
+                                // #247: bounded retry at the SDK layer instead
+                                // of a single best-effort attempt — a transient
+                                // db lock at close time no longer strands the
+                                // claim on the first failure.
                                 match state_close
                                     .rt
-                                    .watch_unclaim("vcs", &cwd_close, &sub_id)
+                                    .watch_unclaim_retrying("vcs", &cwd_close, &sub_id, 5)
                                     .await
                                 {
                                     Ok(true) => state_close
                                         .vcs_watch_changed
                                         .send_modify(|v| *v = v.wrapping_add(1)),
                                     Ok(false) => {}
-                                    Err(e) => tracing::warn!(
+                                    Err(e) => tracing::error!(
                                         %e, cwd = %cwd_close,
-                                        "could not release the vcs watch claim"
+                                        "could not release the vcs watch claim after retries — \
+                                         this claim is now durably stuck until this scope's \
+                                         watchers are swept or manually reconciled"
                                     ),
                                 }
                             },
@@ -4634,7 +4647,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 .respond_to_approval(&session, turn, &call_id, allow)
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(true) => {
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     if let Err(e) = publish_approval_resolved(
@@ -4645,6 +4658,32 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                         exit_failure(tx, &id, &format!("approval settlement projection failed: {e}"));
                                         return;
                                     }
+                                }
+                                // #261: `Ok(false)` means no pending approval row
+                                // was durably answered — a stale or already-
+                                // consumed session/turn/callId. This used to be
+                                // matched by `Ok(_)` and treated identically to a
+                                // real success: the reducer would show the
+                                // approval resolved and clear the banner while
+                                // the agent, still genuinely parked, never
+                                // received an answer. Route it through the same
+                                // failure path as a delivery error.
+                                Ok(false) => {
+                                    tracing::warn!(
+                                        %request_id, %session, turn, %call_id,
+                                        "respond_to_approval answered no pending row — stale or already-consumed approval"
+                                    );
+                                    let detail = "this approval is no longer pending and could not be answered";
+                                    if let Err(projection) = publish_approval_failed(
+                                        &state, &thread_id_of(&command), &request_id, detail,
+                                    )
+                                    .await
+                                    {
+                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        return;
+                                    }
+                                    exit_failure(tx, &id, detail);
+                                    return;
                                 }
                                 Err(e) => {
                                     // The answer did not land. Saying nothing
