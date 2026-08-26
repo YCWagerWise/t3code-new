@@ -45,6 +45,46 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Decode one wire rule, naming what is wrong with it.
+    ///
+    /// Used for the DURABLE load (#354). The lenient [`from_wire`](Rule::from_wire)
+    /// below is for RPC *input*, where a rejected argument is answered with a
+    /// message and nothing is at stake; a durable row that will not decode is a
+    /// different situation entirely, because `load_custom`'s output is written
+    /// straight back over the source by `save_custom`.
+    fn from_wire_checked(v: &Value, index: usize) -> Result<Self, String> {
+        let field = |name: &str| -> Result<String, String> {
+            match v.get(name) {
+                None => Err(format!("entry {index} has no `{name}`")),
+                Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+                Some(Value::String(_)) => Err(format!("entry {index} has an empty `{name}`")),
+                Some(other) => Err(format!(
+                    "entry {index} has a non-string `{name}` ({})",
+                    match other {
+                        Value::Null => "null",
+                        Value::Bool(_) => "bool",
+                        Value::Number(_) => "number",
+                        Value::Array(_) => "array",
+                        Value::Object(_) => "object",
+                        Value::String(_) => unreachable!(),
+                    }
+                )),
+            }
+        };
+        let key = field("key")?;
+        let command = field("command")?;
+        // `when` keeps the lenient reading deliberately: the contract makes it
+        // optional, an explicit null is the same as absent, and an empty string
+        // is not a valid expression. None of those lose a RULE.
+        let when = v
+            .get("when")
+            .and_then(|w| w.as_str())
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string);
+        Ok(Rule { key, command, when })
+    }
+
     fn from_wire(v: &Value) -> Option<Self> {
         let key = v.get("key")?.as_str()?.trim().to_string();
         let command = v.get("command")?.as_str()?.trim().to_string();
@@ -432,7 +472,30 @@ pub async fn load_custom(store: &OrchStore) -> Result<Vec<Rule>, String> {
     else {
         return Err(format!("{KEYBINDINGS_KEY} is malformed: expected an array"));
     };
-    Ok(items.iter().filter_map(Rule::from_wire).collect())
+    // PER-ITEM DECODE IS FALLIBLE (#354), matching the two blob-level checks
+    // directly above it.
+    //
+    // `filter_map` here was not merely lossy — it was lossy into a
+    // READ-MODIFY-WRITE. `server.upsertKeybinding` loads this set, adds one
+    // rule, and `save_custom` writes the WHOLE ARRAY back. So a user with ten
+    // shortcuts and one malformed durable row who rebinds something unrelated
+    // got nine rules back, ten written, and the malformed one PERMANENTLY
+    // DESTROYED — silently, with the RPC reporting success, by an action they
+    // would never connect to it. Before the edit that row was corrupt but
+    // present and fixable by hand; after it, it was gone.
+    //
+    // So the load refuses, naming the entry. Dropping the bad row and writing
+    // back "cleaned" data would be the same destruction with a tidier name:
+    // deleting a user's configuration has to be a decision someone makes, not a
+    // side effect of rebinding an unrelated key. The caller at
+    // `server_main.rs` already has the branch for this — it answers
+    // `keybindings unreadable: {e}` — so the error only had to reach it.
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| Rule::from_wire_checked(v, i))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|e| format!("{KEYBINDINGS_KEY} is malformed: {e}"))
 }
 
 pub async fn save_custom(store: &OrchStore, rules: &[Rule]) -> Result<(), String> {
@@ -754,8 +817,13 @@ mod tests {
     /// the working default keyboard.
     #[test]
     fn a_corrupt_stored_blob_falls_back_to_defaults() {
-        // `load_custom` decodes exactly this shape; the non-array/garbage paths
-        // return an empty custom set, which `resolved` turns into the defaults.
+        // The comment here described behaviour `load_custom` has not had for a
+        // while and never had after #354: garbage JSON, a non-array blob and now
+        // a malformed ENTRY are all `Err`, not an empty custom set. What this
+        // test actually pins — and the assertion is unchanged — is the other
+        // half: with NO custom rules the resolved keyboard is still the full set
+        // of defaults, which is what an empty custom set has to produce for the
+        // no-stored-blob case to be usable.
         assert!(!default_resolved().is_empty());
     }
 

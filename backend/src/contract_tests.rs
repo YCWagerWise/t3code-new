@@ -471,6 +471,54 @@ where
     out
 }
 
+/// Drain until `pred` matches, or until the stream goes IDLE for `idle` with
+/// nothing new arriving.
+///
+/// A fixed wall-clock deadline is the wrong instrument for "did the subscriber
+/// receive everything". Under load a slow-but-correct stream and a stream that
+/// genuinely dropped events look identical: both leave the predicate unmatched
+/// when the clock runs out, and the caller then reports the missing tail as a
+/// LOST EVENT — a false claim about the invariant, and the reason
+/// `events_published_inside_subscribe_thread_are_never_skipped` failed roughly
+/// one full-suite run in three on a busy box while passing every time in
+/// isolation.
+///
+/// Idleness distinguishes them without guessing at a budget: as long as frames
+/// keep arriving, delivery is working and we keep reading no matter how loaded
+/// the machine is. Only a stream that has stopped producing for `idle` without
+/// satisfying `pred` has actually failed, and that is a real finding rather
+/// than a timing artifact. `cap` remains as a backstop so a genuinely
+/// stuck-but-chattering stream cannot hang the suite forever.
+async fn drain_until_idle<F>(
+    rx: &mut mpsc::UnboundedReceiver<OutFrame>,
+    idle: std::time::Duration,
+    cap: std::time::Duration,
+    pred: F,
+) -> (Vec<Value>, bool)
+where
+    F: Fn(&Value) -> bool,
+{
+    let start = std::time::Instant::now();
+    let mut out: Vec<Value> = vec![];
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        let before = out.len();
+        out.extend(drain(rx));
+        if out.len() > before {
+            last_progress = std::time::Instant::now();
+        }
+        if out.iter().any(&pred) {
+            return (out, true);
+        }
+        if last_progress.elapsed() >= idle || start.elapsed() >= cap {
+            out.extend(drain(rx));
+            let matched = out.iter().any(&pred);
+            return (out, matched);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Write a user prompt the way `run_turn_with_prompt_id` does, for tests
 /// that exercise thread bootstrap without running a turn.
 async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: &str) {
@@ -6838,9 +6886,18 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
-            carries(v, last)
-        })
+        // Read until the tail arrives or the stream goes quiet — NOT until a
+        // fixed 15s clock expires. On a loaded box (a full release suite plus
+        // whatever else shares the machine) 120 durable publishes and their
+        // fanout can outlive any fixed budget, and the old form then reported
+        // the undelivered tail as events that "never reached the subscriber",
+        // which is a different claim entirely.
+        let (seen, reached_tail) = drain_until_idle(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(120),
+            |v| carries(v, last),
+        )
         .await;
         // The mark the client was told it holds through. The resume path
         // sends no snapshot, so it is the `afterSequence` the client asked
@@ -6859,6 +6916,16 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
             "[{label}] {} event(s) above the advertised mark {mark} never reached the \
              subscriber: {missing:?}",
             missing.len()
+        );
+        // Stated separately, because it is a DIFFERENT failure: the gap check
+        // above is about events skipped over, this one is about the stream
+        // stopping short. Collapsing them is what let a slow machine be
+        // reported as a lost-event defect.
+        assert!(
+            reached_tail,
+            "[{label}] the stream went idle for 5s without ever delivering the last \
+             published event ({last}); {} frame(s) arrived and none carried it",
+            seen.len()
         );
     }
 }
@@ -10500,4 +10567,301 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
         found.len() * 5
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PROOF (#261): `respond_to_approval` returning `Ok(false)` is a FAILED
+/// approval at the T3 command boundary, not a successful one.
+///
+/// `ThreadRuntime::respond_to_approval` returns whether a pending approval row
+/// was durably answered. `false` means the `session|turn|callId` matched
+/// nothing — stale, already consumed, or from a turn that has since ended — so
+/// the agent never received the answer and is still parked. The handler used to
+/// match `Ok(_)`, which published `approval.resolved` and acked applied: the
+/// banner cleared, a reducer-visible resolved activity was written, and the run
+/// stayed blocked with nobody looking at it.
+#[tokio::test]
+async fn an_approval_that_matched_no_pending_request_fails_the_rpc() {
+    let (state, _d) = test_state().await;
+    let thread_id = "t-approval-absent";
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": thread_id, "projectId": "p-workspace", "title": "absent approval",
+            "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+
+    // A REAL session, so the approval schema exists and the absent-row case is
+    // what is being tested rather than a missing table.
+    let binding = SessionBinding {
+        thread_id: thread_id.into(),
+        provider_instance_id: "claude_resume:test".into(),
+        model_key: "k".into(),
+    };
+    let def = AgentDefinition {
+        name: "t3code".into(),
+        instructions: String::new(),
+        model: ModelRef::ClaudeResume { model: "test".into() },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
+        cwd: Some(state.cwd.clone()),
+    };
+    let session_id = state.rt.session_for(&binding, def).await.unwrap();
+
+    // A well-FORMED request id (so the routing guard above it is not what
+    // fails) that names an approval nobody is holding.
+    let request_id = format!("{session_id}|7|call-nobody");
+    assert!(
+        !state
+            .rt
+            .respond_to_approval(&session_id, 7, "call-nobody", true)
+            .await
+            .expect("answering an absent approval is not an error, it is a false"),
+        "precondition: the SDK reports Ok(false) for an approval nobody is holding"
+    );
+
+    let tail = state.rt.tail(thread_id).await.expect("tail the thread");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.approval.respond",
+            "threadId": thread_id,
+            "requestId": request_id.clone(),
+            "decision": "accept",
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap_or_else(|| panic!("the request must terminate: {frames:?}"));
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an approval that answered nothing must fail the RPC: {exit}"
+    );
+    let rendered = serde_json::to_string(&frames).unwrap();
+    assert!(
+        rendered.contains("no longer pending"),
+        "the failure must say WHY the answer did not land: {rendered}"
+    );
+
+    // …and nothing on the wire or in the durable log says this approval
+    // resolved. That activity is what clears the client's banner.
+    assert!(
+        !rendered.contains("approval.resolved"),
+        "an undelivered approval must not be published as resolved: {rendered}"
+    );
+    let mut published = vec![];
+    for _ in 0..3 {
+        match tail.next(std::time::Duration::from_millis(500)).await {
+            Ok(items) if !items.is_empty() => published.extend(items),
+            _ => break,
+        }
+    }
+    assert!(
+        !published
+            .iter()
+            .any(|(_, i)| i["event"]["payload"]["activity"]["kind"] == "approval.resolved"),
+        "no durable approval.resolved activity may exist for an approval nobody answered: {published:?}"
+    );
+}
+
+/// PROOF (#267): when the durable SDK cancel fails, the shared PTY is never
+/// interrupted, and the command-route RPC fails.
+///
+/// A stop has two legs. The old helper fired hearth's foreground interrupt
+/// FIRST and the SDK cancel second, reporting both. That is the worst possible
+/// ordering: a bash command the user did not ask to kill is dead, the turn is
+/// still durably running because `agent_control` was never written, and nothing
+/// records that anyone tried to stop it. Killing a foreground process is not a
+/// side effect worth paying for authority the runtime never obtained — so the
+/// durable cancel goes first, and a failed cancel means the PTY is left alone.
+#[tokio::test]
+async fn a_failed_durable_cancel_never_touches_the_shared_pty() {
+    let (state, _d) = test_state().await;
+    let thread_id = "t-stop-no-pty";
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": thread_id, "projectId": "p-workspace", "title": "stop ordering",
+            "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
+    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+
+    // Break the durable cancel the same way #112's regression does: the row
+    // `interrupt`/`stop` reads is gone, so the SDK leg cannot land.
+    {
+        use agent_sdk_do::ObjectDb;
+        state
+            .rt
+            .store()
+            .db()
+            .execute("DROP TABLE thread_session", vec![])
+            .await
+            .unwrap();
+    }
+
+    // A REAL foreground command in the shared PTY. This is the thing the old
+    // ordering killed: an interrupt reaching this shell cuts it short and
+    // `SURVIVED` never prints.
+    let pty = state.terminal.clone();
+    let foreground =
+        tokio::spawn(async move { pty.run("sleep 3; echo SURVIVED", false, Some(30), false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The EXPLICIT COMMAND route, not the raw Interrupt frame.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.interrupt",
+            "threadId": thread_id,
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap_or_else(|| panic!("the stop request must terminate: {frames:?}"));
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a stop whose durable cancel failed must fail the RPC: {exit}"
+    );
+    let rendered = serde_json::to_string(&frames).unwrap();
+    assert!(
+        rendered.contains("runtime cancel failed"),
+        "the failure must name the leg that failed: {rendered}"
+    );
+
+    // THE ASSERTION THAT MATTERS: the user's foreground command is untouched.
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), foreground)
+        .await
+        .expect("the foreground command must finish, not hang")
+        .expect("the foreground task did not panic");
+    assert!(
+        out.output.contains("SURVIVED"),
+        "a failed durable cancel must not interrupt the shared PTY: {out:?}"
+    );
+}
+
+/// PROOF (#354): a malformed keybinding row SURVIVES an unrelated rebind.
+///
+/// `load_custom` used to `filter_map` malformed entries away, and its output is
+/// written straight back over the source by `save_custom`. So a user with a
+/// corrupt durable row who rebound something else got the corrupt row
+/// PERMANENTLY DESTROYED — silently, with the RPC reporting success.
+///
+/// The assertion that matters is NOT that the RPC errors. It is that the
+/// durable blob still holds all three entries afterwards: only reading the
+/// store back proves the row survived.
+#[tokio::test]
+async fn a_malformed_keybinding_row_is_not_destroyed_by_rebinding_another_key() {
+    let (state, _d) = test_state().await;
+    let store = state.rt.store();
+
+    // Three rules; the MIDDLE one has a non-string `command`.
+    let seeded = json!([
+        {"key": "mod+1", "command": "pane.first"},
+        {"key": "mod+2", "command": {"oops": "this was a partial write"}},
+        {"key": "mod+3", "command": "pane.third"},
+    ]);
+    store
+        .put_kv("server_settings:keybindings", &serde_json::to_string(&seeded).unwrap())
+        .await
+        .unwrap();
+
+    // An edit to a completely unrelated key.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "server.upsertKeybinding",
+        json!({"key": "mod+shift+b", "command": "sidebar.toggle"}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap_or_else(|| panic!("the request must terminate: {frames:?}"));
+
+    // The RPC refuses rather than quietly rewriting a partial set…
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "an unreadable keybinding set must not be silently rewritten: {exit}"
+    );
+    let rendered = serde_json::to_string(&frames).unwrap();
+    assert!(
+        rendered.contains("entry 1"),
+        "the error must name WHICH entry is bad so the user can fix it: {rendered}"
+    );
+
+    // …and THIS is the property under test: the durable row is untouched.
+    let raw = store
+        .kv("server_settings:keybindings")
+        .await
+        .unwrap()
+        .expect("the keybindings blob still exists");
+    let stored: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        stored.as_array().map(|a| a.len()),
+        Some(3),
+        "the malformed entry must still be there — destroying a user's configuration \
+         has to be a decision someone makes, not a side effect of rebinding an \
+         unrelated key: {stored}"
+    );
+    assert_eq!(stored, seeded, "the blob is byte-for-byte what was there: {stored}");
+}
+
+/// The guard must not break the normal path: a WELL-FORMED custom set still
+/// loads, still merges, and an unrelated rebind still lands.
+#[tokio::test]
+async fn a_well_formed_custom_set_still_accepts_an_unrelated_rebind() {
+    let (state, _d) = test_state().await;
+    let store = state.rt.store();
+    store
+        .put_kv(
+            "server_settings:keybindings",
+            &serde_json::to_string(&json!([{"key": "mod+1", "command": "pane.first"}])).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "server.upsertKeybinding",
+        json!({"key": "mod+shift+b", "command": "sidebar.toggle"}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let exit = frames.iter().find(|f| f["_tag"] == "Exit").unwrap();
+    assert_eq!(exit["exit"]["_tag"], "Success", "a readable set still rebinds: {exit}");
+
+    let raw = store.kv("server_settings:keybindings").await.unwrap().unwrap();
+    let stored: Value = serde_json::from_str(&raw).unwrap();
+    let cmds: Vec<&str> =
+        stored.as_array().unwrap().iter().filter_map(|r| r["command"].as_str()).collect();
+    assert!(cmds.contains(&"pane.first"), "the existing rule survived: {stored}");
+    assert!(cmds.contains(&"sidebar.toggle"), "the new rule landed: {stored}");
 }

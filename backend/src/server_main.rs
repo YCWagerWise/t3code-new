@@ -1729,37 +1729,38 @@ async fn stop_thread_checked(
     thread_id: &str,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    // A stop has TWO legs — hearth's foreground interrupt and the SDK's durable
-    // cancel — and they fail independently. Short-circuiting on the first one
-    // let a dead PTY mask an unwritten durable cancel: the user saw "stop
-    // failed" for the shell while the turn kept running with nothing recorded.
-    // So attempt both, and report every leg that failed.
-    let shell = terminal::interrupt(&state.terminal)
-        .await
-        .map_err(|e| format!("terminal interrupt failed: {e}"));
-    let runtime = if kind == "thread.session.stop" {
+    // A stop has TWO legs — the SDK's durable cancel and hearth's foreground
+    // interrupt — and the ORDER between them is the contract, not a detail
+    // (#267).
+    //
+    // Running them concurrently-and-reporting-both (the previous shape) meant
+    // the shared PTY could receive Ctrl-C while the durable cancel failed to
+    // write. That is the worst of the three outcomes: a bash command the user
+    // did not ask to kill is dead, the turn is still durably running, and
+    // nothing in agent_control records that anyone tried to stop it. Killing
+    // someone's foreground process is not a side effect worth paying for
+    // authority the runtime never obtained.
+    //
+    // So: durable cancel FIRST. Only once the SDK has actually recorded the
+    // cancellation is the PTY touched. If the SDK leg fails the PTY is never
+    // interrupted at all, and the caller is told which leg failed.
+    let sessions = if kind == "thread.session.stop" {
         state.rt.stop(thread_id).await
     } else {
         state.rt.interrupt(thread_id).await
     }
-    .map_err(|e| format!("runtime cancel failed: {e}"));
+    .map_err(|e| format!("runtime cancel failed: {e}"))?;
 
-    let (shell_out, sessions) = match (shell, runtime) {
-        (Ok(out), Ok(sessions)) => (out, sessions),
-        (shell, runtime) => {
-            let mut legs = Vec::new();
-            if let Err(e) = shell {
-                legs.push(e);
-            }
-            if let Err(e) = runtime {
-                legs.push(e);
-            }
-            return Err(legs.join("; "));
-        }
-    };
-    if shell_out.starts_with("ERROR:") {
-        return Err(format!("terminal interrupt failed: {shell_out}"));
-    }
+    // The durable cancel LANDED. A PTY leg that now fails is still a failure
+    // the caller must see — the user pressed stop and a foreground command is
+    // still running — but it is a partial failure over durable authority that
+    // already exists, so the message says so rather than implying nothing
+    // happened.
+    interrupt_foreground_terminal(&state.terminal).await.map_err(|e| {
+        format!(
+            "runtime cancel landed but the terminal interrupt failed: {e};              a foreground command may still be running"
+        )
+    })?;
     Ok(sessions)
 }
 
@@ -4327,15 +4328,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             return;
                         }
                     };
-                    let shell_out = match interrupt_foreground_terminal(&state.terminal).await {
-                        Ok(out) => out,
-                        Err(e) => {
-                            tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
-                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
-                            return;
-                        }
-                    };
-                    tracing::info!(%thread_id, %kind, %shell_out, "stop dispatched");
+                    // NO second interrupt here (#267). `stop_thread_checked`
+                    // owns both legs and their order; interrupting the shared
+                    // PTY again from the command route sent a second Ctrl-C to
+                    // whatever had started in the meantime, and did it through
+                    // a path that could not tell the two interrupts apart.
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
                 // and doing nothing was the worst available behaviour — the UI
@@ -4552,7 +4549,34 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 .respond_to_approval(&session, turn, &call_id, allow)
                                 .await
                             {
-                                Ok(_) => {
+                                // `respond_to_approval` returns whether a
+                                // PENDING APPROVAL ROW WAS DURABLY ANSWERED
+                                // (#261). `Ok(false)` is not a success: the
+                                // session|turn|callId matched nothing — stale,
+                                // already consumed, or from a turn that has
+                                // since ended — so the agent never received the
+                                // answer and is still parked. Publishing
+                                // `approval.resolved` here cleared the banner
+                                // and wrote a reducer-visible resolved activity
+                                // for an approval that was never delivered,
+                                // which is the same lie the `Err` arm below
+                                // already refuses to tell.
+                                Ok(false) => {
+                                    tracing::error!(%request_id, "approval matched no pending request");
+                                    let detail =
+                                        "this approval is no longer pending (it was already answered, or its turn has ended)";
+                                    if let Err(projection) = publish_approval_failed(
+                                        &state, &thread_id_of(&command), &request_id, detail,
+                                    )
+                                    .await
+                                    {
+                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        return;
+                                    }
+                                    exit_failure(tx, &id, detail);
+                                    return;
+                                }
+                                Ok(true) => {
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     if let Err(e) = publish_approval_resolved(

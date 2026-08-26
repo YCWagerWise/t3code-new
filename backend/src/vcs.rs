@@ -387,6 +387,11 @@ pub async fn list_refs(cwd: &str, input: &Value) -> Value {
     list_refs_payload(refs, worktrees, default, has_remote)
 }
 
+/// The refs themselves could not be listed. `refs: []` here means UNKNOWN, and
+/// the flag is what says so — `statusUnavailable`/`statusError` used to be
+/// emitted instead, which are fields of the VCS *status* schema and are not in
+/// `VcsListRefsResult` at all, so the client decoder dropped them and read the
+/// payload as a repository with no branches (#258).
 fn refs_unavailable(why: String) -> Value {
     json!({
         "refs": [],
@@ -394,8 +399,8 @@ fn refs_unavailable(why: String) -> Value {
         "hasPrimaryRemote": false,
         "nextCursor": null,
         "totalCount": 0,
-        "statusUnavailable": true,
-        "statusError": why,
+        "refsUnavailable": true,
+        "refsError": why,
     })
 }
 
@@ -409,18 +414,25 @@ fn list_refs_payload(
         Ok(refs) => refs,
         Err(e) => return refs_unavailable(e),
     };
-    let worktrees = match worktrees {
-        Ok(worktrees) => worktrees,
-        Err(e) => return refs_unavailable(e),
-    };
-    let total = refs.len() as i64;
     // Which branch is checked out in which linked worktree. The backend owns
     // this truth: without it the UI cannot disable unsafe operations on a ref
     // another worktree already holds, and cannot route a click to the pane that
     // owns it.
-    let owners: HashMap<String, String> =
-        worktrees.into_iter().map(|w| (w.branch, w.path)).collect();
-    json!({
+    //
+    // When cairn cannot list linked worktrees, an EMPTY owner map is the one
+    // answer that must not be given (#258): every ref then reports
+    // `worktreePath: null`, which the UI reads as "free", and it will happily
+    // offer to delete or switch to a branch another worktree currently holds
+    // checked out. The refs themselves are still real, so blanking them would
+    // be a second fabrication in the other direction. Return them, and say
+    // ownership is UNKNOWN — `ownershipUnavailable` is what disables the
+    // affordances that depend on it.
+    let (owners, ownership_error): (HashMap<String, String>, Option<String>) = match worktrees {
+        Ok(worktrees) => (worktrees.into_iter().map(|w| (w.branch, w.path)).collect(), None),
+        Err(e) => (HashMap::new(), Some(e)),
+    };
+    let total = refs.len() as i64;
+    let mut out = json!({
         "refs": refs.iter().map(|r| json!({
             "name": r.name,
             "current": r.is_current,
@@ -431,7 +443,12 @@ fn list_refs_payload(
         "hasPrimaryRemote": has_remote,
         "nextCursor": null,
         "totalCount": total,
-    })
+    });
+    if let (Some(e), Some(o)) = (ownership_error, out.as_object_mut()) {
+        o.insert("ownershipUnavailable".into(), json!(true));
+        o.insert("refsError".into(), json!(e));
+    }
+    out
 }
 
 /// The shape every mutating VCS method answers with on failure. The frontend
@@ -1032,6 +1049,7 @@ pub async fn run_stacked_action_streaming_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use agent_sdk_do::do_rs::{Error as DoError, Param, Result as DoResult};
     use agent_sdk_do::ObjectDb;
     use std::sync::Arc;
@@ -1393,10 +1411,19 @@ mod tests {
             true,
         );
         assert_eq!(out["isRepo"], json!(true), "the repo was detected: {out}");
-        assert_eq!(out["statusUnavailable"], json!(true), "the failure must be explicit: {out}");
+        // #258: the marker moved to `refsUnavailable`/`refsError`.
+        // `statusUnavailable`/`statusError` are fields of the VCS *status*
+        // schema and are absent from `VcsListRefsResult`, so the client decoder
+        // dropped them — reporting there was the same as not reporting, and the
+        // client read `refs: []` as a repository with no branches.
+        assert_eq!(out["refsUnavailable"], json!(true), "the failure must be explicit: {out}");
         assert!(
-            out["statusError"].as_str().unwrap_or("").contains("git for-each-ref exploded"),
+            out["refsError"].as_str().unwrap_or("").contains("git for-each-ref exploded"),
             "the cairn failure reason must survive: {out}"
+        );
+        assert!(
+            out.get("statusUnavailable").is_none(),
+            "the marker must live on a field the refs schema carries: {out}"
         );
         assert!(
             out["refs"].as_array().unwrap().is_empty(),
@@ -1419,14 +1446,33 @@ mod tests {
             true,
         );
         assert_eq!(out["isRepo"], json!(true), "the repo was detected: {out}");
-        assert_eq!(out["statusUnavailable"], json!(true), "the failure must be explicit: {out}");
-        assert!(
-            out["statusError"].as_str().unwrap_or("").contains("git worktree list exploded"),
-            "the worktree failure reason must survive: {out}"
+        // #258 SHARPENS this test rather than relaxing it. Blanking the refs
+        // satisfied "must not be emitted as SAFE refs" only by telling the
+        // other lie — a repository with no branches — and it could not say why,
+        // because `VcsListRefsResult` had no field for it. It does now, so the
+        // real refs are served and the UNSAFETY is stated: ownership unknown,
+        // every `worktreePath` null because it is unknown rather than free.
+        assert_eq!(
+            out["ownershipUnavailable"], json!(true),
+            "a failed worktrees() must be reported, not flattened into an empty owner map: {out}"
         );
         assert!(
-            out["refs"].as_array().unwrap().is_empty(),
-            "refs without trustworthy ownership must not be emitted as safe refs: {out}"
+            out["refsError"].as_str().unwrap_or("").contains("git worktree list exploded"),
+            "the worktree failure reason must survive: {out}"
+        );
+        assert_eq!(
+            out["refs"].as_array().unwrap().len(), 1,
+            "the refs are real and are still served: {out}"
+        );
+        for r in out["refs"].as_array().unwrap() {
+            assert!(
+                r["worktreePath"].is_null(),
+                "ownership is unknown, so no ref may claim an owner: {r}"
+            );
+        }
+        assert!(
+            out.get("statusUnavailable").is_none(),
+            "the marker must live on a field the refs schema carries: {out}"
         );
     }
 
