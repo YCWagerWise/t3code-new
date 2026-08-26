@@ -634,18 +634,22 @@ mod wait_tests {
     use super::*;
     use agent_sdk_do::ObjectDb;
 
-    async fn registry_with_db() -> (Arc<TerminalRegistry>, Arc<dyn ObjectDb>) {
-        let dir = std::env::temp_dir().join(format!("t3term-{}", uuid::Uuid::new_v4()));
+    /// Returns the scratch-dir GUARD as well: the registry and its hearth
+    /// runner keep using this directory, so it must outlive the helper. When
+    /// the dir was a leaked `PathBuf` that happened by accident; now that
+    /// cleanup is real, the lifetime has to be stated.
+    async fn registry_with_db() -> (Arc<TerminalRegistry>, Arc<dyn ObjectDb>, crate::testtmp::TempRoot) {
+        let dir = crate::testtmp::temp_root(format!("t3term-{}", uuid::Uuid::new_v4()));
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
-        let cfg = hearth::Config::new(dir.clone(), data.clone(), "ws");
+        let cfg = hearth::Config::new(dir.to_path_buf(), data.clone(), "ws");
         let runner = Arc::new(hearth::Runner::open(cfg).await.unwrap());
         let pool = do_storage::DbPool::new(data.join("exec"));
         let db = pool.object_db("exec", "main").await.unwrap();
         let sessions = Arc::new(agent_sdk_exec::ExecSessions::new(
             db.clone(),
             data.join("roots"),
-            Arc::new(agent_sdk_exec::RootedAdmission::new([dir.clone()])),
+            Arc::new(agent_sdk_exec::RootedAdmission::new([dir.to_path_buf()])),
         ));
         sessions.migrate().await.unwrap();
         let registry = Arc::new(
@@ -653,11 +657,12 @@ mod wait_tests {
                 .await
                 .unwrap(),
         );
-        (registry, db)
+        (registry, db, dir)
     }
 
-    async fn registry() -> Arc<TerminalRegistry> {
-        registry_with_db().await.0
+    async fn registry() -> (Arc<TerminalRegistry>, crate::testtmp::TempRoot) {
+        let (reg, _db, scratch) = registry_with_db().await;
+        (reg, scratch)
     }
 
     async fn break_pane_store(db: &Arc<dyn ObjectDb>) {
@@ -679,7 +684,7 @@ mod wait_tests {
         const ROUNDS: usize = 300;
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-        let reg = registry().await;
+        let (reg, _scratch) = registry().await;
         let mut worst = std::time::Duration::ZERO;
         for i in 0..ROUNDS {
             let round_start = std::time::Instant::now();
@@ -736,7 +741,7 @@ mod wait_tests {
     /// can ever reach again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_opens_of_one_pane_id_share_a_single_shell() {
-        let reg = registry().await;
+        let (reg, _scratch) = registry().await;
 
         let racers: Vec<_> = (0..4)
             .map(|_| {
@@ -779,7 +784,7 @@ mod wait_tests {
     /// lying-label failure, not a leak.
     #[tokio::test]
     async fn closing_the_agent_pane_leaves_it_registered_and_listed() {
-        let reg = registry().await;
+        let (reg, _scratch) = registry().await;
         let opened = reg
             .open(
                 &TerminalOwner::thread("t-agent"),
@@ -819,7 +824,7 @@ mod wait_tests {
 
     #[tokio::test]
     async fn get_list_and_wait_for_surface_pane_store_failures() {
-        let (reg, db) = registry_with_db().await;
+        let (reg, db, _scratch) = registry_with_db().await;
         break_pane_store(&db).await;
         let owner = TerminalOwner::thread("t-fault");
 
@@ -856,7 +861,7 @@ mod wait_tests {
 
     #[tokio::test]
     async fn close_surfaces_pane_store_failures() {
-        let (reg, db) = registry_with_db().await;
+        let (reg, db, _scratch) = registry_with_db().await;
         break_pane_store(&db).await;
         let err = reg
             .close(&TerminalOwner::thread("t-fault"), "pane-x")
@@ -875,7 +880,7 @@ mod wait_tests {
         // Use the module's own fault helpers rather than reaching into a
         // private field: `registry_with_db` hands back the store this registry
         // is built on, which is the supported way to break it.
-        let (reg, db) = registry_with_db().await;
+        let (reg, db, _scratch) = registry_with_db().await;
         reg.open(&TerminalOwner::thread("t-broken"), "pane-a", None, None, &[])
             .await
             .expect("pane opens");
@@ -917,7 +922,7 @@ mod wait_tests {
     /// failure is total: a pane where nothing the user types can be found.
     #[tokio::test]
     async fn a_pane_launched_with_env_still_has_a_usable_environment() {
-        let reg = registry().await;
+        let (reg, _scratch) = registry().await;
         let pane = reg
             .open(
                 &TerminalOwner::thread("t-env"),

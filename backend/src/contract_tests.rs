@@ -19,8 +19,15 @@ fn contract_test_fd_slots() -> &'static Arc<tokio::sync::Semaphore> {
     SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
 }
 
-async fn test_state() -> (AppState, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+/// The scratch dir every contract test runs in, removed when the test ends.
+///
+/// This was a bare `std::path::PathBuf`, which has no `Drop` — so each of these
+/// ~145 tests left ~13 MB behind, every run. See [`crate::testtmp`] for what
+/// that cost the build box and why it was misdiagnosed as a red base.
+type TestDir = t3code_agent::testtmp::TempRoot;
+
+async fn test_state() -> (AppState, TestDir) {
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
     let state = state_at(&dir).await;
     (state, dir)
 }
@@ -1070,7 +1077,7 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
     let (mut state, dir) = test_state().await;
     let bad = hearth::Runner::open(
-        hearth::Config::new(dir.clone(), dir.join("bad-hearth"), "bad-terminal")
+        hearth::Config::new(dir.to_path_buf(), dir.join("bad-hearth"), "bad-terminal")
             .shell(vec!["/definitely/not/a/t3code-shell".to_string()]),
     )
     .await
@@ -1389,6 +1396,145 @@ async fn terminal_metadata_stream_follows_panes_opened_and_closed_after_attach()
             && has(rows, terminal::AGENT_TERMINAL_ID))
         .await,
         "the close is published and the stream keeps serving the remaining panes"
+    );
+}
+
+/// PROOF (#237): a turn is REFUSED when the durable thread record cannot prove
+/// what it should run as — it is not launched on invented defaults.
+///
+/// `run_turn` used to read the record through `threads()`, the display helper
+/// that turns a store/decode error into a quarantine placeholder. The
+/// placeholder's id never matches, so `find` returned `None` and every field
+/// fell through to a hard-coded default: `full-access` policy, `default`
+/// interaction, no options, no worktree, and a provider instance derived from
+/// the resolved backend rather than the one the user configured. A thread whose
+/// row could not be read therefore ran with the MOST permissive policy this
+/// product has, in the workspace root.
+///
+/// The refusal has to be visible, too. The client already rendered the user's
+/// message optimistically; a bare `return` leaves it spinning forever, so the
+/// refusal projects a terminal `TurnEnded` and the session settles with the
+/// reason on it.
+#[tokio::test]
+async fn a_turn_whose_thread_record_cannot_be_proven_is_refused_not_defaulted() {
+    let (state, _d) = test_state().await;
+
+    // Tail BEFORE dispatching, so the terminal fact cannot land between the
+    // call and the subscription.
+    let tail = state.rt.tail("t-ghost").await.expect("tail the thread");
+
+    // No `save_thread` — this thread id has no durable record at all, which is
+    // the `Ok(None)` half of the accessor's contract ("no such thread", never
+    // confused with "the store could not be read").
+    run_turn(
+        json!({
+            "threadId": "t-ghost",
+            "message": { "text": "do something", "messageId": "u1" },
+            // NOTE: no runtimeMode / interactionMode / modelSelection. This is
+            // the ordinary follow-up-turn shape, where the durable record is
+            // supposed to be the authority for everything not repeated.
+        }),
+        ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        state.clone(),
+    );
+
+    // The refusal is a TERMINAL fact on the thread's stream: the client that
+    // optimistically rendered the prompt settles instead of spinning.
+    let items = tail
+        .next(std::time::Duration::from_secs(10))
+        .await
+        .expect("the refusal was published");
+    let (_seq, item) = items
+        .iter()
+        .find(|(_, i)| i["event"]["type"] == "thread.session-set")
+        .unwrap_or_else(|| panic!("a refused turn must settle the session: {items:?}"));
+    let session = &item["event"]["payload"]["session"];
+
+    let msg = session["lastError"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("no durable record"),
+        "the refusal must say WHY the turn could not run: {session}"
+    );
+    assert_eq!(
+        session["status"], "idle",
+        "a refused turn leaves no running session: {session}"
+    );
+    assert_eq!(
+        session["activeTurnId"],
+        Value::Null,
+        "a turn that never ran has no active turn id: {session}"
+    );
+}
+
+/// PROOF (#235): an unreadable pane store FAILS the metadata subscription — it
+/// does not leave a live-looking stream over a store nobody can read.
+///
+/// Emitting the `store_unavailable` frame and then carrying on was half a fix.
+/// The durable tail stayed attached and a process-local metadata tail started
+/// polling the very store that had just failed, so the client sat on a
+/// subscription that could only ever report this process's local pane edges
+/// while believing it was watching the thread's panes. The frame goes first so
+/// the panel can render the fault, then the stream closes and no tail is
+/// started over it.
+#[tokio::test]
+async fn an_unreadable_pane_store_closes_the_metadata_subscription() {
+    let (state, _d) = test_state().await;
+    state
+        .terminals
+        .open(
+            &terminal::TerminalOwner::thread("t-pane-closed"),
+            "pane-real",
+            Some(&state.cwd),
+            None,
+            &[],
+        )
+        .await
+        .expect("pane opens before durable store corruption");
+    state
+        .tool_roots
+        .session_db()
+        .execute("DROP TABLE exec_pane", vec![])
+        .await
+        .expect("corrupt pane store");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-pane-closed" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+
+    // the fault is described on the stream...
+    let events: Vec<Value> = frames
+        .iter()
+        .filter_map(|f| f["values"].get(0).cloned())
+        .collect();
+    assert!(
+        events.iter().any(|e| e["type"] == "store_unavailable"),
+        "the panel must be told the store is unavailable: {events:?}"
+    );
+
+    // ...and the request FAILS, rather than acknowledging a usable stream.
+    // This is the assertion the sibling test never made: before, a handler
+    // could emit the fault frame and still hand back a live subscription.
+    assert!(
+        frames.iter().any(|f| {
+            f["_tag"] == "Exit" && f["exit"]["_tag"] == "Failure"
+        }),
+        "an unreadable pane store must fail the subscription, not leave it live: {frames:?}"
+    );
+    // and the failure names the substrate that broke, so the cause is not
+    // guesswork on the client side.
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["_tag"] == "Exit" && f.to_string().contains("exec_pane")),
+        "the failure must name what could not be read: {frames:?}"
     );
 }
 
@@ -2770,7 +2916,7 @@ async fn an_outside_repo_cwd_is_refused_by_every_vcs_method() {
     let (state, dir) = test_state().await;
     cairn::init_repository(&dir).await.unwrap();
     // a REAL git repository, deliberately outside this environment
-    let outside = std::env::temp_dir().join(format!("t3-outside-{}", uuid::Uuid::new_v4()));
+    let outside = t3code_agent::testtmp::temp_root(format!("t3-outside-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&outside).unwrap();
     cairn::init_repository(&outside).await.unwrap();
     let alien = outside.to_string_lossy().into_owned();
@@ -3085,7 +3231,7 @@ async fn worktree_paths_are_admitted_not_trusted() {
     .unwrap();
 
     // 1. an outside absolute path is refused BEFORE git runs
-    let outside = std::env::temp_dir().join(format!("t3-wt-outside-{}", uuid::Uuid::new_v4()));
+    let outside = t3code_agent::testtmp::temp_root(format!("t3-wt-outside-{}", uuid::Uuid::new_v4()));
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
         &state,
@@ -3136,7 +3282,7 @@ async fn worktree_paths_are_admitted_not_trusted() {
     );
 
     // 3. removing an unregistered/outside path is refused
-    let alien = std::env::temp_dir().join(format!("t3-wt-alien-{}", uuid::Uuid::new_v4()));
+    let alien = t3code_agent::testtmp::temp_root(format!("t3-wt-alien-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&alien).unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -4245,7 +4391,7 @@ async fn project_file_rpcs_are_implemented_and_confined() {
     );
 
     // and an outside cwd is refused before any file work happens
-    let outside = std::env::temp_dir().join(format!("t3-proj-out-{}", uuid::Uuid::new_v4()));
+    let outside = t3code_agent::testtmp::temp_root(format!("t3-proj-out-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&outside).unwrap();
     let exit = call(
         "projects.listEntries",
@@ -5744,7 +5890,7 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
 /// require the new number to be strictly greater.
 #[tokio::test]
 async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
 
     // First process: burn some sequence, then read the client's mark.
     let mark = {
@@ -5825,7 +5971,7 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
 /// the first backend is dropped entirely before the second one answers.
 #[tokio::test]
 async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
 
     // First process: persist a thread + its history, then drop everything.
     {
@@ -6531,7 +6677,7 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         }
     }
 
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake_editor = bin.join("mate");
@@ -7211,7 +7357,7 @@ async fn source_control_repository_actions_are_wired() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_paths_are_admitted_before_any_tool_runs() {
     let (state, dir) = test_state().await;
-    let outside = std::env::temp_dir().join(format!("t3-outside-{}", uuid::Uuid::new_v4()));
+    let outside = t3code_agent::testtmp::temp_root(format!("t3-outside-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&outside).unwrap();
 
     // #178: a clone destination outside the environment is refused BEFORE
@@ -8108,7 +8254,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
     let runner_b = tools::open_workspace_shell(&tmp, data.clone())
         .await
         .unwrap();
-    let tool_roots_b = tools::ToolRoots::new(tmp.clone(), data.clone(), runner_b.clone()).await;
+    let tool_roots_b = tools::ToolRoots::new(tmp.to_path_buf(), data.clone(), runner_b.clone()).await;
     let shell_b = Arc::new(Shell::new(&data, tool_roots_b.registry_factory()));
     let rt_b = ThreadRuntime::open(shell_b, data.to_str().unwrap(), "main")
         .await
@@ -9432,7 +9578,7 @@ impl agent_sdk_core::Model for Spinner {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_frame_cancels_a_running_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-int-{}", uuid::Uuid::new_v4()));
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     // The spinner's tool call must SUCCEED so the loop keeps re-entering; a
     // failing tool can short-circuit the turn into a terminal state and we
@@ -9730,7 +9876,7 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-neg-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-int-neg-{}", uuid::Uuid::new_v4()));
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     let _ = std::fs::write(std::path::Path::new(&state.cwd).join("spin.txt"), b"spin");
 
@@ -10151,7 +10297,7 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
 /// from the store, not from anything the first process remembered.
 #[tokio::test]
 async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_restart() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let wt_s = wt.to_string_lossy().into_owned();
@@ -10275,7 +10421,7 @@ async fn a_thread_with_no_durable_row_still_snapshots_with_declared_defaults() {
 /// the same data directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Process one: open a non-agent pane through the real command.
@@ -10338,7 +10484,7 @@ async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
 ///     subscribe_thread_worktree_snapshot_is_a_recorded_fixture
 #[tokio::test]
 async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-{}", uuid::Uuid::new_v4()));
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let state = state_at(&dir).await;
@@ -10435,7 +10581,7 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
 /// is a number that grows.
 #[tokio::test]
 async fn an_app_state_opens_a_bounded_number_of_isolates() {
-    let dir = std::env::temp_dir().join(format!("t3ct-iso-{}", uuid::Uuid::new_v4()));
+    let dir = t3code_agent::testtmp::temp_root(format!("t3ct-iso-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let state = state_at(&dir).await;
     // Touch the paths a real session uses, so lazily-opened isolates count too.

@@ -1080,7 +1080,7 @@ mod tests {
     /// A `Control` over a throwaway isolate, so the cancel flag under test is a
     /// REAL durable row and not a bool the test made up.
     async fn scratch_control(tag: &str) -> agent_sdk_do::Control {
-        let dir = std::env::temp_dir().join(format!("t3-cancel-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::temp_root(format!("t3-cancel-{tag}-{}", uuid::Uuid::new_v4()));
         let store = agent_sdk_shell::OrchStore::open_at(dir.to_str().unwrap(), "test")
             .await
             .expect("open a scratch orchestration store");
@@ -1090,7 +1090,7 @@ mod tests {
     }
 
     async fn scratch_control_db(tag: &str) -> (agent_sdk_do::Control, Arc<dyn ObjectDb>) {
-        let dir = std::env::temp_dir().join(format!("t3-cancel-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::temp_root(format!("t3-cancel-{tag}-{}", uuid::Uuid::new_v4()));
         let store = agent_sdk_shell::OrchStore::open_at(dir.to_str().unwrap(), "test")
             .await
             .expect("open a scratch orchestration store");
@@ -1272,8 +1272,8 @@ mod tests {
         assert!(err.contains("actionId"), "error should name the missing action id: {err}");
     }
 
-    async fn scratch_repo() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("t3-vcs-{}", uuid::Uuid::new_v4()));
+    async fn scratch_repo() -> crate::testtmp::TempRoot {
+        let dir = crate::testtmp::temp_root(format!("t3-vcs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cairn::init_repository(&dir).await.unwrap();
         for args in [
@@ -1298,7 +1298,7 @@ mod tests {
     /// A plain directory is reported as "not a repo" — a state, not an error.
     #[tokio::test]
     async fn a_non_repo_directory_is_reported_not_crashed() {
-        let dir = std::env::temp_dir().join(format!("t3-vcs-plain-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::temp_root(format!("t3-vcs-plain-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = status(dir.to_str().unwrap()).await;
         assert_eq!(s["isRepo"], json!(false));

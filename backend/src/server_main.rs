@@ -4079,10 +4079,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(tail) => tail,
                 Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}")),
             };
-            let _ = state
-                .terminals
-                .open(&thread_owner, terminal::AGENT_TERMINAL_ID, None, None, &[])
-                .await;
+            // The duplicate `open` that used to sit here is GONE (#235). It was
+            // a second bootstrap of the same agent pane with the same
+            // arguments, and its result was discarded with `let _ =` — so the
+            // one path that could still fail after the checked open above did
+            // so silently, and the `snapshot` below then went out looking
+            // clean. `open` returns an existing pane unchanged, so the checked
+            // call before the tail attach is the whole bootstrap; this one
+            // added nothing but a place for an error to disappear.
             let now = now_iso();
             // An unreadable pane store is NOT an empty terminal list: the panel
             // would render "no terminals" for a workspace that has them.
@@ -4094,15 +4098,34 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     }
                     chunk(tx, &id, json!({ "type": "snapshot", "terminals": rows }));
                 }
-                Err(e) => chunk(
-                    tx,
-                    &id,
-                    json!({
-                        "type": "store_unavailable",
-                        "terminals": Value::Null,
-                        "error": format!("terminal pane store unavailable: {e}"),
-                    }),
-                ),
+                Err(e) => {
+                    // FAIL CLOSED, like the `open` failure above (#235). Emitting
+                    // the error frame and then carrying on left a stream that
+                    // looked live: the durable tail stayed attached and a
+                    // process-local metadata tail started polling the very pane
+                    // store that had just failed to read. The client would sit
+                    // on a subscription that could only ever report this
+                    // process's local edges over a store nobody could list.
+                    //
+                    // The frame goes first so the panel can render the fault,
+                    // then the stream closes, and no tail is started over it.
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "store_unavailable",
+                            "threadId": thread,
+                            "terminals": Value::Null,
+                            "error": format!("terminal pane store unavailable: {e}"),
+                        }),
+                    );
+                    tail.close().await;
+                    return exit_failure(
+                        tx,
+                        &id,
+                        &format!("subscribeTerminalMetadata: terminal pane store unavailable: {e}"),
+                    );
+                }
             }
             spawn_thread_tail(tail, tx.clone(), id.clone(), topic.clone());
             spawn_metadata_tail(state.terminals.clone(), tx.clone(), id.clone(), thread);
@@ -4748,6 +4771,38 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
 /// function only: picks the model, builds the durable [`SessionBinding`], and
 /// hands a [`T3Projector`] to `rt.run_turn`, which emits every lifecycle fact
 /// (including a guaranteed `TurnEnded`) on the durable bus (#5/#14/#15/#16/#17).
+/// Refuse a turn before it starts, VISIBLY (#237).
+///
+/// A pre-flight bail is the stuck-spinner bug's favourite hiding place: the
+/// client already rendered the user's message optimistically and is waiting for
+/// a terminal fact, and `return` alone never sends one — the thread sits
+/// "running" until the page is reloaded. `ThreadRuntime::run_turn` guarantees a
+/// terminal `TurnEnded` on every path, but only once it has been entered; a
+/// refusal upstream of it has to make the same guarantee itself.
+///
+/// The turn id is the client's optimistic prompt id when it sent one. The T3
+/// projection of `TurnEnded` is thread-scoped and does not key on the turn id
+/// (it clears `activeTurnId` and sets `lastError`), so this settles the session
+/// and shows the reason rather than inventing a durable turn that never ran.
+async fn refuse_turn(state: &AppState, thread_id: &str, prompt_id: Option<&str>, why: &str) {
+    tracing::error!(%thread_id, %why, "turn refused before dispatch");
+    let projector = event_adapter::t3_projector(state.rt.clone());
+    if let Err(e) = projector
+        .project(agent_sdk_shell::Lifecycle::TurnEnded {
+            thread_id: thread_id.to_string(),
+            turn_id: prompt_id.unwrap_or_default().to_string(),
+            outcome: agent_sdk_shell::TurnOutcome::Failed {
+                message: why.to_string(),
+            },
+        })
+        .await
+    {
+        // Nothing above this can rescue it; say so loudly rather than let the
+        // refusal itself disappear.
+        tracing::error!(%thread_id, %e, "the turn refusal could not be made visible");
+    }
+}
+
 fn run_turn(command: Value, model: ModelRef, state: AppState) {
     tokio::spawn(async move {
         let thread_id = command
@@ -4782,14 +4837,55 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // The binding identity: thread + configured provider instance + model.
         // The runtime keys the durable session on all three, so switching the
         // instance never resumes a native provider thread under the wrong config.
-        // the durable thread record: the source for anything the command did
-        // not repeat (mode, model selection).
-        let stored = state
-            .rt
-            .threads()
-            .await
-            .into_iter()
-            .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id.as_str()));
+        // THE DURABLE THREAD ROW IS AUTHORITY, NOT A HINT (#237).
+        //
+        // This used to read the durable record through `threads()` — the
+        // DISPLAY helper, which swallows a store/decode error and hands back a
+        // quarantine placeholder so a snapshot can render the corruption. That
+        // is the right shape for a list panel and exactly the wrong shape here:
+        // the placeholder's id never matches, `find` returns `None`, and every
+        // field below silently fell through to a hard-coded default —
+        // `full-access`, `default` interaction, no options, no worktree, and a
+        // provider instance derived from the resolved backend instead of the
+        // one the user configured.
+        //
+        // So a transient thread-store read error did not refuse the turn. It
+        // RAN it, in the workspace root, with the most permissive policy this
+        // product has. The SDK's own decoder takes the opposite view on the
+        // same ambiguity — `ThreadRecord::from_row` falls back to
+        // `ApprovalRequired`, the most restrictive mode — and the product was
+        // overriding that safety with its own optimism.
+        //
+        // `thread_record` is the typed, fallible accessor the SDK exposes for
+        // callers that can handle the error: `Ok(None)` is "no such thread",
+        // `Err` is "the store could not be read", and they are never the same
+        // value. Both refuse the turn here, because neither one can prove the
+        // model selection, runtime mode, interaction mode, options or worktree
+        // this turn is supposed to run under.
+        let stored = match state.rt.thread_record(&thread_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return refuse_turn(
+                    &state,
+                    &thread_id,
+                    prompt_id.as_deref(),
+                    &format!(
+                        "thread {thread_id} has no durable record; \
+                         its model selection, runtime mode and worktree cannot be proven"
+                    ),
+                )
+                .await;
+            }
+            Err(e) => {
+                return refuse_turn(
+                    &state,
+                    &thread_id,
+                    prompt_id.as_deref(),
+                    &format!("the thread store is unreadable: {e}"),
+                )
+                .await;
+            }
+        };
         // The binding identity is the CONFIGURED instance the user picked, not
         // one derived from the resolved backend. Two instances of the same
         // driver pointing at the same base url and model — different creds,
@@ -4805,11 +4901,14 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
             .map(String::from)
             .or_else(|| {
                 stored
-                    .as_ref()
-                    .and_then(|t| t.pointer("/modelSelection/instanceId"))
+                    .model_selection
+                    .pointer("/instanceId")
                     .and_then(Value::as_str)
                     .map(String::from)
             })
+            // Only reachable when NEITHER the command nor the proven durable
+            // record carried a selection — a thread that genuinely has none,
+            // not a thread we failed to read.
             .unwrap_or_else(|| agent_sdk_shell::provider_instance_id(&model));
         let binding = SessionBinding {
             thread_id: thread_id.clone(),
@@ -4820,31 +4919,33 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // from the durable thread record — a mode set earlier by
         // `thread.meta.update` must still apply to a turn that does not repeat
         // it (#73/#79).
-        let pick = |key: &str, fallback: &str| -> String {
+        // The command wins when it carries the field; otherwise the PROVEN
+        // durable record does. There is no third branch any more: the old
+        // `unwrap_or(fallback)` is what turned an unreadable row into
+        // full-access, and the record above is now guaranteed to exist.
+        let from_command = |key: &str| -> Option<String> {
             command
                 .get(key)
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    stored
-                        .as_ref()
-                        .and_then(|t| t.get(key))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or(fallback)
-                .to_string()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
         };
-        let runtime_mode = pick("runtimeMode", "full-access");
-        let interaction_mode = pick("interactionMode", "default");
+        let runtime_mode =
+            from_command("runtimeMode").unwrap_or_else(|| stored.runtime_mode.as_str().to_string());
+        let interaction_mode =
+            from_command("interactionMode").unwrap_or_else(|| stored.interaction_mode.clone());
         let (ask_tools, instructions) = policy_for(&runtime_mode, &interaction_mode);
         tracing::info!(%thread_id, %runtime_mode, %interaction_mode, gated = ask_tools.len(), "turn policy");
         // WHERE this turn works. A thread created against a worktree stored the
         // path on its record; without carrying it onto the definition the tool
         // registry was built over the boot-time workspace root and the agent
         // edited the MAIN checkout while the UI showed the worktree (#207).
+        // `None` here now means the record PROVED the thread has no worktree,
+        // not that we could not find out.
         let worktree = stored
-            .as_ref()
-            .and_then(|t| t.get("worktreePath"))
-            .and_then(Value::as_str)
+            .worktree_path
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from);
@@ -4860,11 +4961,7 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
             use agent_sdk_provider::instance::decode_option_selections;
             command
                 .pointer("/modelSelection/options")
-                .or_else(|| {
-                    stored
-                        .as_ref()
-                        .and_then(|t| t.pointer("/modelSelection/options"))
-                })
+                .or_else(|| stored.model_selection.pointer("/options"))
                 .filter(|v| !v.is_null())
                 .map(decode_option_selections)
                 .unwrap_or_default()

@@ -293,8 +293,8 @@ pub async fn write_file(
 mod tests {
     use super::*;
 
-    async fn workspace() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("t3-proj-{}", uuid::Uuid::new_v4()));
+    async fn workspace() -> crate::testtmp::TempRoot {
+        let dir = crate::testtmp::temp_root(format!("t3-proj-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("node_modules/junk")).unwrap();
         std::fs::write(dir.join("src/server_main.rs"), "fn main() {}\n").unwrap();
@@ -510,7 +510,7 @@ mod tests {
     /// the right directory is still an unreviewable, unrevertable change.
     #[tokio::test]
     async fn a_repo_backed_save_creates_a_cairn_checkpoint() {
-        let dir = std::env::temp_dir().join(format!("t3-proj-cp-{}", uuid::Uuid::new_v4()));
+        let dir = crate::testtmp::temp_root(format!("t3-proj-cp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cairn::init_repository(&dir).await.unwrap();
         let cwd = dir.to_str().unwrap();

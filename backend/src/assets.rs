@@ -223,11 +223,20 @@ mod tests {
         b"test-signing-key".to_vec()
     }
 
-    fn workspace() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("t3-assets-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("nested/logo.png"), b"\x89PNG").unwrap();
-        dir.canonicalize().unwrap()
+    /// Returns the GUARD, not a bare path: these files must survive until the
+    /// test ends, and cleanup is now real rather than accidental. The guard is
+    /// built from the CANONICAL path so it removes the same directory the test
+    /// resolves against.
+    fn workspace() -> crate::testtmp::TempRoot {
+        // A UUID, not the process id: keyed on the pid every test in this binary
+        // shared ONE directory. That was invisible while nothing was ever
+        // cleaned up, and became a real interference bug the moment cleanup
+        // started working — the first test to finish deleted the directory the
+        // others were still reading.
+        let raw = std::env::temp_dir().join(format!("t3-assets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(raw.join("nested")).unwrap();
+        std::fs::write(raw.join("nested/logo.png"), b"\x89PNG").unwrap();
+        crate::testtmp::TempRoot::new(raw.canonicalize().unwrap())
     }
 
     #[test]

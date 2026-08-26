@@ -11,5 +11,8 @@ pub mod review;
 pub mod settings;
 pub mod sourcecontrol;
 pub mod terminal;
+// Test scratch dirs with a real Drop — see the module docs; this leak filled
+// the build box's tmpfs and was misdiagnosed as a red base.
+pub mod testtmp;
 pub mod tools;
 pub mod vcs;
