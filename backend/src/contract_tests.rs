@@ -524,6 +524,37 @@ where
     out
 }
 
+/// Like [`drain_until`], but the predicate sees EVERY frame collected so far and
+/// the caller is told WHY the drain stopped (#377).
+///
+/// Two things `drain_until` cannot express. It stops at the first frame matching
+/// a single predicate, so a test that needs two different frames — a snapshot
+/// AND a later event — can return before the second one arrives. And it returns
+/// the same `Vec` whether the predicate was satisfied or the deadline simply
+/// passed, so the caller cannot tell "the data was wrong" from "nothing was
+/// delivered in time" and inevitably prints the first message for both.
+async fn drain_while<F>(
+    rx: &mut mpsc::UnboundedReceiver<OutFrame>,
+    deadline: std::time::Duration,
+    done: F,
+) -> (Vec<Value>, bool)
+where
+    F: Fn(&[Value]) -> bool,
+{
+    let start = std::time::Instant::now();
+    let mut out: Vec<Value> = vec![];
+    while start.elapsed() < deadline {
+        out.extend(drain(rx));
+        if done(&out) {
+            return (out, true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    out.extend(drain(rx));
+    let satisfied = done(&out);
+    (out, satisfied)
+}
+
 /// Write a user prompt the way `run_turn_with_prompt_id` does, for tests
 /// that exercise thread bootstrap without running a turn.
 async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: &str) {
@@ -7444,9 +7475,15 @@ async fn an_empty_result_over_an_unreadable_match_is_not_a_clean_empty_result() 
 /// reachable, which a single-event probe cannot see.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_published_inside_subscribe_thread_are_never_skipped() {
-    for (label, payload) in [
-        ("resume", json!({ "threadId": "t-win", "afterSequence": 0 })),
-        ("snapshot", json!({ "threadId": "t-win" })),
+    // Whether this variant is ANSWERED with a snapshot frame. The two paths
+    // advertise their watermark differently and conflating them is #377: the
+    // resume path sends no snapshot at all, so its mark is the `afterSequence`
+    // the client asked from (0, i.e. every event is owed); the snapshot path
+    // MUST advertise `snapshotSequence`, and its absence is a broken contract,
+    // not a mark of 0.
+    for (label, payload, expects_snapshot) in [
+        ("resume", json!({ "threadId": "t-win", "afterSequence": 0 }), false),
+        ("snapshot", json!({ "threadId": "t-win" }), true),
     ] {
         let (state, _d) = test_state().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -7482,17 +7519,45 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
-            carries(v, last)
+        let snapshot_mark =
+            |v: &Value| v["values"][0]["snapshot"]["snapshotSequence"].as_i64();
+
+        // WAIT FOR BOTH FACTS THIS TEST READS (#377). Stopping at the first
+        // frame carrying `last` could return before the snapshot frame arrived,
+        // and the mark derived from it then defaulted to 0 — which turned a
+        // missing snapshot into "120 events never reached the subscriber", a
+        // failure this test had not observed and could not have.
+        let deadline = std::time::Duration::from_secs(15);
+        let (seen, delivered) = drain_while(&mut rx, deadline, |fs| {
+            fs.iter().any(|v| carries(v, last))
+                && (!expects_snapshot || fs.iter().any(|v| snapshot_mark(v).is_some()))
         })
         .await;
-        // The mark the client was told it holds through. The resume path
-        // sends no snapshot, so it is the `afterSequence` the client asked
-        // from — 0 here, i.e. every event is owed.
-        let mark = seen
-            .iter()
-            .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
-            .unwrap_or(0);
+
+        // A DISTINCT MESSAGE FOR THE TIMEOUT BRANCH. "Nothing arrived in time"
+        // and "something arrived and was wrong" are different failures; printing
+        // the gap message for both is what made this read as a delivery bug.
+        assert!(
+            delivered,
+            "[{label}] the {}s deadline passed before the subscription delivered {}event \
+             {last}. This is a DELIVERY TIMEOUT, not a gap — {} frame(s) were seen. If this \
+             branch fires repeatedly it is a finding against ThreadBus/Broker::wait, not \
+             against this test.",
+            deadline.as_secs(),
+            if expects_snapshot { "its snapshot frame and " } else { "" },
+            seen.len()
+        );
+
+        // The mark the client was told it holds through.
+        let mark = if expects_snapshot {
+            seen.iter()
+                .find_map(snapshot_mark)
+                .expect("the snapshot path must advertise snapshotSequence")
+        } else {
+            // The resume path sends no snapshot; the mark is the
+            // `afterSequence` this variant asked from.
+            0
+        };
         let missing: Vec<i64> = seqs
             .iter()
             .copied()
