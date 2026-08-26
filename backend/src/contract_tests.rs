@@ -19,10 +19,71 @@ fn contract_test_fd_slots() -> &'static Arc<tokio::sync::Semaphore> {
     SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
 }
 
-async fn test_state() -> (AppState, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
-    let state = state_at(&dir).await;
-    (state, dir)
+/// The temp workspace one contract test runs in, removed when the test ENDS --
+/// including when it panics.
+///
+/// This used to be a bare `PathBuf` under `std::env::temp_dir()`, with cleanup
+/// left to each test remembering `let _ = std::fs::remove_dir_all(&dir);` as the
+/// last statement of its body -- which does not run when the body unwinds. A
+/// FAILING test is exactly when the directory got left behind, so a red round
+/// made the next round redder.
+///
+/// Measured on woodbine: 12,002 `/tmp/t3ct-*` directories in eleven hours, ~13M
+/// each, filling a 31G tmpfs to 80%. /tmp there is RAM, so that was 25 of the
+/// box own 60 GB -- and once it filled, unrelated suites (cairn, hearth,
+/// do-storage) began failing with `os error 122 QuotaExceeded` and getting
+/// misattributed to whatever change was under test.
+///
+/// `Drop` is the fix rather than more cleanup calls: it cannot be forgotten by
+/// the next test, and it runs while unwinding.
+pub(crate) struct TestDir(tempfile::TempDir);
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+// Both `Deref` AND `AsRef` are needed: a generic `P: AsRef<Path>` parameter does
+// NOT get deref coercion, so `state_at(&dir)` requires this impl even though
+// `dir.join(..)` works through `Deref`.
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+/// The worktree base is a SIBLING of the workspace root, not a child of it, so
+/// `TempDir`'s own cleanup cannot reach it -- by construction, not by oversight.
+///
+/// `vcs::worktree_base` deliberately puts `.t3code-worktrees-<slug>` beside the
+/// root, because a linked worktree living UNDER the repository shows up in that
+/// repository's own status as a pile of untracked files. Correct for the
+/// product, and it means every contract test that creates a worktree leaves a
+/// directory one level up from the one `TempDir` removes.
+///
+/// Measured on woodbine: 20,430 `.t3code-worktrees-*` directories. Tiny in
+/// bytes (~8K total) and therefore invisible on `df`, but it is an INODE leak
+/// on the same tmpfs -- a different failure shape from the `t3ct-*` byte leak,
+/// with the same cause and the same fix.
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let base = crate::vcs::worktree_base(&self.0.path().to_string_lossy());
+        // Best-effort: most tests never create a worktree, so the directory
+        // usually does not exist. A failure here must not mask the test's own
+        // result, which is why it is not unwrapped.
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+async fn test_state() -> (AppState, TestDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let state = state_at(dir.path()).await;
+    (state, TestDir(dir))
 }
 
 async fn drop_runtime_kv(state: &AppState) {
@@ -1070,7 +1131,7 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
     let (mut state, dir) = test_state().await;
     let bad = hearth::Runner::open(
-        hearth::Config::new(dir.clone(), dir.join("bad-hearth"), "bad-terminal")
+        hearth::Config::new(dir.to_path_buf(), dir.join("bad-hearth"), "bad-terminal")
             .shell(vec!["/definitely/not/a/t3code-shell".to_string()]),
     )
     .await
@@ -5744,7 +5805,12 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
 /// require the new number to be strictly greater.
 #[tokio::test]
 async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
 
     // First process: burn some sequence, then read the client's mark.
     let mark = {
@@ -5825,7 +5891,12 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
 /// the first backend is dropped entirely before the second one answers.
 #[tokio::test]
 async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
 
     // First process: persist a thread + its history, then drop everything.
     {
@@ -6531,7 +6602,12 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         }
     }
 
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake_editor = bin.join("mate");
@@ -8108,7 +8184,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
     let runner_b = tools::open_workspace_shell(&tmp, data.clone())
         .await
         .unwrap();
-    let tool_roots_b = tools::ToolRoots::new(tmp.clone(), data.clone(), runner_b.clone()).await;
+    let tool_roots_b = tools::ToolRoots::new(tmp.to_path_buf(), data.clone(), runner_b.clone()).await;
     let shell_b = Arc::new(Shell::new(&data, tool_roots_b.registry_factory()));
     let rt_b = ThreadRuntime::open(shell_b, data.to_str().unwrap(), "main")
         .await
@@ -9432,7 +9508,12 @@ impl agent_sdk_core::Model for Spinner {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_frame_cancels_a_running_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-int-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     // The spinner's tool call must SUCCEED so the loop keeps re-entering; a
     // failing tool can short-circuit the turn into a terminal state and we
@@ -9730,7 +9811,12 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-neg-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-int-neg-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     let _ = std::fs::write(std::path::Path::new(&state.cwd).join("spin.txt"), b"spin");
 
@@ -10151,7 +10237,12 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
 /// from the store, not from anything the first process remembered.
 #[tokio::test]
 async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_restart() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let wt_s = wt.to_string_lossy().into_owned();
@@ -10275,7 +10366,12 @@ async fn a_thread_with_no_durable_row_still_snapshots_with_declared_defaults() {
 /// the same data directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     // Process one: open a non-agent pane through the real command.
@@ -10338,7 +10434,12 @@ async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
 ///     subscribe_thread_worktree_snapshot_is_a_recorded_fixture
 #[tokio::test]
 async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let state = state_at(&dir).await;
@@ -10435,7 +10536,12 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
 /// is a number that grows.
 #[tokio::test]
 async fn an_app_state_opens_a_bounded_number_of_isolates() {
-    let dir = std::env::temp_dir().join(format!("t3ct-iso-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-iso-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     std::fs::create_dir_all(&dir).unwrap();
     let state = state_at(&dir).await;
     // Touch the paths a real session uses, so lazily-opened isolates count too.
@@ -10500,4 +10606,149 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
         found.len() * 5
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// RESTORED by clau-0e5a: three fail-closed tests whose cells landed to main
+// (merge commits eae0abd6b codex-4a9f, 4ecdfad50 codex-a47f, and codex-e9b6)
+// while these test functions did not. Found by gate 5 (test-name survival).
+// Copied verbatim from each cell's own checkpoint ref -- not rewritten, so a
+// failure here is a statement about main, not about my reconstruction.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ws_interrupt_frame_reports_runtime_interrupt_failure() {
+    use super::dispatch_ws_frame;
+    let (state, dir) = test_state().await;
+
+    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
+        "id": "t-int-fail", "projectId": "p-workspace", "title": "int-fail",
+        "createdAt": now_iso(), "updatedAt": now_iso(),
+    })).await.unwrap();
+
+    let binding = SessionBinding {
+        thread_id: "t-int-fail".into(),
+        provider_instance_id: "claude_resume:test".into(),
+        model_key: "k".into(),
+    };
+    let def = AgentDefinition {
+        name: "t3code".into(),
+        instructions: String::new(),
+        model: ModelRef::ClaudeResume { model: "test".into() },
+        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
+        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+    };
+    state.rt.session_for(&binding, def).await.unwrap();
+    // PORT (clau-0e5a): `sessions_for_thread` became fallible after this test was
+    // written -- it now returns Result<Vec<String>, String>. Without the unwrap the
+    // Result itself is iterated, yielding the whole Vec as one item, which is the
+    // same Result-IntoIterator trap that produced the &Vec-where-&str error here.
+    // The assertions below are untouched.
+    let sid = state
+        .rt
+        .sessions_for_thread("t-int-fail")
+        .await
+        .expect("sessions_for_thread must not fail in this fixture")
+        .into_iter()
+        .next()
+        .expect("the interrupt has a bound SDK session to cancel");
+
+    let pool = do_storage::DbPool::new(dir.join("data"));
+    let db = pool.object_db("ShellSession", &sid).await.unwrap();
+    db.execute("DROP TABLE agent_control", vec![]).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    dispatch_ws_frame(
+        json!({
+            "_tag": "Interrupt",
+            "requestId": "r-int-fail",
+            "payload": { "input": { "threadId": "t-int-fail" } },
+        }),
+        &tx,
+        &state,
+    )
+    .await;
+
+    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|(s, _)| serde_json::from_str(&s).unwrap())
+        .collect();
+    let failure = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit" && f["requestId"] == json!("r-int-fail"))
+        .unwrap_or_else(|| panic!("raw Interrupt must answer failure on stop error: {frames:?}"));
+    assert_eq!(failure["exit"]["_tag"], "Failure", "{failure}");
+    let defect = failure["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("interrupt failed") && defect.contains("agent_control"),
+        "failure must name the durable cancel failure, got {failure}"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_revert_refuses_before_mutation_when_request_event_cannot_be_recorded() {
+    let (state, dir) = test_state().await;
+    init_git_repo(&state.cwd);
+    let file = std::path::Path::new(&state.cwd).join("requested.txt");
+    std::fs::write(&file, "before\n").unwrap();
+
+    state.rt.save_thread(&thread_row_ck("t-req-fail")).await.unwrap();
+    checkpoint_turn_start(&state, &state.cwd.clone(), "turn-1").await;
+    std::fs::write(&file, "after\n").unwrap();
+
+    drop_thread_event_table(&dir).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "type": "thread.checkpoint.revert", "threadId": "t-req-fail", "turnCount": 1 }),
+    )
+    .await;
+    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exit");
+    assert_eq!(exit["exit"]["_tag"], "Failure", "request event failure must not ack success: {exit}");
+    let defect = exit_defect(&exit);
+    assert!(
+        defect.contains("refused before mutation") && defect.contains("request event failed"),
+        "failure must name the pre-mutation lifecycle write: {exit}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "after\n",
+        "files must not move when the requested event cannot be durably recorded"
+    );
+}
+
+#[tokio::test]
+async fn ws_interrupt_frame_reports_hearth_interrupt_failure() {
+    use super::dispatch_ws_frame;
+    let (state, _d) = test_state().await;
+    let _ = state.terminal.shutdown().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    dispatch_ws_frame(
+        json!({
+            "_tag": "Interrupt",
+            "requestId": "r-stop-fail",
+            "payload": { "input": { "threadId": "t-int-fail" } },
+        }),
+        &tx,
+        &state,
+    )
+    .await;
+
+    let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|(s, _)| serde_json::from_str(&s).unwrap())
+        .collect();
+    let exits: Vec<&Value> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "raw Interrupt failure must be reported once: {frames:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "raw Interrupt must not silently drop a Hearth interrupt failure: {frames:?}"
+    );
+    let defect = exits[0]["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("terminal interrupt failed"),
+        "the failure should name the failed stop leg: {frames:?}"
+    );
 }
