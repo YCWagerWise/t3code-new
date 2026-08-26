@@ -840,6 +840,9 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     let runtime_mode = str_of(command.get("runtimeMode"))
         .or_else(|| str_of(boot.and_then(|b| b.get("runtimeMode"))))
         .unwrap_or_else(|| "full-access".into());
+    let interaction_mode = str_of(command.get("interactionMode"))
+        .or_else(|| str_of(boot.and_then(|b| b.get("interactionMode"))))
+        .unwrap_or_else(|| "default".into());
     // The durable row is built by the SDK record, not by hand (#2/#5): the
     // create path and the reconnect snapshot now agree by construction, because
     // both go through `ThreadRecord`. The keys below the record does not own are
@@ -852,6 +855,7 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
         agent_sdk_shell::RuntimeMode::parse(&runtime_mode),
         now.clone(),
     )
+    .with_interaction_mode(interaction_mode.clone())
     .on_worktree(worktree_path.clone(), branch.clone())
     .project(json!({
         "latestUserMessageAt": now,
