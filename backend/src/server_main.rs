@@ -288,7 +288,7 @@ fn model_from_selection(
         let snapshot = catalog
             .snapshot(instance)
             .ok_or_else(|| format!("unknown provider instance \"{instance}\""))?;
-        for selection in decode_option_selections(raw_options) {
+        for selection in decode_option_selections(raw_options)? {
             validate_selection(&snapshot.options, &selection)
                 .map_err(|e| format!("invalid model option: {e}"))?;
         }
@@ -2839,6 +2839,8 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 .rt
                                 .active_turn_id(thread_id)
                                 .await
+                                .ok()
+                                .flatten()
                                 .map(Value::String)
                                 .unwrap_or(Value::Null)
                         } else {
@@ -4908,7 +4910,12 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
                 })
                 .filter(|v| !v.is_null())
                 .map(decode_option_selections)
-                .unwrap_or_default()
+                .transpose()
+                .map_err(|e| format!("invalid model option: {e}"))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(%e, "dropping invalid persisted model options for turn");
+                    Vec::new()
+                })
         };
         let def = AgentDefinition {
             name: "t3code".into(),
