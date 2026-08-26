@@ -7112,6 +7112,104 @@ async fn terminal_metadata_updates_report_the_real_panes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #172: `visibility` is a CLOSED ENUM, not a flag name the client gets to pick.
+///
+/// The bug this pins: `publish_repository` interpolated the client's string
+/// straight into `format!("--{visibility}")`, so the request did not choose a
+/// value — it chose the OPTION. `disable-issues`, `disable-wiki`, `template` and
+/// every future `gh repo create` flag were reachable from the wire, and cairn
+/// could not stop it: the screened exec decides whether an allow-listed program
+/// may run with option shapes like these, not whether the product meant that
+/// option. This is product-owned command policy and it belongs in the product.
+///
+/// Each case below uses a cwd that is NOT a git repository, and asserts the
+/// refusal names the argument rather than the repository. That is the load
+/// bearing part: it proves the gate fires BEFORE `vcs::open`, before cairn, and
+/// before `gh` — not that gh eventually rejected something.
+#[tokio::test]
+async fn publish_refuses_argument_shapes_that_select_a_cli_mode() {
+    let (state, dir) = test_state().await;
+    let plain = dir.join("publish-arg-shapes");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    // Flag-shaped visibility values: each of these is a real `gh repo create`
+    // option, which is exactly why the old code reached them.
+    for bad in ["disable-issues", "disable-wiki", "template", "public --force"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "sourceControl.publishRepository",
+            json!({
+                "cwd": plain.to_string_lossy(), "provider": "github",
+                "repository": "t3/x", "visibility": bad,
+            }),
+        )
+        .await;
+        let f = drain(&mut rx);
+        assert_eq!(f[0]["exit"]["_tag"], "Failure", "{bad:?} must be refused: {:?}", f[0]);
+        let why = f[0]["exit"]["cause"].to_string();
+        assert!(
+            why.contains("visibility must be one of"),
+            "refused for being an unknown visibility, not for something \
+             downstream: {bad:?} -> {why}"
+        );
+        assert!(
+            !why.contains("not a git repository"),
+            "the gate must run BEFORE vcs::open, or a valid-looking cwd would \
+             have carried {bad:?} all the way to gh: {why}"
+        );
+    }
+
+    // The same leak one argument over: a positional / value that begins with `-`
+    // is read by gh as an option.
+    for (field, payload) in [
+        ("repository", json!({ "repository": "--template", "remoteName": "origin" })),
+        ("remoteName", json!({ "repository": "t3/x", "remoteName": "--force" })),
+    ] {
+        let mut body = json!({
+            "cwd": plain.to_string_lossy(), "provider": "github", "visibility": "private",
+        });
+        for (k, v) in payload.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, "sourceControl.publishRepository", body).await;
+        let f = drain(&mut rx);
+        assert_eq!(f[0]["exit"]["_tag"], "Failure", "{field} must be refused: {:?}", f[0]);
+        let why = f[0]["exit"]["cause"].to_string();
+        assert!(
+            why.contains(field) && why.contains("command-line option"),
+            "the refusal names the offending field and the reason: {why}"
+        );
+    }
+
+    // AND the contract values still pass the gate — a closed enum that rejected
+    // everything would pass the tests above and break the feature. These get
+    // past argument validation and fail on the repository instead, which is the
+    // next check in line.
+    for ok in ["public", "private", "internal"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "sourceControl.publishRepository",
+            json!({
+                "cwd": plain.to_string_lossy(), "provider": "github",
+                "repository": "t3/x", "visibility": ok,
+            }),
+        )
+        .await;
+        let f = drain(&mut rx);
+        let why = f[0]["exit"]["cause"].to_string();
+        assert!(
+            !why.contains("visibility must be one of"),
+            "{ok:?} is a contract value and must reach the repository check: {why}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// #58: the repository actions discovery unlocks are IMPLEMENTED — they
 /// reach a real tool and fail with a reason, instead of the
 /// unsupported-method arm.
@@ -8411,6 +8509,107 @@ async fn a_shell_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snaps
 /// PROOF (#376): `checkpointTurnCount` 1 is the MOST RECENT turn, and
 /// reverting 1 undoes only that turn.
 ///
+/// #139: a thread whose CHECKPOINT SUBSTRATE is unreadable must not be
+/// snapshotted as a thread with no checkpoints.
+///
+/// The defect: `checkpoint_summaries` used to swallow the substrate error into
+/// an empty vec, and `subscribeThread` published `"checkpoints": []`. Schema
+/// valid, lifecycle false — the diff/revert UI renders "this thread has no
+/// recovery history", which is a claim about the WORK, when the truth is a claim
+/// about the STORE. `checkpoint_stack` goes to deliberate trouble to distinguish
+/// unavailable from no-repository (server_main.rs:1926, "a `.git` git cannot
+/// read is a repository whose checkpoints are broken"); erasing that distinction
+/// one frame up threw the whole point away.
+///
+/// The code half is fixed. This is the contract test that was missing, and its
+/// job is to keep it fixed: the assertion that matters is NOT just "an error
+/// came back" but that the client is never handed an EMPTY checkpoint array for
+/// an unreadable store.
+#[tokio::test]
+async fn an_unreadable_checkpoint_store_is_not_snapshotted_as_no_checkpoints() {
+    let (state, dir) = test_state().await;
+
+    // A worktree that IS a git repository — so this is not the "unversioned
+    // directory" path — whose git dir is then made unreadable. That is exactly
+    // the case `checkpoint_stack` distinguishes: broken, not absent.
+    let wt = dir.join("broken-wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    for args in [vec!["init", "-q"], vec!["config", "user.email", "t@t"], vec!["config", "user.name", "t"]] {
+        std::process::Command::new("git").args(&args).current_dir(&wt).output().unwrap();
+    }
+    std::fs::write(wt.join("f.txt"), "x").unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", "base"]] {
+        std::process::Command::new("git").args(&args).current_dir(&wt).output().unwrap();
+    }
+    // Corrupt it: HEAD present but unparseable. `git` fails on this rather than
+    // reporting an unversioned directory, which is the whole distinction.
+    std::fs::write(wt.join(".git").join("HEAD"), "not a ref
+").unwrap();
+
+    // PRECONDITION — the substrate really is unreadable, and the function says
+    // so rather than answering with an empty list.
+    let direct = checkpoint_summaries(&state, &wt.to_string_lossy()).await;
+    match &direct {
+        Err(e) => assert!(
+            e.contains("unavailable") || e.contains("unreadable"),
+            "the error must name the substrate, not the work: {e}"
+        ),
+        Ok(v) => panic!(
+            "#139: an unreadable checkpoint store answered with a checkpoint \
+             LIST ({} entries). That is the defect — a claim about the store \
+             rendered as a claim about the thread.",
+            v.len()
+        ),
+    }
+
+    // And through the wire: create the thread ON that worktree, then subscribe.
+    let command = json!({
+        "type": "thread.turn.start",
+        "commandId": "c-139",
+        "threadId": "t-139",
+        "message": { "messageId": "m-1", "role": "user", "text": "hi", "attachments": [] },
+        "runtimeMode": "approval-required",
+        "bootstrap": { "createThread": {
+            "projectId": "p-139",
+            "title": "broken checkpoints",
+            "runtimeMode": "approval-required",
+            "worktreePath": wt.to_string_lossy(),
+        }},
+    });
+    ensure_thread_on_shell(&state, &command).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-139" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+
+    // THE ASSERTION THAT MATTERS. Whatever shape the snapshot takes, it must
+    // never carry an empty checkpoint array for a store nobody could read —
+    // that is indistinguishable from a thread that genuinely has no history.
+    let text = format!("{frames:?}");
+    assert!(
+        !text.contains("\"checkpoints\":[]"),
+        "#139: subscribeThread published an EMPTY checkpoint list for an \
+         unreadable store: {text}"
+    );
+    assert_eq!(
+        frames[0]["exit"]["_tag"], "Failure",
+        "an unreadable checkpoint substrate fails the subscribe rather than \
+         answering with a lie: {:?}",
+        frames[0]
+    );
+    let why = frames[0]["exit"]["cause"].to_string();
+    assert!(
+        why.contains("checkpoint"),
+        "and the failure names what could not be read: {why}"
+    );
+}
+
 /// This is the regression for a live inversion. `checkpoint_summaries` and
 /// `checkpoint_seq_for` both did `stack.list().rev()`, under comments saying
 /// cairn lists oldest-first. It does not — `list` is `ORDER BY seq DESC`, so

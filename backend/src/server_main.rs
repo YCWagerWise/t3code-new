@@ -832,9 +832,15 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
         .or_else(|| str_of(command.pointer("/bootstrap/prepareWorktree/projectCwd")));
     let branch = str_of(boot.and_then(|b| b.get("branch")))
         .or_else(|| str_of(command.pointer("/bootstrap/prepareWorktree/branch")));
-    let runtime_mode = str_of(command.get("runtimeMode"))
-        .or_else(|| str_of(boot.and_then(|b| b.get("runtimeMode"))))
-        .unwrap_or_else(|| "full-access".into());
+    // SAME DECODER as the turn path (#237/#337). There is no durable record yet
+    // — that is what this function is about to write — so `None`, and a create
+    // that names no mode anywhere falls back to `RuntimeMode::default()`. That
+    // default is legitimate HERE and only here: this is the CREATE path, where
+    // the caller is stating the thread's mode rather than recovering one. Every
+    // later reader recovers, and recovery must not assume.
+    let runtime_mode = agent_sdk_shell::TurnLaunch::resolve(command, None)
+        .map(|l| l.runtime_mode)
+        .unwrap_or_default();
     // The durable row is built by the SDK record, not by hand (#2/#5): the
     // create path and the reconnect snapshot now agree by construction, because
     // both go through `ThreadRecord`. The keys below the record does not own are
@@ -844,7 +850,7 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
         project_id.clone(),
         title.clone(),
         sel.clone(),
-        agent_sdk_shell::RuntimeMode::parse(&runtime_mode),
+        runtime_mode.clone(),
         now.clone(),
     )
     .on_worktree(worktree_path.clone(), branch.clone())
@@ -1220,6 +1226,26 @@ fn spawn_vcs_watcher(state: AppState) {
             // subscriber was given. Publishing against the oldest is the safe
             // direction: a newer subscriber has already seen everything the
             // oldest has, so it can receive a repeat, but nobody can miss one.
+            // RECOVER LEAKED AUTHORITY FIRST (#247). A socket that closed while
+            // the store was locked left its claim behind, and the close callback
+            // that would have dropped it is the thing that already failed — so
+            // nothing in that path can ever come back for it. The sweep drops
+            // claims whose SUBSCRIPTION is gone and releases the mark of any key
+            // left with no claims, which is what turns "watched forever" into
+            // "watched until the next supervisor pass".
+            //
+            // Fail-closed on the sweep itself, for the same reason the read
+            // below is: a transient store error must not tear down live
+            // watches.
+            match state.rt.watch_sweep("vcs").await {
+                Ok(released) if !released.is_empty() => {
+                    tracing::info!(?released, "released vcs watches whose subscribers are gone")
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(%e, "vcs watch sweep failed; keeping current watches")
+                }
+            }
             let watched: Vec<(String, String)> = match state.rt.watch_marks("vcs").await {
                 Ok(w) => w,
                 // FAIL-CLOSED: a failed read is not "nothing is watched". Tearing
@@ -3389,10 +3415,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                         .vcs_watch_changed
                                         .send_modify(|v| *v = v.wrapping_add(1)),
                                     Ok(false) => {}
-                                    Err(e) => tracing::warn!(
-                                        %e, cwd = %cwd_close,
-                                        "could not release the vcs watch claim"
-                                    ),
+                                    Err(e) => {
+                                        // NOT best-effort any more (#247). The
+                                        // write failed, but the claim is no
+                                        // longer authoritative on its own: it is
+                                        // keyed by this tail's sub_id, and the
+                                        // SDK sweep drops claims whose
+                                        // subscription is gone. Waking the
+                                        // supervisor is what runs that sweep, so
+                                        // the leak costs one pass instead of
+                                        // outliving the process.
+                                        tracing::warn!(
+                                            %e, cwd = %cwd_close,
+                                            "could not release the vcs watch claim; \
+                                             waking the supervisor to sweep it"
+                                        );
+                                        state_close
+                                            .vcs_watch_changed
+                                            .send_modify(|v| *v = v.wrapping_add(1));
+                                    }
                                 }
                             },
                         );
@@ -4820,21 +4861,38 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // from the durable thread record — a mode set earlier by
         // `thread.meta.update` must still apply to a turn that does not repeat
         // it (#73/#79).
-        let pick = |key: &str, fallback: &str| -> String {
-            command
-                .get(key)
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    stored
-                        .as_ref()
-                        .and_then(|t| t.get(key))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or(fallback)
-                .to_string()
+        // ONE DECODER, ALL THREE SOURCES (#237/#337). This used to be a local
+        // `pick` reading only the command's TOP LEVEL and the durable row, with
+        // `"full-access"` as the fallback. Two bugs in one closure:
+        //
+        //  * it could not see `/bootstrap/createThread/runtimeMode`, which is
+        //    where a FIRST turn's mode lives — the same payload
+        //    `ensure_thread_on_shell` two frames up reads correctly. Two readers
+        //    of the same command, different schemas, different answers.
+        //  * when no source named a mode it granted `full-access`: the MOST
+        //    permissive gate, chosen by absence rather than by the user.
+        //
+        // `TurnLaunch::resolve` owns the precedence and refuses to assume an
+        // access mode. The durable row goes through `ThreadRecord::from_row`, so
+        // a damaged row is an error here too instead of quietly becoming
+        // full-access.
+        let record = match stored.as_ref().map(agent_sdk_shell::ThreadRecord::from_row) {
+            Some(Ok(r)) => Some(r),
+            Some(Err(e)) => {
+                tracing::error!(%thread_id, %e, "turn refused: durable thread record is unreadable");
+                return;
+            }
+            None => None,
         };
-        let runtime_mode = pick("runtimeMode", "full-access");
-        let interaction_mode = pick("interactionMode", "default");
+        let launch = match agent_sdk_shell::TurnLaunch::resolve(&command, record.as_ref()) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(%thread_id, %e, "turn refused: no runtime mode");
+                return;
+            }
+        };
+        let runtime_mode = launch.runtime_mode.as_str().to_string();
+        let interaction_mode = launch.interaction_mode.clone();
         let (ask_tools, instructions) = policy_for(&runtime_mode, &interaction_mode);
         tracing::info!(%thread_id, %runtime_mode, %interaction_mode, gated = ask_tools.len(), "turn policy");
         // WHERE this turn works. A thread created against a worktree stored the

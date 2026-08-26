@@ -438,8 +438,42 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
             "this environment can only publish to github (asked for {provider})"
         ));
     }
-    let visibility = input.get("visibility").and_then(Value::as_str).unwrap_or("private");
+    // CLOSED ENUM, resolved before any argv exists (#172). `visibility` used to
+    // be an arbitrary client string interpolated straight into `--{visibility}`,
+    // which is not a value at all — it is the NAME OF A FLAG. A client sending
+    // `disable-issues`, `disable-wiki`, `template`, or any future
+    // `gh repo create` option selected that mode, and cairn could not catch it:
+    // its screen answers "may this program run with option shapes like these",
+    // not "did the product mean this option". Deciding which gh mode a request
+    // selects is product policy, so the product decides it here, from a list.
+    let visibility = match input
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private")
+    {
+        "public" => "public",
+        "private" => "private",
+        "internal" => "internal",
+        other => {
+            return Err(format!(
+                "visibility must be one of public, private, internal (asked for {other})"
+            ))
+        }
+    };
     let remote_name = input.get("remoteName").and_then(Value::as_str).unwrap_or("origin");
+    // The same leak, one argument over. `repository` is POSITIONAL and
+    // `remote_name` is a value, so a leading `-` on either makes gh read it as
+    // an option instead of the name the client asked for. Reject the shape
+    // rather than betting on gh's parser and on which of these positions it
+    // happens to treat as greedy.
+    for (field, value) in [("repository", repository), ("remoteName", remote_name)] {
+        if value.starts_with('-') {
+            return Err(format!(
+                "{field} must not begin with '-' — {value:?} would be read as a \
+                 command-line option, not a name"
+            ));
+        }
+    }
 
     let repo = crate::vcs::open(cwd).await.ok_or("cwd is not a git repository")?;
     let branch = repo
