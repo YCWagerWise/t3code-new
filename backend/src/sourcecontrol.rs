@@ -136,14 +136,16 @@ const VCS_PROBES: &[VcsProbe] = &[
         label: "Git",
         executable: "git",
         implemented: true,
-        install_hint: "Install Git from https://git-scm.com/downloads or with your package manager.",
+        install_hint:
+            "Install Git from https://git-scm.com/downloads or with your package manager.",
     },
     VcsProbe {
         kind: "jj",
         label: "Jujutsu",
         executable: "jj",
         implemented: false,
-        install_hint: "Install Jujutsu with `brew install jj` or from https://github.com/jj-vcs/jj.",
+        install_hint:
+            "Install Jujutsu with `brew install jj` or from https://github.com/jj-vcs/jj.",
     },
 ];
 
@@ -232,7 +234,12 @@ fn parse_account(text: &str) -> (Option<String>, Option<String>) {
             let mut words = rest.split_whitespace().peekable();
             while let Some(w) = words.next() {
                 if (w == "account" || w == "as") && account.is_none() {
-                    account = words.peek().map(|n| n.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '@' && c != '.').to_string());
+                    account = words.peek().map(|n| {
+                        n.trim_matches(|c: char| {
+                            !c.is_alphanumeric() && c != '-' && c != '_' && c != '@' && c != '.'
+                        })
+                        .to_string()
+                    });
                 }
             }
         }
@@ -262,18 +269,18 @@ async fn discover_provider(p: &ProviderProbe) -> Value {
     }
 
     let auth_value = match run(p.executable, p.auth_args).await {
-        None => auth("unknown", none(), none(), some("the auth check could not be run")),
+        None => auth(
+            "unknown",
+            none(),
+            none(),
+            some("the auth check could not be run"),
+        ),
         Some(ap) if ap.exit_ok => {
             let combined = format!("{}\n{}", ap.stdout, ap.stderr);
             let (account, host) = parse_account(&combined);
             auth("authenticated", maybe(account), maybe(host), none())
         }
-        Some(ap) => auth(
-            "unauthenticated",
-            none(),
-            none(),
-            maybe(first_line(&ap)),
-        ),
+        Some(ap) => auth("unauthenticated", none(), none(), maybe(first_line(&ap))),
     };
     json!({
         "kind": p.kind, "label": p.label, "executable": p.executable,
@@ -287,7 +294,11 @@ fn discover_bitbucket() -> Value {
     let missing: Vec<&str> = BITBUCKET_ENV
         .iter()
         .copied()
-        .filter(|k| std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true))
+        .filter(|k| {
+            std::env::var(k)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
         .collect();
     let configured = missing.is_empty();
     json!({
@@ -333,7 +344,10 @@ pub async fn discover() -> Value {
 /// carries. GitHub is the only provider with a CLI we can drive here; the others
 /// report honestly that this environment cannot look them up.
 pub async fn lookup_repository(input: &Value) -> Result<Value, String> {
-    let provider = input.get("provider").and_then(Value::as_str).unwrap_or("unknown");
+    let provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let repository = input
         .get("repository")
         .and_then(Value::as_str)
@@ -377,9 +391,14 @@ pub async fn clone_repository(input: &Value, workspace_root: &str) -> Result<Val
     let destination_owned = crate::vcs::admit_new_directory(requested, workspace_root)?;
     let destination = destination_owned.as_str();
     if std::path::Path::new(destination).exists() {
-        return Err(format!("{destination} already exists — refusing to clone over it"));
+        return Err(format!(
+            "{destination} already exists — refusing to clone over it"
+        ));
     }
-    let protocol = input.get("protocol").and_then(Value::as_str).unwrap_or("auto");
+    let protocol = input
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
 
     // Either an explicit remote, or one resolved through the provider.
     let (remote_url, repository) = match input.get("remoteUrl").and_then(Value::as_str) {
@@ -432,16 +451,28 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .ok_or("repository is required")?;
-    let provider = input.get("provider").and_then(Value::as_str).unwrap_or("github");
+    let provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("github");
     if provider != "github" {
         return Err(format!(
             "this environment can only publish to github (asked for {provider})"
         ));
     }
-    let visibility = input.get("visibility").and_then(Value::as_str).unwrap_or("private");
-    let remote_name = input.get("remoteName").and_then(Value::as_str).unwrap_or("origin");
+    let visibility = input
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private");
+    let remote_name = input
+        .get("remoteName")
+        .and_then(Value::as_str)
+        .unwrap_or("origin");
+    validate_git_remote_name(remote_name)?;
 
-    let repo = crate::vcs::open(cwd).await.ok_or("cwd is not a git repository")?;
+    let repo = crate::vcs::open(cwd)
+        .await
+        .ok_or("cwd is not a git repository")?;
     let branch = repo
         .branch()
         .await
@@ -487,7 +518,8 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
             return Err(format!("gh repo create: {}", stderr.trim()));
         }
     }
-    let info = lookup_repository(&json!({ "provider": "github", "repository": repository })).await?;
+    let info =
+        lookup_repository(&json!({ "provider": "github", "repository": repository })).await?;
     let remote_url = info["url"].as_str().unwrap_or_default().to_string();
     Ok(json!({
         "repository": info,
@@ -499,12 +531,140 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
     }))
 }
 
+fn validate_git_remote_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("remoteName must not be empty".into());
+    }
+    if name.trim() != name || name.chars().any(char::is_whitespace) {
+        return Err(format!("remoteName {name:?} must not contain whitespace"));
+    }
+    if name.starts_with('-') {
+        return Err(format!("remoteName {name:?} must not begin with '-'"));
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Err(format!(
+            "remoteName {name:?} is not a valid git remote name"
+        ));
+    }
+    for part in name.split('/') {
+        if part == "." || part == ".." || part.ends_with(".lock") {
+            return Err(format!(
+                "remoteName {name:?} is not a valid git remote name"
+            ));
+        }
+    }
+    if name.contains("..") {
+        return Err(format!(
+            "remoteName {name:?} is not a valid git remote name"
+        ));
+    }
+    let invalid = ['~', '^', ':', '?', '*', '[', '\\'];
+    if name.chars().any(|c| c.is_control() || invalid.contains(&c)) {
+        return Err(format!(
+            "remoteName {name:?} is not a valid git remote name"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn init_git_repo(cwd: &std::path::Path) {
+        for args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "t@t"].as_slice(),
+            ["config", "user.name", "t"].as_slice(),
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}{}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::write(cwd.join("README.md"), "x\n").unwrap();
+        for args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-qm", "base"].as_slice(),
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}{}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     fn opt(v: &Value) -> Option<&str> {
         (v["_tag"] == "Some").then(|| v["value"].as_str().unwrap())
+    }
+
+    #[tokio::test]
+    async fn publish_repository_rejects_flag_shaped_remote_name_before_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let err = publish_repository(
+            &serde_json::json!({
+                "cwd": dir.path(),
+                "provider": "github",
+                "repository": "t3/remote-name-test",
+                "visibility": "private",
+                "remoteName": "--add-readme",
+            }),
+            dir.path().to_str().unwrap(),
+        )
+        .await
+        .expect_err("flag-shaped remoteName must fail before gh argv construction");
+
+        assert!(
+            err.contains("remoteName") && err.contains("must not begin"),
+            "remoteName validation error is explicit: {err}"
+        );
+        assert!(
+            !err.contains("gh repo create") && !err.contains("gh is not available"),
+            "invalid remoteName must be rejected before gh execution: {err}"
+        );
+    }
+
+    #[test]
+    fn git_remote_name_parser_rejects_git_invalid_names() {
+        for bad in [
+            "",
+            " bad",
+            "bad name",
+            "--template",
+            "/origin",
+            "origin/",
+            "origin//fork",
+            "origin..fork",
+            "origin.lock",
+            "origin:fork",
+            "origin\\fork",
+        ] {
+            assert!(
+                validate_git_remote_name(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        for good in ["origin", "upstream", "team/fork", "fork-2", "user.name"] {
+            validate_git_remote_name(good).expect(good);
+        }
     }
 
     /// The shape the contract demands, against the REAL host.
@@ -517,7 +677,14 @@ mod tests {
         assert_eq!(provs.len(), 4, "github, gitlab, azure-devops, bitbucket");
 
         for item in vcs.iter().chain(provs.iter()) {
-            for field in ["kind", "label", "status", "version", "installHint", "detail"] {
+            for field in [
+                "kind",
+                "label",
+                "status",
+                "version",
+                "installHint",
+                "detail",
+            ] {
                 assert!(!item[field].is_null(), "{field} missing from {item}");
             }
             assert!(
@@ -531,7 +698,10 @@ mod tests {
                     "{field} must be an encoded Option: {item}"
                 );
             }
-            assert!(!item["installHint"].as_str().unwrap().is_empty(), "a hint a user can act on");
+            assert!(
+                !item["installHint"].as_str().unwrap().is_empty(),
+                "a hint a user can act on"
+            );
         }
         for p in provs {
             let status = p["auth"]["status"].as_str().unwrap();
@@ -557,7 +727,10 @@ mod tests {
         assert_eq!(git["status"], "available");
         assert_eq!(git["implemented"], true);
         let version = opt(&git["version"]).expect("a version banner");
-        assert!(version.to_lowercase().contains("git"), "real banner: {version}");
+        assert!(
+            version.to_lowercase().contains("git"),
+            "real banner: {version}"
+        );
     }
 
     /// jj is reported even when installed, and never as implemented — the

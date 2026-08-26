@@ -1,0 +1,43 @@
+# Pinned Rust T3Code stack for integration verification.
+#
+# The backend depends on sibling repos by relative path. A crate-local green is
+# only provisional unless every sibling in this file is checked out at the
+# recorded revision and clean. `scripts/check-rust-stack.sh` enforces that before
+# running the backend integration check.
+
+[[repo]]
+name = "agent-sdk-rs"
+path = "../../agent-sdk-rs"
+rev = "a985a9f7529965caca4ff99712cc5b3e204a3040"
+
+[[repo]]
+name = "cairn"
+path = "../../cairn"
+rev = "6f620846021a2bad27707374ae23f4c7956b8337"
+
+[[repo]]
+name = "do-rs"
+path = "../../do-rs"
+rev = "57e2daf0b883039bd36cefd460ca6da7109790dc"
+
+[[repo]]
+name = "hearth"
+path = "../../hearth"
+rev = "3a4f018b01bee23367ebfb613c9a8e29dc33a411"
+
+[[repo]]
+name = "turso"
+path = "../../turso"
+rev = "7eb0b267cd0e8dea78b8bf603c8fe01f3110a379"
+
+[[repo]]
+name = "t3code-new"
+path = ".."
+# The product repo is the commit under test. The script verifies it is clean and
+# prints its concrete HEAD; sibling substrates are pinned above/below.
+rev = "self"
+
+[[repo]]
+name = "git-forks/rust-mcp"
+path = "../../git-forks/rust-mcp"
+rev = "5c4115bd5c40d115cb821e262cf707252c5308c2"

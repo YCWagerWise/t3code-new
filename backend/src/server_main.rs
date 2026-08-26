@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use agent_sdk_shell::{
-    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, SessionBinding,
-    Projector, Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
+    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, Projector, SessionBinding,
+    Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
 };
 
 use tokio::sync::RwLock;
@@ -353,6 +353,128 @@ fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, Strin
     (ask, instructions)
 }
 
+#[derive(Clone, Debug)]
+struct TurnLaunch {
+    provider_instance_id: String,
+    runtime_mode: String,
+    interaction_mode: String,
+    options: Vec<agent_sdk_provider::instance::ProviderOptionSelection>,
+    worktree: Option<String>,
+}
+
+fn optional_str(row: &Value, pointer: &str, label: &str) -> Result<Option<String>, String> {
+    match row.pointer(pointer) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let s = s.trim();
+            Ok((!s.is_empty()).then(|| s.to_string()))
+        }
+        Some(other) => Err(format!(
+            "thread launch metadata unavailable: {label} must be a string or null, got {other:?}"
+        )),
+    }
+}
+
+fn non_empty_str(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+async fn resolve_turn_launch(
+    state: &AppState,
+    command: &Value,
+    model: &ModelRef,
+) -> Result<TurnLaunch, String> {
+    use agent_sdk_provider::instance::decode_option_selections;
+
+    let thread_id = non_empty_str(command.get("threadId"))
+        .ok_or_else(|| "thread launch metadata unavailable: threadId is missing".to_string())?;
+    let boot = command.pointer("/bootstrap/createThread");
+    let stored = state
+        .rt
+        .try_threads()
+        .await
+        .map_err(|e| format!("thread launch metadata unavailable: thread store unreadable: {e}"))?
+        .into_iter()
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id.as_str()));
+
+    if stored.is_none() && boot.is_none() {
+        return Err(format!(
+            "thread launch metadata unavailable: no durable thread row for {thread_id:?} and no bootstrap.createThread"
+        ));
+    }
+
+    let provider_instance_id = non_empty_str(command.pointer("/modelSelection/instanceId"))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|t| non_empty_str(t.pointer("/modelSelection/instanceId")))
+        })
+        .unwrap_or_else(|| agent_sdk_shell::provider_instance_id(model));
+
+    let runtime_mode = non_empty_str(command.get("runtimeMode"))
+        .or_else(|| non_empty_str(boot.and_then(|b| b.get("runtimeMode"))))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|t| non_empty_str(t.get("runtimeMode")))
+        })
+        .ok_or_else(|| "thread launch metadata unavailable: runtimeMode is missing".to_string())?;
+    let interaction_mode = non_empty_str(command.get("interactionMode"))
+        .or_else(|| non_empty_str(boot.and_then(|b| b.get("interactionMode"))))
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|t| non_empty_str(t.get("interactionMode")))
+        })
+        .ok_or_else(|| {
+            "thread launch metadata unavailable: interactionMode is missing".to_string()
+        })?;
+    let worktree = optional_str(
+        command
+            .pointer("/bootstrap/createThread")
+            .unwrap_or(&Value::Null),
+        "/worktreePath",
+        "bootstrap.createThread.worktreePath",
+    )?
+    .or_else(|| non_empty_str(command.pointer("/bootstrap/prepareWorktree/projectCwd")))
+    .or_else(|| {
+        stored.as_ref().and_then(|t| {
+            optional_str(t, "/worktreePath", "worktreePath")
+                .ok()
+                .flatten()
+        })
+    });
+
+    let options = command
+        .pointer("/modelSelection/options")
+        .or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|t| t.pointer("/modelSelection/options"))
+        })
+        .filter(|v| !v.is_null())
+        .map(decode_option_selections)
+        .unwrap_or_default();
+
+    if let Some(stored) = &stored {
+        let _ = non_empty_str(stored.pointer("/modelSelection/instanceId")).ok_or_else(|| {
+            "thread launch metadata unavailable: modelSelection.instanceId is missing".to_string()
+        })?;
+        let _ = optional_str(stored, "/worktreePath", "worktreePath")?;
+    }
+
+    Ok(TurnLaunch {
+        provider_instance_id,
+        runtime_mode,
+        interaction_mode,
+        options,
+        worktree,
+    })
+}
+
 /// Where the agent works, and where its durable state lives.
 fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let root = std::env::var("T3CODE_WORKSPACE")
@@ -632,13 +754,17 @@ async fn asset_root(resource: &Value, state: &AppState) -> Result<String, String
                 .await
                 .into_iter()
                 .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` was not found"))?;
+                .ok_or_else(|| {
+                    format!("workspace-file asset thread `{thread_id}` was not found")
+                })?;
             let root = thread
                 .get("worktreePath")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` has no worktree root"))?;
+                .ok_or_else(|| {
+                    format!("workspace-file asset thread `{thread_id}` has no worktree root")
+                })?;
             Some(root.to_string())
         }
         "project-favicon" => resource
@@ -816,7 +942,9 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
+                    tracing::error!(
+                        "ensure_thread_on_shell: no seed project in store; refusing to invent an id"
+                    );
                     return;
                 }
             },
@@ -835,6 +963,9 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     let runtime_mode = str_of(command.get("runtimeMode"))
         .or_else(|| str_of(boot.and_then(|b| b.get("runtimeMode"))))
         .unwrap_or_else(|| "full-access".into());
+    let interaction_mode = str_of(command.get("interactionMode"))
+        .or_else(|| str_of(boot.and_then(|b| b.get("interactionMode"))))
+        .unwrap_or_else(|| "default".into());
     // The durable row is built by the SDK record, not by hand (#2/#5): the
     // create path and the reconnect snapshot now agree by construction, because
     // both go through `ThreadRecord`. The keys below the record does not own are
@@ -848,6 +979,7 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
         now.clone(),
     )
     .on_worktree(worktree_path.clone(), branch.clone())
+    .with_interaction_mode(interaction_mode)
     .project(json!({
         "latestUserMessageAt": now,
         "hasPendingApprovals": false,
@@ -1071,8 +1203,15 @@ async fn publish_approval_resolved(
     decision: &str,
     allowed: bool,
 ) -> Result<(), String> {
-    let decision =
-        if decision.is_empty() { if allowed { "accept" } else { "decline" } } else { decision };
+    let decision = if decision.is_empty() {
+        if allowed {
+            "accept"
+        } else {
+            "decline"
+        }
+    } else {
+        decision
+    };
     // `thread.approval-resolved` was invented — not in `OrchestrationEventType`,
     // so the reducer fell through its forward-compatible default and the banner
     // stayed up after the user answered (#315/#316).
@@ -1331,7 +1470,7 @@ fn config_snapshot_event(config: Value) -> Value {
     json!({ "version": 1, "type": "snapshot", "config": config })
 }
 
-async fn publish_config(state: &AppState, item: Value) {
+async fn publish_config(state: &AppState, item: Value) -> Result<(), String> {
     // Every settings/provider/keybindings mutation goes through the SDK's
     // durable config topic (packet DL). A second backend process attached to
     // the same isolate observes the frame; the old `Vec<Sender>` fanout only
@@ -1339,9 +1478,10 @@ async fn publish_config(state: &AppState, item: Value) {
     // surface stale until reconnect. Failure is loud: a broker publish that
     // cannot land is not a silent no-op — a subscriber that expected to see
     // this frame would otherwise be told nothing and act on stale config.
-    if let Err(e) = state.rt.config_publish(&item).await {
-        tracing::error!(%e, "config publish failed — subscribers may miss this update");
-    }
+    state.rt.config_publish(&item).await.map_err(|e| {
+        tracing::error!(%e, "config publish failed — refusing mutation success");
+        format!("config publish failed: {e}")
+    })
 }
 
 impl AppState {
@@ -1403,7 +1543,11 @@ impl AppState {
     /// workspace terminal. Keying the lookup by owner is the difference between
     /// addressing a subagent's shell and addressing something that merely
     /// answers.
-    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> Result<terminal::Terminal, String> {
+    async fn pane_runner(
+        &self,
+        owner: &terminal::TerminalOwner,
+        terminal_id: &str,
+    ) -> Result<terminal::Terminal, String> {
         match self.terminals.get(owner, terminal_id).await {
             Ok(Some(pane)) => Ok(pane.runner),
             Ok(None) => Ok(self.terminal.clone()),
@@ -1438,7 +1582,11 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
     // Built ONCE for the thread rather than per subscriber: every watcher of a
     // thread receives the same rows, and each row costs a PTY session lock.
     let now = now_iso();
-    let payload = match state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
+    let payload = match state
+        .terminals
+        .list(&terminal::TerminalOwner::thread(&thread))
+        .await
+    {
         Ok(panes) => {
             let mut rows = Vec::new();
             for pane in panes {
@@ -1490,7 +1638,10 @@ fn spawn_thread_tail_with_cleanup<F>(
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let sink = WsThreadSink { tx: tx.clone(), req: req.clone() };
+        let sink = WsThreadSink {
+            tx: tx.clone(),
+            req: req.clone(),
+        };
         loop {
             match tail.next(std::time::Duration::from_secs(25)).await {
                 Ok(items) => {
@@ -1682,7 +1833,9 @@ pub(crate) async fn dispatch_ws_frame(
                 .map(str::to_string);
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
-                if let Err(e) = stop_thread_checked(state, &thread_id, "thread.turn.interrupt").await {
+                if let Err(e) =
+                    stop_thread_checked(state, &thread_id, "thread.turn.interrupt").await
+                {
                     tracing::error!(%thread_id, ?req_id, %e, "ws interrupt failed");
                     if !req_id.is_null() {
                         exit_failure(tx, &req_id, &format!("interrupt failed: {e}"));
@@ -1966,7 +2119,7 @@ impl agent_sdk_shell::TurnCheckpointer for WorkspaceCheckpointer {
                 return Err(
                     "this workspace is not a git repository, so there is nothing to revert to"
                         .into(),
-                )
+                );
             }
             Err(why) => return Err(format!("checkpoint substrate unavailable: {why}")),
         };
@@ -2134,7 +2287,11 @@ async fn revert_checkpoint(
                 json!({ "threadId": thread_id, "turnCount": turn_count }),
             )
             .await
-            .map_err(|e| format!("checkpoint revert completed but thread.reverted could not be recorded: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "checkpoint revert completed but thread.reverted could not be recorded: {e}"
+                )
+            })?;
             // The worktree moved under every source-control subscriber too.
             publish_vcs_status(state, &cwd).await;
             Ok(())
@@ -2353,11 +2510,16 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 return;
             }
             let wire = keybindings::result_wire(&next);
-            exit_success(tx, &id, wire.clone());
             // Every other open surface (a second window, the command palette's
             // hint column) reads the projection this stream feeds, not this
             // command's return value.
-            publish_config(&state, config_event("keybindingsUpdated", wire)).await;
+            if let Err(e) =
+                publish_config(&state, config_event("keybindingsUpdated", wire.clone())).await
+            {
+                exit_failure(tx, &id, &e);
+                return;
+            }
+            exit_success(tx, &id, wire.clone());
         }
 
         // Provider management (#47/#60): the settings UI reads/writes provider
@@ -2365,10 +2527,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // runtime routes. Each write persists to the do-rs store and reconciles
         // the SAME live catalog, then answers with the shape the UI decodes.
         "server.getSettings" => {
-            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(instances) => instances,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             let other = match settings::load_other(state.rt.store()).await {
                 Ok(other) => other,
                 Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
@@ -2384,10 +2549,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 exit_failure(tx, &id, &e);
                 return;
             }
-            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(current) => current,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let current =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             let next = settings::apply_patch(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
@@ -2408,34 +2576,48 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Reconcile + answer with the EFFECTIVE set (saved re-merged under the
             // boot defaults), so a whole-map replace that removed a custom
             // provider drops it from the catalog while stock providers survive.
-            let effective = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(effective) => effective,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let effective =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(effective) => effective,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             settings::reconcile(&mut *state.catalog.write().await, &effective);
             let wire = settings::settings_wire(&effective, &other);
-            exit_success(tx, &id, wire.clone());
-            publish_config(
+            if let Err(e) = publish_config(
                 &state,
-                config_event("settingsUpdated", json!({"settings": wire})),
+                config_event("settingsUpdated", json!({"settings": wire.clone()})),
             )
-            .await;
-            publish_config(
+            .await
+            {
+                exit_failure(tx, &id, &e);
+                return;
+            }
+            if let Err(e) = publish_config(
                 &state,
                 config_event(
                     "providerStatuses",
                     json!({"providers": provider_entries(&state).await}),
                 ),
             )
-            .await;
+            .await
+            {
+                exit_failure(tx, &id, &e);
+                return;
+            }
+            exit_success(tx, &id, wire.clone());
         }
         "server.refreshProviders" => {
             // re-reconcile from the durable set (re-probes availability), then
             // answer with the current provider snapshots the UI renders.
-            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(instances) => instances,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             // A refresh is exactly when to ASK each OpenAI-compatible endpoint
             // what it serves: the user pointed at an Ollama and expects its
             // models to appear without hand-typing slugs (#180).
@@ -2451,18 +2633,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     .map(provider_entry)
                     .collect::<Vec<_>>()
             };
-            exit_success(tx, &id, json!({ "providers": providers.clone() }));
-            publish_config(
+            if let Err(e) = publish_config(
                 &state,
-                config_event("providerStatuses", json!({"providers": providers})),
+                config_event("providerStatuses", json!({"providers": providers.clone()})),
             )
-            .await;
+            .await
+            {
+                exit_failure(tx, &id, &e);
+                return;
+            }
+            exit_success(tx, &id, json!({ "providers": providers.clone() }));
         }
         "server.updateProvider" => {
-            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(current) => current,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let current =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             let next = settings::apply_provider_update(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist provider failed: {e}"));
@@ -2476,12 +2665,16 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     .map(provider_entry)
                     .collect::<Vec<_>>()
             };
-            exit_success(tx, &id, json!({ "providers": providers.clone() }));
-            publish_config(
+            if let Err(e) = publish_config(
                 &state,
-                config_event("providerStatuses", json!({"providers": providers})),
+                config_event("providerStatuses", json!({"providers": providers.clone()})),
             )
-            .await;
+            .await
+            {
+                exit_failure(tx, &id, &e);
+                return;
+            }
+            exit_success(tx, &id, json!({ "providers": providers.clone() }));
         }
 
         // The source-control settings/publish UI reads this to decide whether git
@@ -2823,8 +3016,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     Err(e) => {
                         tracing::error!(%e, %thread_id, "session status unreadable");
                         snapshot_tail.close().await;
-                        chunk(tx, &id, json!({ "kind": "error",
-                            "error": { "message": format!("session status unreadable: {e}") } }));
+                        chunk(
+                            tx,
+                            &id,
+                            json!({ "kind": "error",
+                            "error": { "message": format!("session status unreadable: {e}") } }),
+                        );
                         return;
                     }
                 };
@@ -3020,11 +3217,15 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             let cwd = match thread_cwd(&state, &thread_id).await {
                 Ok(cwd) => cwd,
                 Err(e) => {
-                    exit_typed_failure(tx, &id, json!({
-                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
-                                else { "OrchestrationGetFullThreadDiffError" },
-                        "message": format!("thread worktree unavailable: {e}"),
-                    }));
+                    exit_typed_failure(
+                        tx,
+                        &id,
+                        json!({
+                            "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                    else { "OrchestrationGetFullThreadDiffError" },
+                            "message": format!("thread worktree unavailable: {e}"),
+                        }),
+                    );
                     return;
                 }
             };
@@ -3517,8 +3718,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 exit_failure(tx, &id, &format!("could not start action control: {e}"));
                 return;
             }
-            match vcs::run_stacked_action_streaming(&cwd, &payload, &mut emit, Some(&action_control))
-                .await
+            match vcs::run_stacked_action_streaming(
+                &cwd,
+                &payload,
+                &mut emit,
+                Some(&action_control),
+            )
+            .await
             {
                 Ok(None) => {
                     let _ = action_control.clear(&action_id).await;
@@ -3527,7 +3733,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 }
                 Ok(Some((phase, message))) => {
                     if message.contains("cancelled") {
-                        let _ = action_control.finish(&action_id, agent_sdk_do::Checkpoint::Cancel).await;
+                        let _ = action_control
+                            .finish(&action_id, agent_sdk_do::Checkpoint::Cancel)
+                            .await;
                     }
                     let _ = action_control.clear(&action_id).await;
                     // A refused phase can still have mutated the repository —
@@ -3679,10 +3887,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 "projects.searchEntries" => {
                     exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
                 }
-                "projects.searchContents" => match projects::search_contents(&cwd, &payload).await {
-                    Ok(v) => exit_success(tx, &id, v),
-                    Err(e) => exit_failure(tx, &id, &e),
-                },
+                "projects.searchContents" => {
+                    match projects::search_contents(&cwd, &payload).await {
+                        Ok(v) => exit_success(tx, &id, v),
+                        Err(e) => exit_failure(tx, &id, &e),
+                    }
+                }
                 "projects.searchEntries" => {
                     exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
                 }
@@ -3927,7 +4137,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 {
                     Ok(p) => p,
                     Err(e) => {
-                        return exit_failure(tx, &id, &format!("terminal.attach restart: {e}"))
+                        return exit_failure(tx, &id, &format!("terminal.attach restart: {e}"));
                     }
                 }
             } else {
@@ -3974,16 +4184,24 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             match state.terminals.get(&owner, &term).await {
                 Ok(Some(pane)) => {
                     let started = terminal::pane_snapshot(&pane, &now_iso()).await;
-                    chunk(tx, &id, json!({ "type": "started", "threadId": owner.thread_id(), "terminalId": term, "snapshot": started }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({ "type": "started", "threadId": owner.thread_id(), "terminalId": term, "snapshot": started }),
+                    );
                     spawn_terminal_tail(pane.runner.clone(), tx.clone(), id.clone(), thread, term);
                 }
                 Ok(None) => {
                     // Announce the subscription with no snapshot, then WAIT for
                     // the real open rather than manufacturing one.
-                    chunk(tx, &id, json!({
-                        "type": "started", "threadId": owner.thread_id(), "terminalId": term,
-                        "snapshot": Value::Null, "pending": true,
-                    }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "started", "threadId": owner.thread_id(), "terminalId": term,
+                            "snapshot": Value::Null, "pending": true,
+                        }),
+                    );
                     let terminals = state.terminals.clone();
                     let (tx2, id2) = (tx.clone(), id.clone());
                     let (owner2, thread2, term2) = (owner.clone(), thread.clone(), term.clone());
@@ -3994,35 +4212,47 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         {
                             Ok(Some(pane)) => {
                                 let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
-                                chunk(&tx2, &id2, json!({
-                                    "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
-                                    "snapshot": snap,
-                                }));
+                                chunk(
+                                    &tx2,
+                                    &id2,
+                                    json!({
+                                        "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
+                                        "snapshot": snap,
+                                    }),
+                                );
                                 spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                chunk(&tx2, &id2, json!({
-                                    "type": "started",
-                                    "threadId": thread2,
-                                    "terminalId": term2,
-                                    "snapshot": Value::Null,
-                                    "terminalUnavailable": true,
-                                    "terminalError": e,
-                                }));
+                                chunk(
+                                    &tx2,
+                                    &id2,
+                                    json!({
+                                        "type": "started",
+                                        "threadId": thread2,
+                                        "terminalId": term2,
+                                        "snapshot": Value::Null,
+                                        "terminalUnavailable": true,
+                                        "terminalError": e,
+                                    }),
+                                );
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    chunk(tx, &id, json!({
-                        "type": "started",
-                        "threadId": owner.thread_id(),
-                        "terminalId": term,
-                        "snapshot": Value::Null,
-                        "terminalUnavailable": true,
-                        "terminalError": e,
-                    }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "started",
+                            "threadId": owner.thread_id(),
+                            "terminalId": term,
+                            "snapshot": Value::Null,
+                            "terminalUnavailable": true,
+                            "terminalError": e,
+                        }),
+                    );
                 }
             }
         }
@@ -4133,7 +4363,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             let mark = match state.rt.current_sequence().await {
                 Ok(mark) => mark,
                 Err(e) => {
-                    exit_failure(tx, &id, &format!("getArchivedShellSnapshot: sequence unreadable: {e}"));
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("getArchivedShellSnapshot: sequence unreadable: {e}"),
+                    );
                     return;
                 }
             };
@@ -4263,6 +4497,21 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             } else {
                 None
             };
+            let launch =
+                if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start") {
+                    match model.as_ref() {
+                        Some(model) => match resolve_turn_launch(&state, &command, model).await {
+                            Ok(launch) => Some(launch),
+                            Err(e) => {
+                                exit_failure(tx, &id, &e);
+                                return;
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
+                };
             // DispatchResult is { sequence } — an ACK, not an event. It is
             // durable (a client that remembers the last dispatch number must
             // not see it rewind after a restart, #299) but it comes from the
@@ -4303,9 +4552,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             }
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
-                    if let Some(model) = model {
+                    if let (Some(model), Some(launch)) = (model, launch) {
                         ensure_thread_on_shell(&state, &command).await;
-                        run_turn(command, model, state.clone());
+                        run_turn(command, model, launch, state.clone());
                     }
                 }
                 // STOP MEANS STOP (#52). Acking a stop while the turn keeps
@@ -4315,8 +4564,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // foreground interrupt for a bash command already running in
                 // the shared PTY.
                 Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
-                    let thread_id =
-                        command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let thread_id = command
+                        .get("threadId")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     match stop_thread_checked(&state, &thread_id, kind).await {
                         Ok(sessions) => tracing::info!(
                             %thread_id, %kind, sessions = sessions.len(), "stop dispatched"
@@ -4331,7 +4583,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         Ok(out) => out,
                         Err(e) => {
                             tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
-                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
+                            exit_failure(
+                                tx,
+                                &id,
+                                &format!("{kind} terminal interrupt failed: {e}"),
+                            );
                             return;
                         }
                     };
@@ -4533,14 +4789,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     match routed {
                         None => {
                             tracing::error!(%request_id, "malformed approval requestId — refusing to route");
-                            let detail =
-                                "this approval could not be routed (malformed request id)";
+                            let detail = "this approval could not be routed (malformed request id)";
                             if let Err(e) = publish_approval_failed(
-                                &state, &thread_id_of(&command), &request_id, detail,
+                                &state,
+                                &thread_id_of(&command),
+                                &request_id,
+                                detail,
                             )
                             .await
                             {
-                                exit_failure(tx, &id, &format!("approval failure projection failed: {e}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("approval failure projection failed: {e}"),
+                                );
                                 return;
                             }
                             exit_failure(tx, &id, detail);
@@ -4556,11 +4818,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     if let Err(e) = publish_approval_resolved(
-                                        &state, &thread_id_of(&command), &request_id, &decision, allow,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
+                                        &decision,
+                                        allow,
                                     )
                                     .await
                                     {
-                                        exit_failure(tx, &id, &format!("approval settlement projection failed: {e}"));
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            &format!("approval settlement projection failed: {e}"),
+                                        );
                                         return;
                                     }
                                 }
@@ -4570,14 +4840,23 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     // ignored; clearing it would be worse. The
                                     // request stays pending and carries why.
                                     tracing::error!(%request_id, %e, "approval response failed");
-                                    let detail = format!("the approval could not be delivered: {e}");
+                                    let detail =
+                                        format!("the approval could not be delivered: {e}");
                                     if let Err(projection) = publish_approval_failed(
-                                        &state, &thread_id_of(&command), &request_id,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
                                         &detail,
                                     )
                                     .await
                                     {
-                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            &format!(
+                                                "approval failure projection failed: {projection}"
+                                            ),
+                                        );
                                         return;
                                     }
                                     exit_failure(tx, &id, &detail);
@@ -4643,11 +4922,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             // success: telling the client the question is
                             // answered when the answer never reached the agent
                             // would unblock the composer over a lost answer.
-                            if let Err(e) =
-                                publish_user_input_resolved(&state, &thread_id_of(&command), &session)
-                                    .await
+                            if let Err(e) = publish_user_input_resolved(
+                                &state,
+                                &thread_id_of(&command),
+                                &session,
+                            )
+                            .await
                             {
-                                exit_failure(tx, &id, &format!("user-input settlement projection failed: {e}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("user-input settlement projection failed: {e}"),
+                                );
                                 return;
                             }
                         }
@@ -4659,12 +4945,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             tracing::error!(%request_id, %e, "user-input response failed");
                             let detail = format!("your answer could not be delivered: {e}");
                             if let Err(projection) = publish_user_input_failed(
-                                &state, &thread_id_of(&command), &session,
+                                &state,
+                                &thread_id_of(&command),
+                                &session,
                                 &detail,
                             )
                             .await
                             {
-                                exit_failure(tx, &id, &format!("user-input failure projection failed: {projection}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("user-input failure projection failed: {projection}"),
+                                );
                                 return;
                             }
                             exit_failure(tx, &id, &detail);
@@ -4748,7 +5040,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
 /// function only: picks the model, builds the durable [`SessionBinding`], and
 /// hands a [`T3Projector`] to `rt.run_turn`, which emits every lifecycle fact
 /// (including a guaranteed `TurnEnded`) on the durable bus (#5/#14/#15/#16/#17).
-fn run_turn(command: Value, model: ModelRef, state: AppState) {
+fn run_turn(command: Value, model: ModelRef, launch: TurnLaunch, state: AppState) {
     tokio::spawn(async move {
         let thread_id = command
             .get("threadId")
@@ -4782,72 +5074,33 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // The binding identity: thread + configured provider instance + model.
         // The runtime keys the durable session on all three, so switching the
         // instance never resumes a native provider thread under the wrong config.
-        // the durable thread record: the source for anything the command did
-        // not repeat (mode, model selection).
-        let stored = state
-            .rt
-            .threads()
-            .await
-            .into_iter()
-            .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id.as_str()));
         // The binding identity is the CONFIGURED instance the user picked, not
         // one derived from the resolved backend. Two instances of the same
         // driver pointing at the same base url and model — different creds,
         // env, or display identity — would otherwise collapse onto one durable
         // provider session, defeating the isolation the binding exists for
-        // (#103). Falls back to the derived id only when the command carried no
-        // selection at all.
-        let configured_instance = command
-            .pointer("/modelSelection/instanceId")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| {
-                stored
-                    .as_ref()
-                    .and_then(|t| t.pointer("/modelSelection/instanceId"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| agent_sdk_shell::provider_instance_id(&model));
+        // (#103). `resolve_turn_launch` already read the command/bootstrap or
+        // fallible durable row and refused malformed authority before the
+        // dispatch ack, so this async task does not consult the display
+        // quarantine snapshot or synthesize provider defaults.
         let binding = SessionBinding {
             thread_id: thread_id.clone(),
-            provider_instance_id: configured_instance,
+            provider_instance_id: launch.provider_instance_id,
             model_key: format!("{model:?}"),
         };
         // The gate the user asked for. Read from the COMMAND when present, else
         // from the durable thread record — a mode set earlier by
         // `thread.meta.update` must still apply to a turn that does not repeat
         // it (#73/#79).
-        let pick = |key: &str, fallback: &str| -> String {
-            command
-                .get(key)
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    stored
-                        .as_ref()
-                        .and_then(|t| t.get(key))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or(fallback)
-                .to_string()
-        };
-        let runtime_mode = pick("runtimeMode", "full-access");
-        let interaction_mode = pick("interactionMode", "default");
+        let runtime_mode = launch.runtime_mode;
+        let interaction_mode = launch.interaction_mode;
         let (ask_tools, instructions) = policy_for(&runtime_mode, &interaction_mode);
         tracing::info!(%thread_id, %runtime_mode, %interaction_mode, gated = ask_tools.len(), "turn policy");
         // WHERE this turn works. A thread created against a worktree stored the
         // path on its record; without carrying it onto the definition the tool
         // registry was built over the boot-time workspace root and the agent
         // edited the MAIN checkout while the UI showed the worktree (#207).
-        let worktree = stored
-            .as_ref()
-            .and_then(|t| t.get("worktreePath"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let worktree = launch.worktree;
         // #89 SECOND pass: the user's option choices now REACH the provider.
         // `model_from_selection` already validated them against the instance's
         // descriptors; carrying them onto the definition is what makes them
@@ -4856,19 +5109,7 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // to the stored thread's selection matters because a follow-up turn
         // often repeats only the text — dropping the options there would make
         // the knob apply to the first message of a thread and nothing after.
-        let options = {
-            use agent_sdk_provider::instance::decode_option_selections;
-            command
-                .pointer("/modelSelection/options")
-                .or_else(|| {
-                    stored
-                        .as_ref()
-                        .and_then(|t| t.pointer("/modelSelection/options"))
-                })
-                .filter(|v| !v.is_null())
-                .map(decode_option_selections)
-                .unwrap_or_default()
-        };
+        let options = launch.options;
         let def = AgentDefinition {
             name: "t3code".into(),
             instructions,
@@ -4996,7 +5237,10 @@ fn spawn_metadata_tail(
             // Holding `panes` for the length of the iteration also keeps each
             // runner alive across the wait, so a watch cannot end underneath us
             // and turn one closed pane into a terminated stream.
-            let panes = match terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await {
+            let panes = match terminals
+                .list(&terminal::TerminalOwner::thread(&thread_id))
+                .await
+            {
                 Ok(panes) => panes,
                 Err(e) => {
                     let ev = json!({
@@ -5005,7 +5249,11 @@ fn spawn_metadata_tail(
                         "terminals": Value::Null,
                         "error": format!("terminal pane store unavailable: {e}"),
                     });
-                    let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None));
+                    let _ = tx.send((
+                        json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] })
+                            .to_string(),
+                        None,
+                    ));
                     return;
                 }
             };
