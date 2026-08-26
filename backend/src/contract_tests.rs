@@ -281,9 +281,9 @@ fn every_projected_event_type_is_in_the_contract() {
     assert_eq!(input_failed[0].1["activity"]["tone"], "error");
 }
 
-/// Build a backend over an EXISTING workspace/data directory — i.e. what a
-/// process restart produces. Every durable claim the backend makes is only
-/// worth testing across one of these.
+/// Build a fresh in-process backend over an EXISTING workspace/data directory.
+/// This proves durable read/reconnect behavior without carrying AppState
+/// memory, but it does not prove crash recovery across a killed process.
 /// [`state_at`] with a MODEL behind the runtime's shell.
 ///
 /// `state_at` builds `Shell::new(..)` with no model override, so nothing in
@@ -310,6 +310,10 @@ async fn checkpoint_turn_start(state: &AppState, cwd: &str, turn_id: &str) {
         .expect("checkpoint_turn_start must succeed");
 }
 
+fn fixture_model_selection() -> Value {
+    json!({ "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" })
+}
+
 /// The minimal durable thread row the checkpoint/revert tests operate on.
 ///
 /// Was a helper in server_main.rs until it was removed during the #376
@@ -322,10 +326,9 @@ fn checkpoint_thread(id: &str) -> Value {
         "projectId": "p-workspace",
         "title": id,
         "runtimeMode": "full-access",
-        // The thread decoder refuses to INVENT these two, so a fixture that
-        // omits them is not a valid durable thread row. `null` is a recorded
-        // "no selection", which is what this fixture means.
-        "modelSelection": Value::Null,
+        // The thread decoder refuses to INVENT this, so fixtures use the real
+        // provider/model object rather than a lifecycle-invalid null.
+        "modelSelection": fixture_model_selection(),
         "interactionMode": "default",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
@@ -5770,8 +5773,8 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     };
     assert!(mark > 0, "the first process actually advanced the sequence");
 
-    // Second process over the SAME data dir. Nothing is carried in memory —
-    // this is the restart the old counter could not survive.
+    // Fresh AppState over the SAME data dir. Nothing from the prior AppState is
+    // carried in memory, but this is still an in-process graceful reopen.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -5833,7 +5836,7 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         state
             .rt
             .save_thread(&json!({ "runtimeMode": "full-access","id": "t-reconnect", "title": "before the restart",
-                "projectId": "p-workspace", "modelSelection": null, "interactionMode": "default",
+                "projectId": "p-workspace", "modelSelection": fixture_model_selection(), "interactionMode": "default",
                 "createdAt": now_iso(), "updatedAt": now_iso()}))
             .await
             .unwrap();
@@ -5850,7 +5853,8 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         }
     }
 
-    // Second process over the same directory — nothing carried in memory.
+    // Fresh AppState over the same directory — no AppState memory carried, but
+    // still a graceful in-process reopen rather than a killed process.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -5892,6 +5896,80 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
             .iter()
             .any(|f| f["values"][0]["kind"] == "synchronized"),
         "the client is told the subscription is live"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sigkilled_backend_child_serves_a_reconnecting_client_from_the_store() {
+    const CHILD_DIR_ENV: &str = "T3CODE_CONTRACT_SIGKILL_CHILD_DIR";
+    let test_name = "contract_tests::a_sigkilled_backend_child_serves_a_reconnecting_client_from_the_store";
+
+    if let Ok(dir) = std::env::var(CHILD_DIR_ENV) {
+        let dir = std::path::PathBuf::from(dir);
+        let state = state_at(&dir).await;
+        state
+            .rt
+            .save_thread(&json!({ "runtimeMode": "full-access",
+                "id": "t-crash-reconnect", "title": "before the crash",
+                "projectId": "p-workspace", "modelSelection": fixture_model_selection(),
+                "interactionMode": "default",
+                "createdAt": now_iso(), "updatedAt": now_iso()}))
+            .await
+            .unwrap();
+        state
+            .rt
+            .append_message(
+                "t-crash-reconnect",
+                &json!({"id": "m-crash", "role": "assistant", "text": "survived kill",
+                    "streaming": false, "createdAt": now_iso(), "updatedAt": now_iso()}),
+            )
+            .await
+            .unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &std::process::id().to_string()])
+            .status();
+        std::process::abort();
+    }
+
+    let dir = std::env::temp_dir().join(format!("t3ct-kill-{}", uuid::Uuid::new_v4()));
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test_name, "--exact", "--nocapture"])
+        .env(CHILD_DIR_ENV, &dir)
+        .status()
+        .expect("spawn crash child");
+    assert!(
+        !status.success(),
+        "child must die before running Drop; status was {status:?}"
+    );
+
+    let state = state_at(&dir).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-crash-reconnect"}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .unwrap_or_else(|| panic!("killed child write must recover into a snapshot: {frames:#?}"));
+    let thread = &snap["values"][0]["snapshot"]["thread"];
+    assert_eq!(thread["id"], "t-crash-reconnect");
+    let msgs = thread["messages"].as_array().expect("messages array");
+    assert_eq!(
+        msgs.iter()
+            .map(|m| m["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["m-crash"],
+        "the child-written transcript survived SIGKILL, got {msgs:?}"
+    );
+    assert_eq!(msgs[0]["text"], "survived kill");
+    assert!(
+        frames.iter().all(|f| f["_tag"] != "Exit"),
+        "subscribeThread stays open after crash recovery, got {frames:?}"
     );
 }
 
@@ -8038,7 +8116,7 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-durable-only", "projectId": "p-workspace", "title": "written durably",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": fixture_model_selection(), "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -8072,6 +8150,47 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_persisted_model_selection_fails_thread_projection() {
+    let (state, _tmp) = test_state().await;
+
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-bad-model", "projectId": "p-workspace", "title": "bad model",
+            "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .expect("persist the malformed row so the read boundary is tested");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-bad-model"}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .unwrap_or_else(|| panic!("malformed row must fail visibly: {frames:#?}"));
+    assert_eq!(exit["exit"]["_tag"], "Failure", "{exit}");
+    let why = exit["exit"]["cause"].to_string();
+    assert!(
+        why.contains("thread row t-bad-model") && why.contains("modelSelection"),
+        "the failure names the malformed durable model selection: {why}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["values"][0]["kind"].as_str() != Some("snapshot")),
+        "a lifecycle-invalid row must not be normalized into a snapshot: {frames:#?}"
+    );
+}
+
 /// PROOF (#370): the shell snapshot's `projects` field comes from the
 /// SAME durable source the `threads` field does — not a boot-time
 /// constant on `Store`. Two `AppState`s built over the same data dir
@@ -8099,7 +8218,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         "the seeded project carries createdAt: {projects_a:#?}"
     );
 
-    // Second process over the SAME data dir. If projects were still a
+    // Fresh AppState over the SAME data dir. If projects were still a
     // boot-time constant on `Store`, this snapshot would carry a fresh
     // `createdAt` for the same id — the divergence the finding names.
     // Instead, the second process's boot check sees the row already
@@ -8235,7 +8354,7 @@ async fn a_reconnect_past_the_catchup_limit_falls_back_to_a_coherent_snapshot() 
             "runtimeMode": "full-access", "id": "t-big", "title": "big",
             // subscribeThread PROJECTS this row, and the projection refuses to
             // invent metadata — so a durable thread row has to carry it.
-            "projectId": "p-workspace", "modelSelection": Value::Null,
+            "projectId": "p-workspace", "modelSelection": fixture_model_selection(),
             "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
@@ -8844,7 +8963,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 fn thread_row_ck(id: &str) -> Value {
     json!({
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": fixture_model_selection(), "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
 }
@@ -9067,7 +9186,7 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
     // The thread is dispatched into the WORKTREE.
     let thread = json!({
         "id": "t-wt", "projectId": "p-workspace", "title": "wt-thread",
-        "modelSelection": null,
+        "modelSelection": fixture_model_selection(),
         "runtimeMode": "full-access",
         "interactionMode": "default",
         "worktreePath": worktree.to_string_lossy(),
@@ -9298,7 +9417,7 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-archived", "projectId": "p-workspace", "title": "old",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": fixture_model_selection(), "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(), "archivedAt": now_iso(),
         }))
         .await
@@ -9443,7 +9562,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-live", "projectId": "p-workspace", "title": "int",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": fixture_model_selection(), "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9738,7 +9857,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-neg", "projectId": "p-workspace", "title": "int-neg",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": fixture_model_selection(), "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9834,7 +9953,7 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     // (interrupt on an unknown thread is a no-op, not an error).
     state.rt.save_thread(&json!({ "runtimeMode": "full-access",
         "id": "t-int", "projectId": "p-workspace", "title": "int",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": fixture_model_selection(), "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })).await.unwrap();
     let ready = state.terminal.run("echo ready", false, Some(10), false).await;
