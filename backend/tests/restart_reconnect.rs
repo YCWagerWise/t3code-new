@@ -93,13 +93,15 @@ fn binding(thread: &str) -> SessionBinding {
 /// stream items and published to the durable bus.
 fn projector(rt: &ThreadRuntime) -> BusProjector {
     BusProjector {
-        bus: rt.bus().clone(),
+        rt: rt.clone(),
         encode: Arc::new(|e: &Lifecycle| match e {
-            Lifecycle::Delta { text, .. } => vec![json!({"kind": "delta", "text": text})],
-            Lifecycle::MessageFinal { message_id, text, .. } => {
-                vec![json!({"kind": "final", "messageId": message_id, "text": text})]
+            Lifecycle::Delta { text, .. } => {
+                vec![("delta".into(), json!({"text": text}))]
             }
-            _ => vec![json!({"kind": "lifecycle"})],
+            Lifecycle::MessageFinal { message_id, text, .. } => {
+                vec![("final".into(), json!({"messageId": message_id, "text": text}))]
+            }
+            _ => vec![("lifecycle".into(), json!({}))],
         }),
     }
 }
