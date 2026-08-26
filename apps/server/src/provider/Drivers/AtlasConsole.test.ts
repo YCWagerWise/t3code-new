@@ -1,17 +1,21 @@
 import { describe, expect, it } from "@effect/vitest";
 
+import * as Schema from "effect/Schema";
+
 import {
   AtlasRefusal,
   atlasStartCommand,
   decodeLifecycleEvent,
+  projectFeedFrame,
   projectLifecycleEvent,
   readCatalog,
   readEvents,
   startTurn,
   type AtlasEndpoint,
+  type AtlasFrame,
   type FetchLike,
 } from "./AtlasConsole.ts";
-import type { ThreadId } from "@t3tools/contracts";
+import { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
 
 /**
  * A stub host that records what it was asked and answers what it was told to.
@@ -376,5 +380,178 @@ describe("readCatalog", () => {
     // A picker with no models is honest; a provider that fails to construct is not.
     const host = stubHost([{ match: "/_models", status: 401, body: "unauthenticated" }]);
     expect(await readCatalog(host.endpoint)).toEqual([]);
+  });
+});
+
+// ─────────────── projections must survive T3's own decoder ───────────────
+
+/**
+ * Frames captured from a real atlas-host, not invented here.
+ *
+ * Every row below was read off `GET /console/v1/threads/{id}/feed` on a live node during a
+ * local-model turn. Hand-written fixtures are what let the previous round ship a projection
+ * that agreed with its author and nothing else.
+ */
+const CAPTURED_FRAMES: ReadonlyArray<AtlasFrame> = [
+  {
+    seq: 7,
+    epoch: 1787713415759,
+    kind: "assistant",
+    role: "agent",
+    payload: { text: "pong" },
+  },
+  {
+    seq: 4,
+    epoch: 1787713415759,
+    kind: "user",
+    role: "agent",
+    payload: { text: "Reply with exactly the word: pong" },
+  },
+  {
+    seq: 5,
+    epoch: 1787713415759,
+    kind: "usage",
+    role: "agent",
+    payload: { input_tokens: 17168, output_tokens: 2, model: "qwen2.5-coder:7b" },
+  },
+  {
+    seq: 6,
+    epoch: 1787713415759,
+    kind: "ctx",
+    role: "agent",
+    payload: { used: 17168, window: 32768 },
+  },
+  {
+    seq: 8,
+    epoch: 1787713415759,
+    kind: "lifecycle",
+    role: "agent",
+    payload: { state: "completed", run_id: "r1" },
+  },
+  { seq: 9, epoch: 1787713415759, kind: "turn", role: "agent", payload: { state: "done" } },
+  {
+    seq: 10,
+    epoch: 1787713415759,
+    kind: "approval",
+    role: "agent",
+    payload: {
+      request_id: "r1:call-7",
+      request_type: "command_execution_approval",
+      tool: "mcp__triage__nodes",
+      args: {},
+      reason: "`triage` needs approval on this node",
+    },
+  },
+  {
+    seq: 11,
+    epoch: 1787713415759,
+    kind: "tool_call",
+    role: "agent",
+    payload: { call_id: "call-7", tool: "mcp__triage__nodes", args: {} },
+  },
+  {
+    seq: 12,
+    epoch: 1787713415759,
+    kind: "tool_result",
+    role: "agent",
+    payload: { call_id: "call-7", result_ref: "res-1" },
+  },
+  {
+    seq: 13,
+    epoch: 1787713415759,
+    kind: "thinking",
+    role: "agent",
+    payload: { text: "considering" },
+  },
+  { seq: 14, epoch: 1787713415759, kind: "error", role: "agent", payload: { message: "boom" } },
+  {
+    seq: 15,
+    epoch: 1787713415759,
+    kind: "warning",
+    role: "agent",
+    payload: { message: "model cannot call tools" },
+  },
+];
+
+const projectionContext = {
+  threadId: ThreadId.make("thr-decode"),
+  createdAt: "2026-08-26T00:00:00.000Z",
+  turnId: "run-1",
+};
+
+describe("frame projection against the real contract", () => {
+  /**
+   * The guard that would have caught #8.
+   *
+   * `projectFeedFrame` returns values cast to `ProviderRuntimeEvent`, so the typecheck cannot
+   * see a wrong `itemType` — `"tool_call"` is not a `CanonicalItemType` and every tool event
+   * failed T3's decoder while the build stayed green. Decoding here is what makes the cast
+   * honest: a bad shape fails this test instead of reaching the runtime.
+   */
+  it("emits only events T3 can actually decode", () => {
+    const decode = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+    for (const frame of CAPTURED_FRAMES) {
+      for (const event of projectFeedFrame(frame, projectionContext)) {
+        expect(
+          () => decode(event),
+          `frame kind "${frame.kind}" produced an undecodable event`,
+        ).not.toThrow();
+      }
+    }
+  });
+
+  /**
+   * Decoding alone passes vacuously when a projection returns NOTHING — which is how a
+   * deleted `case "approval"` slipped past the check above once already. So the kinds that
+   * must produce an event are named, and silence on any of them is a failure.
+   */
+  it("actually produces an event for every frame kind that carries one", () => {
+    const mustProject: Record<string, string> = {
+      assistant: "content.delta",
+      thinking: "content.delta",
+      approval: "request.opened",
+      tool_call: "item.started",
+      tool_result: "item.completed",
+      error: "runtime.error",
+      warning: "runtime.warning",
+    };
+    for (const [kind, expected] of Object.entries(mustProject)) {
+      const frame = CAPTURED_FRAMES.find((candidate) => candidate.kind === kind);
+      expect(frame, `no captured frame for kind "${kind}"`).toBeDefined();
+      const projected = projectFeedFrame(frame as AtlasFrame, projectionContext);
+      expect(projected.length, `kind "${kind}" projected nothing`).toBeGreaterThan(0);
+      expect(projected.map((event) => event.type)).toContain(expected);
+    }
+  });
+
+  it("joins a tool call to its result under one item id", () => {
+    const started = projectFeedFrame(CAPTURED_FRAMES[7] as AtlasFrame, projectionContext);
+    const completed = projectFeedFrame(CAPTURED_FRAMES[8] as AtlasFrame, projectionContext);
+    const startedId = (started[0] as unknown as Record<string, unknown>)["itemId"];
+    const completedId = (completed[0] as unknown as Record<string, unknown>)["itemId"];
+    expect(startedId).toBeDefined();
+    // One tool call is one item. Without a shared id the pair renders as two orphans.
+    expect(completedId).toEqual(startedId);
+    expect(
+      (started[0] as unknown as { payload: Record<string, unknown> }).payload["itemType"],
+    ).toEqual("mcp_tool_call");
+  });
+
+  it("stays silent on the frames the supervisor owns, so the lens is not a second author", () => {
+    for (const kind of ["turn", "lifecycle", "user", "usage", "ctx"]) {
+      const frame = CAPTURED_FRAMES.find((candidate) => candidate.kind === kind);
+      expect(projectFeedFrame(frame as AtlasFrame, projectionContext)).toEqual([]);
+    }
+  });
+
+  it("ignores a console echo of our own approval", () => {
+    const echoed: AtlasFrame = {
+      seq: 1,
+      epoch: 1,
+      kind: "approve",
+      role: "console",
+      payload: { request_id: "r1:call-7", approved: true },
+    };
+    expect(projectFeedFrame(echoed, projectionContext)).toEqual([]);
   });
 });

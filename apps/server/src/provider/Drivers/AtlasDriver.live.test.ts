@@ -24,6 +24,7 @@ import { ThreadId } from "@t3tools/contracts";
 import { makeAtlasDriver, probeAtlasHost } from "./AtlasDriver.ts";
 import {
   readCatalog,
+  readConsoleFrames,
   readEvents,
   readFeed,
   type AtlasEndpoint,
@@ -141,20 +142,44 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     expect(second.events).toEqual([]);
   });
 
-  it("sends an approval to the authority and surfaces its refusal when no run is waiting", async () => {
+  it("delivers a decision to Atlas durably, over a console it attached at session start", async () => {
     const created = await instance({});
+    const adapter = created.adapter;
     const threadId = ThreadId.make(`live-approval-${Date.now()}`);
+
+    // `startSession` resolves only once the console is ATTACHED. That ordering is the fix for
+    // the readiness race: atlas-host denies a gated tool when presence is zero, so a session
+    // that reported ready while still dialling could have a fast tool call refused before the
+    // user was ever asked.
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+
+    const requestId = `${String(threadId)}:call-7`;
     await Effect.runPromise(
-      created.adapter.startSession({ threadId, runtimeMode: "local" } as never),
+      adapter.respondToRequest(threadId, requestId as never, "acceptForSession" as never),
     );
-    // The command reaches the host over the console seam — the path that used to be a typed
-    // "unsupported" stub. With no run on the thread, Atlas refuses, and the user sees why.
-    const refusal = await Effect.runPromise(
-      Effect.flip(created.adapter.respondToRequest(threadId, "req-1" as never, "accept" as never)),
+    await Effect.runPromise(
+      adapter.respondToUserInput(
+        threadId,
+        `${String(threadId)}:ask-1` as never,
+        {
+          branch: "main",
+        } as never,
+      ),
     );
-    expect(String((refusal as { detail: string }).detail).length).toBeGreaterThan(0);
-    await Effect.runPromise(created.adapter.stopSession(threadId));
-  });
+
+    // `respondTo*` resolving means Atlas RECORDED it, not merely that bytes left the process.
+    // Read the console role back to show the receipt the driver waited on is really there.
+    const recorded = await readConsoleFrames(endpoint(), String(threadId));
+    const approve = recorded.find((frame) => frame.kind === "approve");
+    expect(approve?.payload).toEqual({ request_id: requestId, approved: true });
+    const answer = recorded.find((frame) => frame.kind === "answer");
+    expect(answer?.payload).toEqual({
+      request_id: `${String(threadId)}:ask-1`,
+      value: { branch: "main" },
+    });
+
+    await Effect.runPromise(adapter.stopSession(threadId));
+  }, 60_000);
 
   /** Poll a condition against a live node, on real time rather than event-loop ticks. */
   const waitForLive = async (condition: () => boolean, what: string): Promise<void> => {

@@ -24,7 +24,13 @@
  * @module provider/Drivers/AtlasConsole
  */
 import type { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
-import { EventId, ProviderDriverKind, TurnId } from "@t3tools/contracts";
+import {
+  EventId,
+  ProviderDriverKind,
+  RuntimeItemId,
+  RuntimeRequestId,
+  TurnId,
+} from "@t3tools/contracts";
 
 export const ATLAS_DRIVER_KIND = ProviderDriverKind.make("atlas");
 
@@ -643,8 +649,53 @@ export const readFeed = async (
   return { frames, cursor: { epoch, after: highest } };
 };
 
+/**
+ * Read back the frames THIS console wrote.
+ *
+ * A decision is only real once Atlas has stored it. `send` on a WebSocket resolves as soon as
+ * the bytes leave the process, which says nothing about whether the node recorded them — so a
+ * driver that reported success there would be telling the user their approval landed when a
+ * dropped connection had just eaten it. This is the receipt.
+ */
+export const readConsoleFrames = async (
+  endpoint: AtlasEndpoint,
+  threadId: string,
+): Promise<ReadonlyArray<AtlasFrame>> => {
+  const url =
+    `${endpoint.baseUrl}/console/v1/threads/${encodeURIComponent(threadId)}/feed` +
+    `?after=0&role=console`;
+  const response = await endpoint.fetch(url, { method: "GET", headers: headers(endpoint) });
+  const body = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    throw new AtlasRefusal({
+      status: response.status,
+      code: "feed_unavailable",
+      message: `console feed answered ${response.status}`,
+    });
+  }
+  const parsed = parse(body);
+  const raw = Array.isArray(parsed?.["frames"]) ? (parsed["frames"] as unknown[]) : [];
+  return raw.flatMap((entry) => {
+    const decoded = decodeFrame(entry);
+    return decoded === null ? [] : [decoded];
+  });
+};
+
 /** Frames the console itself wrote. Echoing our own commands back as content would double them. */
 const AGENT_ROLE = "agent";
+
+/**
+ * The id that joins a tool call to its result.
+ *
+ * Atlas names a call once (`call_id`) and reuses it on the result, so both ends of the pair
+ * derive the same `RuntimeItemId` and T3 renders one item. Without it the two events are
+ * unrelated orphans — which is what shipped, because nothing decoded them.
+ */
+const toolItemId = (frame: AtlasFrame): { itemId?: RuntimeItemId } => {
+  const callId = frame.payload["call_id"] ?? frame.payload["tool_id"];
+  if (typeof callId !== "string" || callId.length === 0) return {};
+  return { itemId: RuntimeItemId.make(`atlas-tool-${callId}`) };
+};
 
 /**
  * Turn one Atlas frame into T3 runtime events.
@@ -689,14 +740,23 @@ export const projectFeedFrame = (
       return delta("assistant_text");
     case "thinking":
       return delta("reasoning_text");
+    // Atlas tools are MCP tools (`mcp__triage__nodes`), so `mcp_tool_call` is the canonical
+    // type — NOT "tool_call", which is not a `CanonicalItemType` at all and made every tool
+    // event fail T3's decoder while an `as` cast kept the typecheck quiet.
+    //
+    // `itemId` is what joins a start to its result. Atlas's `call_id` is stable for the life
+    // of one tool call, so both ends derive the same id and the pair renders as one item
+    // rather than two orphans.
     case "tool_call": {
-      const name = frame.payload["name"] ?? frame.payload["tool"];
+      const name = frame.payload["tool"] ?? frame.payload["name"];
       return [
         {
           ...base,
+          ...toolItemId(frame),
           type: "item.started",
           payload: {
-            itemType: "tool_call",
+            itemType: "mcp_tool_call",
+            status: "inProgress",
             ...(typeof name === "string" && name.length > 0 ? { title: name } : {}),
             data: frame.payload,
           },
@@ -707,27 +767,29 @@ export const projectFeedFrame = (
       return [
         {
           ...base,
+          ...toolItemId(frame),
           type: "item.completed",
-          payload: { itemType: "tool_call", data: frame.payload },
+          payload: { itemType: "mcp_tool_call", status: "completed", data: frame.payload },
         } as ProviderRuntimeEvent,
       ];
     // A held tool call. `request_id` is Atlas's `{run_id}:{call_id}` and is the ONLY string an
-    // approval may quote back — `await_approval` matches on it exactly and ignores anything else.
+    // approval may quote back — `await_approval` matches on it exactly and ignores anything
+    // else, so a stale answer for a different held call cannot release this one.
     case "approval": {
       const requestId = frame.payload["request_id"];
-      if (typeof requestId !== "string") return [];
+      if (typeof requestId !== "string" || requestId.length === 0) return [];
       const requestType = frame.payload["request_type"];
       return [
         {
           ...base,
-          requestId,
+          requestId: RuntimeRequestId.make(requestId),
           type: "request.opened",
           payload: {
             requestType:
               typeof requestType === "string" && requestType.length > 0
                 ? requestType
                 : "command_execution_approval",
-            ...(typeof frame.payload["reason"] === "string"
+            ...(typeof frame.payload["reason"] === "string" && frame.payload["reason"].length > 0
               ? { detail: frame.payload["reason"] as string }
               : {}),
             args: frame.payload["args"],
@@ -846,6 +908,7 @@ export const makeConsolePresence = (input: {
   // Decisions made while the socket was down. Dropping one silently would strand the turn that
   // is waiting for it, and Atlas's gate deadline is the only other thing that would end it.
   let queued: Array<string> = [];
+  let waiters: Array<() => void> = [];
 
   const flush = (): void => {
     if (!open || socket === undefined) return;
@@ -856,14 +919,26 @@ export const makeConsolePresence = (input: {
 
   const dial = (): void => {
     if (closed) return;
+    // `browserSocketFactory` reports BOTH `error` and `close`, and a failed connection fires
+    // them in sequence. Without this latch each failure scheduled two re-dials, doubling on
+    // every retry until the backoff was meaningless.
+    //
+    // It latches the CLOSE path only. Latching on open as well would mean a socket that
+    // connected and later dropped never re-dialled — which is the "console silently stops
+    // existing, every later tool call is denied" failure this whole mechanism exists to avoid.
+    let reconnectScheduled = false;
     socket = input.connect(feedSocketUrl(input.endpoint, input.threadId), {
       onOpen: () => {
+        if (closed) return;
         open = true;
         attempt = 0;
+        for (const wake of waiters) wake();
+        waiters = [];
         flush();
       },
       onClose: () => {
-        if (closed) return;
+        if (reconnectScheduled || closed) return;
+        reconnectScheduled = true;
         open = false;
         socket = undefined;
         attempt += 1;
@@ -883,12 +958,28 @@ export const makeConsolePresence = (input: {
       queued = [...queued, JSON.stringify({ kind, payload })];
       flush();
     },
+    /**
+     * Resolve once Atlas has actually accepted the connection.
+     *
+     * A session that reports `ready` on a socket that is still connecting has no console
+     * presence yet, and `await_approval` denies a gated tool outright when presence is zero —
+     * so a turn that reached a tool quickly enough would be refused before the lens could ever
+     * be asked. Readiness therefore means attached, not dialling.
+     */
+    whenAttached: (): Promise<void> =>
+      open
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            waiters = [...waiters, resolve];
+          }),
     reconnect: dial,
     isOpen: () => open,
     pending: () => queued.length,
     close: (): void => {
       closed = true;
       open = false;
+      for (const wake of waiters) wake();
+      waiters = [];
       socket?.close();
       socket = undefined;
     },

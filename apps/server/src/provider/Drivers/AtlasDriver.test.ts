@@ -274,6 +274,7 @@ const makeFakeAtlas = () => {
   const receipts = new Map<string, unknown>();
   const log: Array<Record<string, unknown>> = [];
   const frames: Array<Record<string, unknown>> = [];
+  const consoleFrames: Array<Record<string, unknown>> = [];
   const FEED_EPOCH = 1_700_000_000_000;
   let failReads = 0;
   let reads = 0;
@@ -294,7 +295,16 @@ const makeFakeAtlas = () => {
   const fetch: FetchLike = (url, init) => {
     const href = String(url);
     if (href.includes("/feed")) {
-      const after = Number(new URL(href).searchParams.get("after") ?? 0);
+      const params = new URL(href).searchParams;
+      // A real node stores what the console wrote and serves it back under role=console. That
+      // read-back is the receipt a decision is confirmed against.
+      if (params.get("role") === "console") {
+        return Promise.resolve({
+          status: 200,
+          text: () => Promise.resolve(JSON.stringify({ epoch: FEED_EPOCH, frames: consoleFrames })),
+        });
+      }
+      const after = Number(params.get("after") ?? 0);
       const visible = frames.filter((frame) => Number(frame["seq"]) > after);
       return Promise.resolve({
         status: 200,
@@ -340,11 +350,24 @@ const makeFakeAtlas = () => {
     frames.push({ epoch: FEED_EPOCH, seq: frames.length + 1, kind, role: "agent", payload });
   };
 
+  /** What the console wrote, as the node would have durably stored it. */
+  const recordConsole = (frame: { kind: string; payload: Record<string, unknown> }): void => {
+    consoleFrames.push({
+      epoch: FEED_EPOCH,
+      seq: consoleFrames.length + 1,
+      kind: frame.kind,
+      role: "console",
+      payload: frame.payload,
+    });
+  };
+
   return {
     fetch,
     commands,
     append,
     say,
+    recordConsole,
+    consoleFrames,
     reads: () => reads,
     consumedUpTo: () => consumedUpTo,
     failNextReads: (count: number) => {
@@ -385,6 +408,18 @@ const settle = async (): Promise<void> => {
   for (let index = 0; index < 25; index += 1) await instantSleep();
 };
 
+/**
+ * A socket that connects and does nothing, for the tests that are not about approvals.
+ *
+ * Without it these adapters reach for a real WebSocket against a port nothing is listening on;
+ * the failure re-dials on the adapter's injected clock, which these tests make instant, and the
+ * resulting tight loop starves the event loop so nothing else makes progress.
+ */
+const silentSocket: AtlasSocketFactory = (_url, handlers) => {
+  queueMicrotask(handlers.onOpen);
+  return { send: () => {}, close: () => {} };
+};
+
 const adapterFor = (node: ReturnType<typeof makeFakeAtlas>) =>
   makeAtlasAdapter({
     endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: undefined, fetch: node.fetch },
@@ -392,6 +427,7 @@ const adapterFor = (node: ReturnType<typeof makeFakeAtlas>) =>
     instanceId: "atlas-1",
     sleep: instantSleep,
     idlePollMs: 0,
+    connect: silentSocket,
   });
 
 const startSession = (adapter: ReturnType<typeof adapterFor>, resumeCursor?: unknown) =>
@@ -626,7 +662,7 @@ describe("turn identity", () => {
 });
 
 /** A console socket a test can open, drop and inspect, with no server involved. */
-const makeFakeSocket = () => {
+const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
   const sent: Array<{ kind: string; payload: Record<string, unknown> }> = [];
   const urls: Array<string> = [];
   let live: { onOpen: () => void; onClose: () => void } | undefined;
@@ -640,6 +676,8 @@ const makeFakeSocket = () => {
       send: (data: string) => {
         const frame = JSON.parse(data) as { kind: string; payload: Record<string, unknown> };
         sent.push(frame);
+        // The node durably records it, which is what the driver reads back to confirm.
+        node?.recordConsole(frame);
       },
       close: () => {},
     };
@@ -677,7 +715,7 @@ const socketAdapterFor = (
 describe("approvals", () => {
   it("attaches a console the moment the session opens, because an unattached one auto-denies", async () => {
     const node = makeFakeAtlas();
-    const socket = makeFakeSocket();
+    const socket = makeFakeSocket(node);
     const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
     await settle();
@@ -695,7 +733,7 @@ describe("approvals", () => {
 
   it("answers the id Atlas stated on the approval frame, and carries the decision", async () => {
     const node = makeFakeAtlas();
-    const socket = makeFakeSocket();
+    const socket = makeFakeSocket(node);
     const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
     await settle();
@@ -718,7 +756,7 @@ describe("approvals", () => {
 
   it("declines as a decision, not as silence", async () => {
     const node = makeFakeAtlas();
-    const socket = makeFakeSocket();
+    const socket = makeFakeSocket(node);
     const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
     await settle();
@@ -732,7 +770,7 @@ describe("approvals", () => {
 
   it("carries a structured answer over the same presence", async () => {
     const node = makeFakeAtlas();
-    const socket = makeFakeSocket();
+    const socket = makeFakeSocket(node);
     const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
     await settle();
@@ -751,26 +789,179 @@ describe("approvals", () => {
     });
   });
 
-  it("holds a decision made while the socket is down instead of dropping it", async () => {
+  it("does not report a decision delivered until Atlas has stored it", async () => {
     const node = makeFakeAtlas();
-    const socket = makeFakeSocket();
-    const adapter = socketAdapterFor(node, socket);
+    const socket = makeFakeSocket(node);
+    // A real (tiny) clock here, unlike the other tests: this one is ABOUT the retry window, and
+    // an instant sleep would burn every attempt before the socket could come back.
+    const adapter = makeAtlasAdapter({
+      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: "tok", fetch: node.fetch },
+      fleetId: "default",
+      instanceId: "atlas-1",
+      sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, Math.min(ms, 20))),
+      idlePollMs: 5,
+      connect: socket.connect,
+    });
     await startSession(adapter);
-    await settle();
     socket.drop();
 
-    await Effect.runPromise(
+    // The user clicks while the connection is down. The decision must neither be lost nor
+    // reported as delivered — a success here would tell them the tool was approved while the
+    // turn quietly died on the gate's deadline.
+    let settled = false;
+    const decision = Effect.runPromise(
       adapter.respondToRequest(ThreadId.make("thr-1"), "run-1:call-1" as never, "accept" as never),
-    );
-    await settle();
-    // Nothing sent yet — but the user's click is not lost either.
-    expect(socket.sent).toHaveLength(0);
+    ).then(() => {
+      settled = true;
+    });
+    await new Promise<void>((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    expect(node.consoleFrames).toHaveLength(0);
 
     socket.restore();
-    await settle();
+    await decision;
     await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
-    // A dropped decision would strand the turn until Atlas's gate deadline expired.
-    expect(socket.sent).toHaveLength(1);
-    expect(socket.sent[0]?.payload).toEqual({ request_id: "run-1:call-1", approved: true });
+
+    // Held across the outage, then delivered and confirmed against the durable feed.
+    expect(settled).toBe(true);
+    expect(node.consoleFrames).toHaveLength(1);
+    expect(node.consoleFrames[0]?.["payload"]).toEqual({
+      request_id: "run-1:call-1",
+      approved: true,
+    });
+  });
+
+  it("reports a failure rather than a success when Atlas never records the decision", async () => {
+    const node = makeFakeAtlas();
+    // A socket that accepts writes and drops them: the shape of a half-open connection, and
+    // the case where claiming success is most harmful.
+    const blackhole: AtlasSocketFactory = (_url, handlers) => {
+      queueMicrotask(handlers.onOpen);
+      return { send: () => {}, close: () => {} };
+    };
+    const adapter = makeAtlasAdapter({
+      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: "tok", fetch: node.fetch },
+      fleetId: "default",
+      instanceId: "atlas-1",
+      sleep: instantSleep,
+      idlePollMs: 0,
+      connect: blackhole,
+    });
+    await startSession(adapter);
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        adapter.respondToRequest(
+          ThreadId.make("thr-1"),
+          "run-1:call-2" as never,
+          "accept" as never,
+        ),
+      ),
+    );
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    // The user is told it may not have applied, instead of being told it did.
+    expect(String((failure as { detail: string }).detail)).toContain("did not record");
+  });
+});
+
+describe("cursor persistence", () => {
+  const persistingAdapter = (
+    node: ReturnType<typeof makeFakeAtlas>,
+    onSessionCursor: (update: {
+      threadId: string;
+      providerInstanceId: string;
+      cursor: { epoch: number; after: number; feed: { epoch: number; after: number } };
+    }) => Promise<void>,
+  ) =>
+    makeAtlasAdapter({
+      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: undefined, fetch: node.fetch },
+      fleetId: "default",
+      instanceId: "atlas-1",
+      sleep: instantSleep,
+      idlePollMs: 0,
+      connect: silentSocket,
+      onSessionCursor,
+    });
+
+  it("stores the full dual cursor after projecting, naming the thread and instance", async () => {
+    const node = makeFakeAtlas();
+    const stored: Array<Record<string, unknown>> = [];
+    const adapter = persistingAdapter(node, async (update) => {
+      stored.push(update as unknown as Record<string, unknown>);
+    });
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    node.append("command.accepted", { command: { kind: "start" } });
+    node.say("assistant", { text: "pong" });
+    await waitFor(
+      () =>
+        stored.some(
+          (entry) =>
+            (entry["cursor"] as { after: number; feed: { after: number } }).after >= 1 &&
+            (entry["cursor"] as { after: number; feed: { after: number } }).feed.after >= 1,
+        ),
+      "a persisted cursor covering both logs",
+    );
+    await teardown(adapter, fiber);
+
+    const last = stored[stored.length - 1] as unknown as {
+      threadId: string;
+      providerInstanceId: string;
+      cursor: { epoch: number; after: number; feed: { epoch: number; after: number } };
+    };
+    expect(last.threadId).toEqual("thr-1");
+    expect(last.providerInstanceId).toEqual("atlas-1");
+    // BOTH logs, in one write — persisting only the lifecycle half is what made a restart
+    // replay the entire frame feed.
+    expect(last.cursor.epoch).toEqual(1);
+    expect(last.cursor.after).toEqual(1);
+    expect(last.cursor.feed.after).toEqual(1);
+  });
+
+  it("does not advance past events whose position was never stored", async () => {
+    const node = makeFakeAtlas();
+    let failing = true;
+    const adapter = persistingAdapter(node, async () => {
+      if (failing) throw new Error("disk full");
+    });
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    node.append("command.accepted", { command: { kind: "start" } });
+
+    // Persistence keeps failing, so the reader must keep re-reading the same page rather than
+    // moving past it. Re-delivery is idempotent for the projection; skipping is not.
+    await waitFor(() => seen.length >= 3, "the same page to be re-delivered while writes fail");
+    expect(seen.every((type) => type === "turn.started")).toBe(true);
+
+    // Once the write succeeds the cursor finally moves, and the thread stops repeating.
+    failing = false;
+    await settle();
+    const settledCount = seen.length;
+    await settle();
+    expect(seen.length).toEqual(settledCount);
+    await teardown(adapter, fiber);
+  });
+
+  it("refuses to move a bookmark backwards", async () => {
+    const node = makeFakeAtlas();
+    const stored: Array<{ after: number }> = [];
+    const adapter = persistingAdapter(node, async (update) => {
+      stored.push({ after: update.cursor.after });
+    });
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    // Hydrated from a position AHEAD of what this stale node will report.
+    await startSession(adapter, {
+      epoch: 1,
+      after: 5,
+      feed: { epoch: 1_700_000_000_000, after: 9 },
+    });
+    node.append("command.accepted", { command: { kind: "start" } });
+    await settle();
+    await teardown(adapter, fiber);
+
+    // A stale page must never rewind the cursor and re-show content the user has seen.
+    expect(stored.every((entry) => entry.after >= 5)).toBe(true);
   });
 });

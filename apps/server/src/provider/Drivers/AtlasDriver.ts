@@ -57,6 +57,7 @@ import {
   fingerprint,
   makeConsolePresence,
   parseAtlasCursor,
+  readConsoleFrames,
   projectFeedFrame,
   projectLifecycleEvent,
   readCatalog,
@@ -247,6 +248,25 @@ const unsupported = (operation: string) =>
 
 const nowIso = () => new Date().toISOString();
 
+/**
+ * Whether `next` is at or ahead of where the thread already is, on BOTH logs.
+ *
+ * The two logs advance independently, so a page that moves one while the other stands still is
+ * still forward progress. What this rejects is a page that would move either bookmark
+ * BACKWARDS — a stale read racing a fresh one, which would re-deliver content already shown.
+ * A new epoch is a new stream and is always accepted: its sequence numbers are unrelated to
+ * the old one's, so comparing them would be meaningless.
+ */
+const isForward = (
+  live: { cursor: AtlasCursor; feedCursor: AtlasFeedCursor },
+  next: { epoch: number; after: number; feed: AtlasFeedCursor },
+): boolean => {
+  const lifecycleOk = next.epoch !== live.cursor.epoch || next.after >= live.cursor.after;
+  const feedOk =
+    next.feed.epoch !== live.feedCursor.epoch || next.feed.after >= live.feedCursor.after;
+  return lifecycleOk && feedOk;
+};
+
 interface LiveThread {
   cursor: AtlasCursor;
   /** Position in the FRAME feed — a different log with its own epoch space. */
@@ -267,6 +287,8 @@ const IDLE_POLL_MS = 400;
 const RETRY_FLOOR_MS = 250;
 /** Ceiling on that doubling: a node that is down must not be hammered, nor abandoned. */
 const RETRY_CEILING_MS = 10_000;
+/** How many times a decision is re-sent before the user is told it could not be confirmed. */
+const DECISION_ATTEMPTS = 5;
 
 /**
  * A sleep that a wake-up can cut short.
@@ -311,6 +333,25 @@ export interface AtlasAdapterInput {
   readonly idlePollMs?: number;
   /** Injectable so a test can drive the console socket without a server. */
   readonly connect?: AtlasSocketFactory;
+  /**
+   * Persist a thread's position, awaited before the reader advances past it.
+   *
+   * Optional and additive: a driver built without one keeps the previous behaviour, where the
+   * cursor only reaches durable storage at a turn boundary and a mid-turn restart replays.
+   *
+   * It is awaited, and a rejection is NOT swallowed — the reader keeps its old position and
+   * retries rather than moving past events whose delivery was never recorded. Acknowledging a
+   * cursor that was not stored is how a restart silently skips a turn's content.
+   */
+  readonly onSessionCursor?: (update: {
+    readonly threadId: string;
+    readonly providerInstanceId: string;
+    readonly cursor: {
+      readonly epoch: number;
+      readonly after: number;
+      readonly feed: AtlasFeedCursor;
+    };
+  }) => Promise<void>;
 }
 
 export const makeAtlasAdapter = (
@@ -411,7 +452,6 @@ export const makeAtlasAdapter = (
           backoff = 0;
           const current = threads.get(threadId);
           if (current === undefined) break;
-          threads.set(threadId, { ...current, cursor: page.cursor, feedCursor: frames.cursor });
           if (page.events.length > 0) observe(threadId, page.events);
           const projected = [
             ...page.events.flatMap((event) =>
@@ -429,6 +469,45 @@ export const makeAtlasAdapter = (
             ),
           ];
           if (projected.length > 0) publish(projected);
+
+          // Advance ONLY after the events have been projected and the new position has been
+          // durably stored. Storing first would let a crash between the write and the publish
+          // lose a turn's content; advancing without storing lets a restart resume past events
+          // nobody ever saw. Both orders are silent, so the order is the invariant.
+          const advanced = { ...page.cursor, feed: frames.cursor };
+          if (!isForward(current, advanced)) {
+            // A fenced write: a stale page must never move the bookmark backwards.
+            await gate.wait(idlePollMs);
+            continue;
+          }
+          const moved =
+            advanced.epoch !== current.cursor.epoch ||
+            advanced.after !== current.cursor.after ||
+            advanced.feed.epoch !== current.feedCursor.epoch ||
+            advanced.feed.after !== current.feedCursor.after;
+          // Only write when the position actually changed. Persisting on every idle poll would
+          // put a durable write behind each tick of a loop whose whole job is to spin quietly.
+          if (moved && input.onSessionCursor !== undefined) {
+            // A rejection leaves the in-memory cursor untouched, so the next read re-delivers
+            // the same page rather than skipping it. Projection is idempotent; skipping is not.
+            await input.onSessionCursor({
+              threadId,
+              providerInstanceId: input.instanceId,
+              cursor: advanced,
+            });
+          }
+          // Deliberately NOT named `live`: the loop's own `live` is read at the top of this
+          // same try block, and a second `const live` here put those reads in its temporal
+          // dead zone. Every iteration threw a ReferenceError that the catch below swallowed
+          // as if it were a failed fetch, so the reader retried forever and delivered nothing.
+          const beforeAdvance = threads.get(threadId);
+          if (beforeAdvance === undefined) break;
+          threads.set(threadId, {
+            ...beforeAdvance,
+            cursor: page.cursor,
+            feedCursor: frames.cursor,
+          });
+
           // More may already be waiting; ask again before parking.
           if (page.events.length > 0 || frames.frames.length > 0) continue;
           await gate.wait(idlePollMs);
@@ -480,6 +559,48 @@ export const makeAtlasAdapter = (
     }
   };
 
+  /**
+   * Send a decision and do not report success until Atlas has stored it.
+   *
+   * A WebSocket `send` resolves when the bytes leave this process, which says nothing about
+   * whether the node recorded them — reporting success there tells a user their approval
+   * landed when a dropped connection has just eaten it, and the turn then dies on the gate's
+   * deadline with no one aware. So the frame is re-sent until it can be READ BACK off the
+   * console role of the durable feed.
+   *
+   * Re-sending is safe because the decision is idempotent: `await_approval` takes the first
+   * frame matching its `request_id` and ignores the rest, so a duplicate cannot resolve a
+   * second call or reverse this one.
+   */
+  const deliverDecision = async (
+    threadId: string,
+    kind: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> => {
+    const requestId = String(payload["request_id"]);
+    const presence = presenceFor(threadId);
+    for (let attemptNumber = 0; attemptNumber < DECISION_ATTEMPTS; attemptNumber += 1) {
+      presence.send(kind, payload);
+      // Give the write a chance to land before asking whether it did.
+      await sleep(attemptNumber === 0 ? 100 : Math.min(250 * 2 ** attemptNumber, 2_000));
+      try {
+        const stored = await readConsoleFrames(input.endpoint, threadId);
+        if (
+          stored.some((frame) => frame.kind === kind && frame.payload["request_id"] === requestId)
+        ) {
+          return;
+        }
+      } catch {
+        // A failed read is not a failed decision — try again rather than claiming either way.
+      }
+    }
+    throw new AtlasRefusal({
+      status: 504,
+      code: "decision_unconfirmed",
+      message: `atlas did not record the ${kind} for ${requestId}; it may not have been applied`,
+    });
+  };
+
   const stopReader = (threadId: string): void => {
     readers.get(threadId)?.stop();
     readers.delete(threadId);
@@ -493,11 +614,8 @@ export const makeAtlasAdapter = (
     capabilities: { sessionModelSwitch: "unsupported" },
 
     startSession: (start) =>
-      Effect.sync(() => {
+      Effect.promise(async () => {
         const threadId = String(start.threadId);
-        // Resume where the last process stopped. Resetting to `{epoch:1, after:0}` here — as
-        // this driver used to — threw away the persisted position on every restart and
-        // re-rendered the whole thread; an unparseable blob is the only case that replays.
         // One persisted blob carries BOTH positions: `{...lifecycle, feed?}`. An older blob
         // that predates the feed reader parses as the lifecycle half and starts the frame feed
         // at its beginning, which replays content rather than skipping it.
@@ -512,8 +630,11 @@ export const makeAtlasAdapter = (
           awaitingRef: undefined,
         });
         startReader(threadId);
-        // Attach BEFORE any turn can gate a tool: an unattached console is an auto-deny.
-        presenceFor(threadId);
+        // Attach BEFORE reporting ready, not merely before the first turn. `await_approval`
+        // denies a gated tool when console presence is zero, so a session that answered
+        // "ready" while its socket was still connecting could have a turn refused before the
+        // user was ever asked. Ready means attached.
+        await presenceFor(threadId).whenAttached();
         return {
           provider: ATLAS_DRIVER_KIND,
           providerInstanceId: input.instanceId as never,
@@ -617,27 +738,31 @@ export const makeAtlasAdapter = (
      * refuses and the user is told why rather than having the click swallowed.
      */
     respondToRequest: (threadId, requestId, decision) =>
-      Effect.sync(() => {
-        const key = String(threadId);
-        // The id Atlas stated on the approval FRAME — `{run_id}:{call_id}` — which reached T3
-        // through `request.opened` and is handed straight back here. `await_approval` compares
-        // it exactly and ignores anything else, so a stale answer for a different held call
-        // cannot release this one.
-        //
-        // Deliberately NOT the supervisor's `request_ref` from a `waiting_for_input` lifecycle
-        // row: that is a different id on a different log, and answering with it would match
-        // nothing and leave the tool held until the gate's deadline.
-        presenceFor(key).send("approve", {
-          request_id: String(requestId),
-          approved: approvalIsGranted(String(decision)),
-        });
+      Effect.tryPromise({
+        try: () =>
+          // The id Atlas stated on the approval FRAME — `{run_id}:{call_id}` — which reached T3
+          // through `request.opened` and is handed straight back. `await_approval` compares it
+          // exactly, so a stale answer for a different held call cannot release this one.
+          //
+          // Deliberately NOT the supervisor's `request_ref` from a `waiting_for_input` row:
+          // that is a different id on a different log, and answering with it would match
+          // nothing and leave the tool held.
+          deliverDecision(String(threadId), "approve", {
+            request_id: String(requestId),
+            approved: approvalIsGranted(String(decision)),
+          }),
+        catch: (cause) => refuse("respondToRequest", cause),
       }),
 
     /** The same presence, carrying a structured answer instead of a yes/no. */
     respondToUserInput: (threadId, requestId, answers) =>
-      Effect.sync(() => {
-        const key = String(threadId);
-        presenceFor(key).send("answer", { request_id: String(requestId), value: answers });
+      Effect.tryPromise({
+        try: () =>
+          deliverDecision(String(threadId), "answer", {
+            request_id: String(requestId),
+            value: answers,
+          }),
+        catch: (cause) => refuse("respondToUserInput", cause),
       }),
 
     stopSession: (threadId) =>
