@@ -3275,9 +3275,25 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
     // a real long-running foreground command in the SHARED pty — the same
     // one run_bash uses, which is why a stop has to reach it
     let runner = state.terminal.clone();
-    let running = tokio::spawn(async move { runner.run("sleep 30", false, Some(25), false).await });
-    // let the command actually reach the shell before interrupting
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let running = tokio::spawn(async move {
+        runner
+            .run("printf STOP_TEST_RUNNING; sleep 30", false, Some(25), false)
+            .await
+    });
+    // Prove the command reached the PTY foreground before interrupting it. A
+    // fixed sleep raced the shell on loaded release runs and sometimes tested
+    // only that Stop was accepted, not that it interrupted a live foreground.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if state.terminal.read_screen().await.contains("STOP_TEST_RUNNING") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "foreground command never became visible before stop"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     let started = std::time::Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
