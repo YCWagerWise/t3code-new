@@ -20,3 +20,21 @@
 # invocation instead of only the ones run with the env var set by hand.
 [net]
 git-fetch-with-cli = true
+
+# #378/#315: `cargo test` IS FAIL-FAST ACROSS TARGETS, and this backend has seven of them.
+#
+# When one target fails, cargo stops — and the remaining targets are never even BUILT, so
+# their tests do not appear in the output at all. They are not reported as failed or skipped;
+# they are simply absent. Measured here: a `--lib` failure hid restart_reconnect (15 tests),
+# shell_session (4), log_backpressure (1) and agent_default_model (1) — 21 tests that a reader
+# of that output would have counted as "not there", and that a test-count ratchet cannot see
+# has regressed.
+#
+# There is no cargo key that makes plain `cargo test` non-fail-fast, so the fix is the tool's
+# own mechanism: an alias, so the project's test command carries the right flag by
+# construction rather than by everyone remembering it. Run `cargo test-all`.
+#
+# Deliberately NOT solved by `#[ignore]`-ing the flaky test — that removes the flake and the
+# guarantee together.
+[alias]
+test-all = "test --no-fail-fast"
