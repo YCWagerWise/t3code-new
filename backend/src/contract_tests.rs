@@ -31,6 +31,12 @@ async fn drop_runtime_kv(state: &AppState) {
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
 }
 
+async fn drop_runtime_messages(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE messages", vec![]).await.unwrap();
+}
+
 /// PROOF (#320 anti-regression, packet AE): the product backend must not
 /// re-grow authority the SDK/do-rs now owns. Each symbol below was
 /// previously a live product-owned hidden authority and its deletion is
@@ -6861,6 +6867,57 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
             missing.len()
         );
     }
+}
+
+/// #326: a reconnect snapshot is a synchronization claim, not a render pane.
+/// If the durable message history cannot be read, `subscribeThread` must fail
+/// the stream instead of substituting the render-only quarantine placeholder and
+/// then announcing `synchronized` over a history the client never received.
+#[tokio::test]
+async fn subscribe_thread_fails_when_message_history_is_unreadable() {
+    let (state, _d) = test_state().await;
+    state
+        .rt
+        .append_message(
+            "t-message-store-fails",
+            &json!({ "id": "m1", "role": "user", "text": "persisted" }),
+        )
+        .await
+        .unwrap();
+    drop_runtime_messages(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-message-store-fails" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    assert!(
+        !frames.iter().any(|f| f["values"][0]["kind"] == "snapshot"),
+        "an unreadable message store must not produce a synthetic snapshot: {frames:?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f["values"][0]["kind"] == "synchronized"),
+        "an unreadable message store must not be advertised as synchronized: {frames:?}"
+    );
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("subscribeThread exits when message history is unreadable");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "message-read failure must surface as a stream Failure: {exit}"
+    );
+    let defect = exit["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    assert!(
+        defect.contains("message store unreadable"),
+        "failure names the unreadable durable message store: {exit}"
+    );
 }
 
 #[tokio::test]

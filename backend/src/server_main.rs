@@ -2625,7 +2625,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // Snapshot derives from the DURABLE store: the thread row and
                 // its message history come from `OrchStore`, not in-memory maps,
                 // so a reload/restart renders the same history that persisted.
-                let messages = state.rt.messages(thread_id).await;
+                let messages = match state.rt.try_messages(thread_id).await {
+                    Ok(messages) => messages,
+                    Err(e) => {
+                        tracing::error!(%thread_id, %e, "subscribeThread: message store unreadable");
+                        let _ = snapshot_tail.close().await;
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!("subscribeThread: message store unreadable: {e}"),
+                        );
+                        return;
+                    }
+                };
                 // The DURABLE record, TYPED (#2). A hand-built thread object beside
                 // the row it was read from is how a worktree-backed read-only
                 // thread reconnected as a default full-access shell: the shape was
