@@ -417,6 +417,51 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     expect(seen.some((event) => event.type === "turn.completed")).toBe(true);
   }, 120_000);
 
+  it("cancels an ACTIVE attempt and the lens sees the turn actually end", async () => {
+    const created = await instance({});
+    const adapter = created.adapter;
+    const threadId = ThreadId.make(`live-active-cancel-${Date.now()}`);
+    const seen: Array<Record<string, unknown>> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => seen.push(event as unknown as Record<string, unknown>)),
+      ),
+    );
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+    await Effect.runPromise(
+      adapter.sendTurn({
+        threadId,
+        // Long enough to still be running when the cancel lands. A local model is slow, which
+        // is the one thing that makes it useful here.
+        input: "Write a very long detailed essay about distributed systems, at least 2000 words.",
+        modelSelection: { model: "ollama/qwen2.5-coder:7b" },
+      } as never),
+    );
+    // Wait until the provider has actually connected — cancelling a run that has not started
+    // yet would prove nothing about stopping work in flight.
+    await waitForEvent(seen, (event) => event["type"] === "turn.started");
+    await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
+
+    await Effect.runPromise(adapter.interruptTurn(threadId));
+
+    // The turn must END, and the lens must be told. Before this, a cancelled ollama-backed run
+    // terminated through `run.stalled` with no `provider.stopped`, which the projector ignored
+    // — so the composer showed a turn that started and never finished.
+    const completed = await waitForEvent(seen, (event) => event["type"] === "turn.completed");
+    const payload = completed["payload"] as Record<string, unknown>;
+    expect(["cancelled", "interrupted"]).toContain(String(payload["state"]));
+
+    // And the authority agrees: the run is terminal, not merely asked to stop.
+    const snapshot = await fetch(`${BASE_URL}/console/v1/threads/${String(threadId)}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const run = ((await snapshot.json()) as { run?: Record<string, unknown> }).run ?? {};
+    expect(String(run["state"])).toEqual("cancelled");
+
+    await Effect.runPromise(adapter.stopSession(threadId));
+    await Effect.runPromise(Fiber.interrupt(fiber));
+  }, 180_000);
+
   it("cancels a real turn through the authority, and a repeated cancel commits once", async () => {
     const created = await instance({});
     const adapter = created.adapter;

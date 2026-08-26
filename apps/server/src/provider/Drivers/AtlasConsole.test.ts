@@ -555,3 +555,48 @@ describe("frame projection against the real contract", () => {
     expect(projectFeedFrame(echoed, projectionContext)).toEqual([]);
   });
 });
+
+describe("a run the supervisor ended", () => {
+  const stalledRow = (reason: string) => ({
+    epoch: 1,
+    seq: 4,
+    event_id: `deadline:att-1:${reason}:1`,
+    run_id: "run-1",
+    attempt_id: "att-1",
+    kind: "run.stalled",
+    payload: { reason, deadline_at_ms: 1, recovered_at_ms: 2 },
+  });
+
+  /**
+   * The ending that used to vanish.
+   *
+   * A crossed deadline writes `run.stalled` and is TERMINAL — `settle_deadline` moves the run
+   * to cancelled or stalled and nothing follows, least of all a `provider.stopped`, because the
+   * provider is what stopped answering. Projecting only `provider.stopped` meant a cancelled
+   * turn rendered as one that started and never finished.
+   */
+  it("closes the turn when a deadline ended the run", () => {
+    const events = projectLifecycleEvent(stalledRow("cancel_timeout"), projectionContext);
+    expect(events).toHaveLength(1);
+    const payload = (events[0] as unknown as { payload: Record<string, unknown> }).payload;
+    // The user asked for it to stop and it stopped: reporting a failure would be a failure
+    // that never happened.
+    expect(payload["state"]).toEqual("cancelled");
+    expect(payload["stopReason"]).toEqual("cancel_timeout");
+  });
+
+  it("calls a run that stopped answering interrupted, not cancelled", () => {
+    const events = projectLifecycleEvent(stalledRow("progress_timeout"), projectionContext);
+    const payload = (events[0] as unknown as { payload: Record<string, unknown> }).payload;
+    expect(payload["state"]).toEqual("interrupted");
+  });
+
+  it("emits a terminal T3 can decode", () => {
+    const decode = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+    for (const reason of ["cancel_timeout", "progress_timeout", "heartbeat_timeout"]) {
+      for (const event of projectLifecycleEvent(stalledRow(reason), projectionContext)) {
+        expect(() => decode(event)).not.toThrow();
+      }
+    }
+  });
+});

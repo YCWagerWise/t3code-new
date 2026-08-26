@@ -366,6 +366,33 @@ export const projectLifecycleEvent = (
     ];
   }
 
+  // A run the SUPERVISOR ended, with no provider left to report a stop.
+  //
+  // `run.stalled` is the row a crossed deadline writes, and it is terminal: `settle_deadline`
+  // moves the snapshot to `cancelled` when the reason is `cancel_timeout` and to `stalled`
+  // otherwise. Nothing else follows it — in particular there is no `provider.stopped`, because
+  // the provider is precisely what stopped answering.
+  //
+  // Projecting only `provider.stopped` therefore left a whole class of endings invisible: a
+  // cancelled turn (observed live — cancel an ollama-backed run and it terminates this way)
+  // rendered as a turn that started and never finished, spinning in the composer forever.
+  if (event.kind === "run.stalled") {
+    const reason = event.payload["reason"];
+    // The user asked for it to stop and it stopped. Reporting a failure here would be a
+    // failure that never happened — the same distinction the supervisor itself draws.
+    const state = reason === "cancel_timeout" ? "cancelled" : "interrupted";
+    return [
+      {
+        ...base,
+        type: "turn.completed",
+        payload: {
+          state,
+          ...(typeof reason === "string" && reason.length > 0 ? { stopReason: reason } : {}),
+        },
+      } as ProviderRuntimeEvent,
+    ];
+  }
+
   return [];
 };
 
