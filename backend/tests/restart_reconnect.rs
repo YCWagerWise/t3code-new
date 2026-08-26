@@ -17,8 +17,8 @@
 
 use agent_sdk_core::{ActionDesc, Message, Model, ModelOutput, ModelResp, Registry, Usage};
 use agent_sdk_shell::{
-    AgentDefinition, BusProjector, Lifecycle, ModelRef, SessionBinding, Shell, ThreadRuntime,
-    TurnOutcome,
+    AgentDefinition, Lifecycle, ModelRef, SessionBinding, Shell, ThreadEventVocab, ThreadRuntime,
+    TurnOutcome, VocabProjector,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -33,7 +33,10 @@ impl Model for Talker {
         _t: &[ActionDesc],
         _i: Option<&str>,
     ) -> Result<ModelOutput, String> {
-        Ok(ModelResp::Text { text: "hello there".into() }.into())
+        Ok(ModelResp::Text {
+            text: "hello there".into(),
+        }
+        .into())
     }
     fn cost_usd(&self, _u: &Usage) -> f64 {
         0.0
@@ -65,7 +68,9 @@ async fn boot(data: &str) -> ThreadRuntime {
         Shell::new(std::path::Path::new(data), |_d| Registry::new())
             .with_model_factory(|| Box::new(Talker)),
     );
-    ThreadRuntime::open(shell, data, "main").await.expect("open thread runtime")
+    ThreadRuntime::open(shell, data, "main")
+        .await
+        .expect("open thread runtime")
 }
 
 fn definition() -> AgentDefinition {
@@ -77,7 +82,9 @@ fn definition() -> AgentDefinition {
         ask_tools: vec![],
         subagents: vec![],
         mcp_servers: vec![],
-        labels: Default::default(), options: vec![], cwd: None,
+        labels: Default::default(),
+        options: vec![],
+        cwd: None,
     }
 }
 
@@ -89,19 +96,43 @@ fn binding(thread: &str) -> SessionBinding {
     }
 }
 
-/// The projector the product runs a turn through: lifecycle facts encoded as
-/// stream items and published to the durable bus.
-fn projector(rt: &ThreadRuntime) -> BusProjector {
-    BusProjector {
-        bus: rt.bus().clone(),
-        encode: Arc::new(|e: &Lifecycle| match e {
-            Lifecycle::Delta { text, .. } => vec![json!({"kind": "delta", "text": text})],
-            Lifecycle::MessageFinal { message_id, text, .. } => {
-                vec![json!({"kind": "final", "messageId": message_id, "text": text})]
-            }
-            _ => vec![json!({"kind": "lifecycle"})],
-        }),
+struct RestartVocab;
+
+impl ThreadEventVocab for RestartVocab {
+    fn project(&self, event: &Lifecycle, _now: &str) -> (String, Vec<(String, Value)>) {
+        let thread_id = match event {
+            Lifecycle::TurnStarted { thread_id, .. }
+            | Lifecycle::Delta { thread_id, .. }
+            | Lifecycle::MessageFinal { thread_id, .. }
+            | Lifecycle::ApprovalRequested { thread_id, .. }
+            | Lifecycle::UserInputRequested { thread_id, .. }
+            | Lifecycle::ApprovalResolved { thread_id, .. }
+            | Lifecycle::ApprovalFailed { thread_id, .. }
+            | Lifecycle::UserInputResolved { thread_id, .. }
+            | Lifecycle::UserInputFailed { thread_id, .. }
+            | Lifecycle::ToolStarted { thread_id, .. }
+            | Lifecycle::ToolCompleted { thread_id, .. }
+            | Lifecycle::ShellCommand { thread_id, .. }
+            | Lifecycle::TurnEnded { thread_id, .. } => thread_id.clone(),
+        };
+        let item = match event {
+            Lifecycle::Delta { text, .. } => ("delta".to_string(), json!({"text": text})),
+            Lifecycle::MessageFinal {
+                message_id, text, ..
+            } => (
+                "final".to_string(),
+                json!({"messageId": message_id, "text": text}),
+            ),
+            _ => ("lifecycle".to_string(), json!({})),
+        };
+        (thread_id, vec![item])
     }
+}
+
+/// The projector the product runs a turn through: lifecycle facts encoded as
+/// stream items and recorded before publication on the durable bus.
+fn projector(rt: &ThreadRuntime) -> VocabProjector<RestartVocab> {
+    VocabProjector::new(rt.clone(), RestartVocab)
 }
 
 fn thread_row(id: &str) -> Value {
@@ -142,7 +173,9 @@ async fn a_restart_rehydrates_the_thread_list_history_and_session() {
     let (session_before, seq_before) = {
         let rt = boot(&data).await;
         rt.save_thread(&thread_row("thread-1")).await.unwrap();
-        rt.append_message("thread-1", &json!({"role": "user", "content": "hi"})).await.unwrap();
+        rt.append_message("thread-1", &json!({"role": "user", "content": "hi"}))
+            .await
+            .unwrap();
         let sid = rt.session_for(&b, definition()).await.unwrap();
         (sid, rt.current_sequence().await.unwrap())
     };
@@ -151,11 +184,19 @@ async fn a_restart_rehydrates_the_thread_list_history_and_session() {
     let rt = boot(&data).await;
 
     let threads = rt.threads().await;
-    assert_eq!(threads.len(), 1, "the thread list is rebuilt from the durable store: {threads:?}");
+    assert_eq!(
+        threads.len(),
+        1,
+        "the thread list is rebuilt from the durable store: {threads:?}"
+    );
     assert_eq!(threads[0]["id"], "thread-1");
 
     let msgs = rt.messages("thread-1").await;
-    assert_eq!(msgs.len(), 1, "the transcript survived the restart: {msgs:?}");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the transcript survived the restart: {msgs:?}"
+    );
     assert_eq!(msgs[0]["content"], "hi");
 
     assert_eq!(
@@ -208,8 +249,10 @@ async fn a_reconnecting_client_resumes_above_its_snapshot_sequence() {
 
     // the reconnect attaches ABOVE what the client already holds — exactly what
     // `subscribeThread` does on both its resume paths.
-    let tail =
-        rt.tail_after("thread-1", Some(client_mark)).await.expect("the reconnect attached");
+    let tail = rt
+        .tail_after("thread-1", Some(client_mark))
+        .await
+        .expect("the reconnect attached");
     let mut published = Vec::new();
     for _ in 0..3 {
         published.push(emit(&rt, "thread-1").await);
@@ -240,7 +283,10 @@ async fn a_reconnecting_client_resumes_above_its_snapshot_sequence() {
     }
     got.sort_unstable();
     got.dedup();
-    assert_eq!(got, published, "the reconnected stream delivered exactly the missed events");
+    assert_eq!(
+        got, published,
+        "the reconnected stream delivered exactly the missed events"
+    );
     assert!(
         got.iter().all(|s| *s > client_mark),
         "no event at or below the snapshot mark was re-sent: {got:?}"
@@ -274,7 +320,9 @@ async fn an_unacked_frame_survives_the_disconnect_and_the_restart() {
     let tail = rt.tail("thread-1").await.unwrap();
     let items = tail.next(Duration::from_secs(5)).await.unwrap();
     assert!(
-        items.iter().any(|(_, v)| v["event"]["sequence"] == json!(seq)),
+        items
+            .iter()
+            .any(|(_, v)| v["event"]["sequence"] == json!(seq)),
         "the frame the client never confirmed came back after the restart: {items:?}"
     );
     tail.close().await;
@@ -297,21 +345,51 @@ async fn turns_before_and_after_a_restart_are_one_conversation() {
         // the durable row reconciles with the optimistic one rather than
         // landing beside it.
         let out = rt
-            .run_turn_with_prompt_id(&b, definition(), "first", Some("umsg-first"), &projector(&rt))
+            .run_turn_with_prompt_id(
+                &b,
+                definition(),
+                "first",
+                Some("umsg-first"),
+                &projector(&rt),
+            )
             .await;
-        assert_eq!(out, TurnOutcome::Completed, "the pre-restart turn completed");
+        assert_eq!(
+            out,
+            TurnOutcome::Completed,
+            "the pre-restart turn completed"
+        );
         rt.cursor(&b).await.unwrap()
     };
-    assert!(cursor_before >= 0, "the first turn advanced the durable cursor");
+    assert!(
+        cursor_before >= 0,
+        "the first turn advanced the durable cursor"
+    );
 
     let rt = boot(&data).await;
-    assert_eq!(rt.cursor(&b).await.unwrap(), cursor_before, "the cursor came back with the process");
+    assert_eq!(
+        rt.cursor(&b).await.unwrap(),
+        cursor_before,
+        "the cursor came back with the process"
+    );
 
     let out = rt
-        .run_turn_with_prompt_id(&b, definition(), "second", Some("umsg-second"), &projector(&rt))
+        .run_turn_with_prompt_id(
+            &b,
+            definition(),
+            "second",
+            Some("umsg-second"),
+            &projector(&rt),
+        )
         .await;
-    assert_eq!(out, TurnOutcome::Completed, "the post-restart turn completed");
-    assert!(rt.cursor(&b).await.unwrap() > cursor_before, "and moved the cursor further");
+    assert_eq!(
+        out,
+        TurnOutcome::Completed,
+        "the post-restart turn completed"
+    );
+    assert!(
+        rt.cursor(&b).await.unwrap() > cursor_before,
+        "and moved the cursor further"
+    );
 
     let msgs = rt.messages("thread-1").await;
     let assistants = msgs.iter().filter(|m| m["role"] == "assistant").count();
@@ -334,6 +412,55 @@ async fn turns_before_and_after_a_restart_are_one_conversation() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_lifecycle_projected_by_the_product_projector_is_replayable() {
+    let env = Env::new("turn-projector-replay");
+    let data = env.path();
+    let b = binding("thread-1");
+
+    let rt = boot(&data).await;
+    rt.save_thread(&thread_row("thread-1")).await.unwrap();
+    let out = rt
+        .run_turn_with_prompt_id(
+            &b,
+            definition(),
+            "hello",
+            Some("umsg-replay"),
+            &projector(&rt),
+        )
+        .await;
+    assert_eq!(out, TurnOutcome::Completed);
+
+    let replay = rt
+        .replay_and_tail("thread-1", 0, 500)
+        .await
+        .expect("replay lifecycle events");
+    let types: Vec<&str> = replay
+        .events
+        .iter()
+        .filter_map(|e| e.pointer("/event/type").and_then(Value::as_str))
+        .collect();
+    assert!(
+        types.contains(&"lifecycle"),
+        "turn lifecycle must be replayable: {types:?}"
+    );
+    assert!(
+        types.contains(&"final"),
+        "final message must be replayable: {types:?}"
+    );
+    assert!(
+        replay
+            .events
+            .iter()
+            .all(|e| agent_sdk_shell::event_sequence(e).is_some()),
+        "projected lifecycle events must carry durable sequence numbers: {:?}",
+        replay.events
+    );
+    if let Some(tail) = replay.tail {
+        let _ = tail.close().await;
+    }
+}
+
 /// A prompt the client already rendered is written ONCE. Re-driving the same
 /// prompt id — a retried dispatch, a reconnect that replays the command — must
 /// reconcile with the durable row, not append beside it.
@@ -347,14 +474,26 @@ async fn a_prompt_id_the_client_already_rendered_is_never_written_twice() {
 
     for _ in 0..2 {
         let out = rt
-            .run_turn_with_prompt_id(&b, definition(), "hello", Some("umsg-fixed"), &projector(&rt))
+            .run_turn_with_prompt_id(
+                &b,
+                definition(),
+                "hello",
+                Some("umsg-fixed"),
+                &projector(&rt),
+            )
             .await;
         assert_eq!(out, TurnOutcome::Completed);
     }
 
     let msgs = rt.messages("thread-1").await;
-    let mine = msgs.iter().filter(|m| m["id"] == json!("umsg-fixed")).count();
-    assert_eq!(mine, 1, "the re-driven prompt reconciled instead of duplicating: {msgs:?}");
+    let mine = msgs
+        .iter()
+        .filter(|m| m["id"] == json!("umsg-fixed"))
+        .count();
+    assert_eq!(
+        mine, 1,
+        "the re-driven prompt reconciled instead of duplicating: {msgs:?}"
+    );
 }
 
 /// #300: turn admission is DURABLE, not a process-local mutex map.
@@ -397,7 +536,9 @@ async fn a_turn_left_in_flight_by_a_crash_blocks_a_concurrent_redispatch() {
     );
 
     // and a real dispatch is refused rather than running alongside it.
-    let out = rt.run_turn(&b, definition(), "hello", &projector(&rt)).await;
+    let out = rt
+        .run_turn(&b, definition(), "hello", &projector(&rt))
+        .await;
     match out {
         TurnOutcome::Failed { ref message } => assert!(
             message.contains("in flight"),
@@ -437,7 +578,10 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
             rt.next_sequence().await.unwrap();
         }
         let mark = rt.current_sequence().await.unwrap();
-        assert!(mark >= 5, "the pre-restart stream really did advance: {mark}");
+        assert!(
+            mark >= 5,
+            "the pre-restart stream really did advance: {mark}"
+        );
         mark
     };
 
@@ -476,9 +620,11 @@ async fn shell_frames_published_while_a_client_was_away_replay_after_a_restart()
 
     let client_mark = {
         let rt = boot(&data).await;
-        rt.emit_shell_event(serde_json::json!({ "kind": "thread-upserted", "thread": thread_row("thread-0") }))
-            .await
-            .unwrap();
+        rt.emit_shell_event(
+            serde_json::json!({ "kind": "thread-upserted", "thread": thread_row("thread-0") }),
+        )
+        .await
+        .unwrap();
         // what the client's snapshot advertised before it went away
         let mark = rt.current_sequence().await.unwrap();
         // three upserts it never saw
@@ -498,7 +644,11 @@ async fn shell_frames_published_while_a_client_was_away_replay_after_a_restart()
     let missed = rt.shell_events_after(client_mark, 500).await.unwrap();
     let ids: Vec<String> = missed
         .iter()
-        .filter_map(|f| f.pointer("/thread/id").and_then(|v| v.as_str()).map(String::from))
+        .filter_map(|f| {
+            f.pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .collect();
     assert_eq!(
         ids,
@@ -507,16 +657,23 @@ async fn shell_frames_published_while_a_client_was_away_replay_after_a_restart()
     );
     // and the frames the client already holds are NOT re-sent
     assert!(
-        missed.iter().all(|f| f.get("sequence").and_then(|s| s.as_i64()).unwrap_or(0) > client_mark),
+        missed
+            .iter()
+            .all(|f| f.get("sequence").and_then(|s| s.as_i64()).unwrap_or(0) > client_mark),
         "catch-up must start strictly above the client's mark: {missed:?}"
     );
 
     // a post-restart emission continues above the same mark
     let next = rt
-        .emit_shell_event(serde_json::json!({ "kind": "thread-upserted", "thread": thread_row("thread-4") }))
+        .emit_shell_event(
+            serde_json::json!({ "kind": "thread-upserted", "thread": thread_row("thread-4") }),
+        )
         .await
         .unwrap();
-    assert!(next > client_mark, "the sequence did not rewind across the restart");
+    assert!(
+        next > client_mark,
+        "the sequence did not rewind across the restart"
+    );
 }
 
 /// PACKET M, across a real process boundary: a question the agent asked
@@ -553,7 +710,10 @@ async fn a_pending_question_is_answerable_again_after_a_restart() {
         asks[0]["sessionId"], "sess-1",
         "the routing needed to answer it comes from the durable request, not a process map"
     );
-    assert_eq!(asks[0]["questions"][0]["options"][1], "dev", "the options survive, so the answer is a choice");
+    assert_eq!(
+        asks[0]["questions"][0]["options"][1], "dev",
+        "the options survive, so the answer is a choice"
+    );
     assert_eq!(
         asks[0]["requestedAt"], "2026-01-01T00:00:00.000Z",
         "the rebuilt row carries the original timestamp, so it replaces the live row instead of stacking"
@@ -616,7 +776,9 @@ async fn a_reconnect_resume_does_not_lose_an_event_published_in_its_window() {
     // ── before the restart ─────────────────────────────────────────────────
     let client_mark = {
         let rt = boot(&data).await;
-        rt.save_thread(&thread_row("thread-resume-window")).await.unwrap();
+        rt.save_thread(&thread_row("thread-resume-window"))
+            .await
+            .unwrap();
         let seq = emit(&rt, "thread-resume-window").await;
         seq
     };
@@ -624,21 +786,30 @@ async fn a_reconnect_resume_does_not_lose_an_event_published_in_its_window() {
     // ── the process died; work continues while the client is away ──────────
     let rt = boot(&data).await;
     let missed = emit(&rt, "thread-resume-window").await;
-    assert!(missed > client_mark, "the missed event is above the client's mark");
+    assert!(
+        missed > client_mark,
+        "the missed event is above the client's mark"
+    );
 
     // ── the reconnect, RACED by a live publish ─────────────────────────────
     let racer = {
         let rt2 = rt.clone();
         async move { emit(&rt2, "thread-resume-window").await }
     };
-    let (resumed, raced) = tokio::join!(rt.replay_and_tail("thread-resume-window", client_mark, 500), racer);
+    let (resumed, raced) = tokio::join!(
+        rt.replay_and_tail("thread-resume-window", client_mark, 500),
+        racer
+    );
     let resumed = resumed.expect("the resume attached and replayed");
     assert!(!resumed.more, "two events is not a full catch-up page");
 
     // `!more` above is what guarantees this tail exists: a truncated replay
     // hands back `None` precisely so a caller cannot pump a stream that covers
     // only part of the gap.
-    let tail = resumed.tail.as_ref().expect("a covered gap comes with a live tail");
+    let tail = resumed
+        .tail
+        .as_ref()
+        .expect("a covered gap comes with a live tail");
     let live = drain_tail(tail).await;
     let got = delivered(&resumed.events, &live);
     tail.close().await;
@@ -659,7 +830,11 @@ async fn a_reconnect_resume_does_not_lose_an_event_published_in_its_window() {
     let mut once = got.clone();
     once.sort_unstable();
     once.dedup();
-    assert_eq!(once.len(), got.len(), "each event delivered exactly once: {got:?}");
+    assert_eq!(
+        once.len(),
+        got.len(),
+        "each event delivered exactly once: {got:?}"
+    );
 }
 
 /// SNAPSHOT PATH (#326): the fallback resume, with an event published while the
@@ -677,7 +852,9 @@ async fn a_snapshot_resume_does_not_lose_an_event_published_in_its_window() {
 
     let before = {
         let rt = boot(&data).await;
-        rt.save_thread(&thread_row("thread-snapshot-window")).await.unwrap();
+        rt.save_thread(&thread_row("thread-snapshot-window"))
+            .await
+            .unwrap();
         emit(&rt, "thread-snapshot-window").await
     };
 
@@ -701,7 +878,11 @@ async fn a_snapshot_resume_does_not_lose_an_event_published_in_its_window() {
         .filter_map(agent_sdk_shell::event_sequence)
         .filter(|s| *s <= mark)
         .collect();
-    let live: Vec<i64> = drain_tail(&tail).await.iter().filter_map(agent_sdk_shell::event_sequence).collect();
+    let live: Vec<i64> = drain_tail(&tail)
+        .await
+        .iter()
+        .filter_map(agent_sdk_shell::event_sequence)
+        .collect();
     tail.close().await;
 
     assert!(
@@ -746,27 +927,40 @@ async fn a_shell_frame_published_on_runtime_a_reaches_runtime_b_on_the_same_data
 
     // B attaches BEFORE A publishes, so this exercises live cross-runtime
     // delivery rather than the retained-latest replay.
-    let tail_b = rt_b.shell_tail_after(None).await.expect("attach shell tail on runtime B");
+    let tail_b = rt_b
+        .shell_tail_after(None)
+        .await
+        .expect("attach shell tail on runtime B");
 
     let frame = serde_json::json!({
         "kind": "thread-upserted",
         "sequence": 1,
         "thread": thread_row("thread-x")
     });
-    rt_a.shell_publish(&frame).await.expect("publish on runtime A");
+    rt_a.shell_publish(&frame)
+        .await
+        .expect("publish on runtime A");
 
     // Poll for a bounded window; broker NOTIFY across process-local isolates
     // on the same data dir is event-driven, not a shared in-process channel.
     let mut received: Vec<Value> = Vec::new();
     for _ in 0..20 {
-        let items = tail_b.next(std::time::Duration::from_millis(150)).await.unwrap();
+        let items = tail_b
+            .next(std::time::Duration::from_millis(150))
+            .await
+            .unwrap();
         received.extend(items.into_iter().map(|(_seq, v)| v));
-        if received.iter().any(|f| f.pointer("/thread/id").and_then(Value::as_str) == Some("thread-x")) {
+        if received
+            .iter()
+            .any(|f| f.pointer("/thread/id").and_then(Value::as_str) == Some("thread-x"))
+        {
             break;
         }
     }
     assert!(
-        received.iter().any(|f| f.pointer("/thread/id").and_then(Value::as_str) == Some("thread-x")),
+        received
+            .iter()
+            .any(|f| f.pointer("/thread/id").and_then(Value::as_str) == Some("thread-x")),
         "runtime B must observe the shell frame runtime A published: got {received:?}"
     );
 }
@@ -780,20 +974,34 @@ async fn a_config_frame_published_on_runtime_a_reaches_runtime_b_on_the_same_dat
     let rt_a = boot(&data).await;
     let rt_b = boot(&data).await;
 
-    let tail_b = rt_b.config_tail_after(None).await.expect("attach config tail on runtime B");
-    let frame = serde_json::json!({ "version": 1, "type": "settingsUpdated", "payload": { "ok": true } });
-    rt_a.config_publish(&frame).await.expect("publish on runtime A");
+    let tail_b = rt_b
+        .config_tail_after(None)
+        .await
+        .expect("attach config tail on runtime B");
+    let frame =
+        serde_json::json!({ "version": 1, "type": "settingsUpdated", "payload": { "ok": true } });
+    rt_a.config_publish(&frame)
+        .await
+        .expect("publish on runtime A");
 
     let mut received: Vec<Value> = Vec::new();
     for _ in 0..20 {
-        let items = tail_b.next(std::time::Duration::from_millis(150)).await.unwrap();
+        let items = tail_b
+            .next(std::time::Duration::from_millis(150))
+            .await
+            .unwrap();
         received.extend(items.into_iter().map(|(_seq, v)| v));
-        if received.iter().any(|f| f.get("type").and_then(Value::as_str) == Some("settingsUpdated")) {
+        if received
+            .iter()
+            .any(|f| f.get("type").and_then(Value::as_str) == Some("settingsUpdated"))
+        {
             break;
         }
     }
     assert!(
-        received.iter().any(|f| f.get("type").and_then(Value::as_str) == Some("settingsUpdated")),
+        received
+            .iter()
+            .any(|f| f.get("type").and_then(Value::as_str) == Some("settingsUpdated")),
         "runtime B must observe the config frame runtime A published: got {received:?}"
     );
 }
@@ -809,20 +1017,33 @@ async fn a_topic_frame_published_on_runtime_a_reaches_runtime_b_on_the_same_data
     let rt_b = boot(&data).await;
 
     let topic = "t3:terminals";
-    let tail_b = rt_b.topic_tail_after(topic, None).await.expect("attach topic tail on runtime B");
+    let tail_b = rt_b
+        .topic_tail_after(topic, None)
+        .await
+        .expect("attach topic tail on runtime B");
     let frame = serde_json::json!({ "type": "upsert", "threadId": "t-x", "terminalId": "term-1" });
-    rt_a.topic_publish(topic, &frame).await.expect("publish on runtime A");
+    rt_a.topic_publish(topic, &frame)
+        .await
+        .expect("publish on runtime A");
 
     let mut received: Vec<Value> = Vec::new();
     for _ in 0..20 {
-        let items = tail_b.next(std::time::Duration::from_millis(150)).await.unwrap();
+        let items = tail_b
+            .next(std::time::Duration::from_millis(150))
+            .await
+            .unwrap();
         received.extend(items.into_iter().map(|(_seq, v)| v));
-        if received.iter().any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-1")) {
+        if received
+            .iter()
+            .any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-1"))
+        {
             break;
         }
     }
     assert!(
-        received.iter().any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-1")),
+        received
+            .iter()
+            .any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-1")),
         "runtime B must observe the topic frame runtime A published: got {received:?}"
     );
 }
@@ -845,13 +1066,18 @@ async fn topic_tail_skip_retained_does_not_deliver_the_retained_frame() {
     // Plant a retained frame (product snapshot handed the client already).
     let topic = "t3:demo";
     let retained_frame = serde_json::json!({ "type": "snapshot", "terminals": [] });
-    rt.topic_publish(topic, &retained_frame).await.expect("publish retained");
+    rt.topic_publish(topic, &retained_frame)
+        .await
+        .expect("publish retained");
 
     // Attach with retained-skip AFTER the publish, so the broker holds one.
     let tail = rt.topic_tail_skip_retained(topic).await.expect("attach");
 
     // First read must NOT surface the retained frame.
-    let items = tail.next(std::time::Duration::from_millis(300)).await.unwrap();
+    let items = tail
+        .next(std::time::Duration::from_millis(300))
+        .await
+        .unwrap();
     assert!(
         items.is_empty(),
         "retained-skip must suppress the retained-latest replay at subscribe time, got: {items:?}"
@@ -863,18 +1089,28 @@ async fn topic_tail_skip_retained_does_not_deliver_the_retained_frame() {
 
     let mut received: Vec<Value> = Vec::new();
     for _ in 0..20 {
-        let items = tail.next(std::time::Duration::from_millis(150)).await.unwrap();
+        let items = tail
+            .next(std::time::Duration::from_millis(150))
+            .await
+            .unwrap();
         received.extend(items.into_iter().map(|(_, v)| v));
-        if received.iter().any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-live")) {
+        if received
+            .iter()
+            .any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-live"))
+        {
             break;
         }
     }
     assert!(
-        received.iter().any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-live")),
+        received
+            .iter()
+            .any(|f| f.get("terminalId").and_then(Value::as_str) == Some("term-live")),
         "retained-skip must not suppress live frames published after attach: got {received:?}"
     );
     assert!(
-        !received.iter().any(|f| f.get("type").and_then(Value::as_str) == Some("snapshot")),
+        !received
+            .iter()
+            .any(|f| f.get("type").and_then(Value::as_str) == Some("snapshot")),
         "the retained snapshot must never appear at all: got {received:?}"
     );
 }
