@@ -574,6 +574,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
             &format!("{}/{{token}}/{{name}}", assets::ROUTE_PREFIX),
             get(asset_http),
         )
+        .route("/api/orchestration/shell", get(shell_snapshot_http))
         .fallback(capture_http)
         .with_state(state)
 }
@@ -3409,31 +3410,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             };
             // The thread list comes from the DURABLE store, not a process-local
             // projection (#303) — one read per subscribe, and it cannot drift.
-            let threads = state.rt.threads().await;
-            // FAIL CLOSED on a project-store read error (#374). The
-            // previous `unwrap_or_default` would ship `projects: []`
-            // alongside durable threads on a store-read error, giving the
-            // reducer a schema-valid but mixed-authority snapshot — the
-            // exact defect #370 rejected, one step later. A refusal makes
-            // the failure loud; the client can reconnect and retry.
-            let projects = match state.rt.projects().await {
+            // FAIL CLOSED on a project-store read error (#374): a schema-valid
+            // snapshot with `projects: []` next to durable threads is mixed
+            // authority. Built by the one `shell_snapshot` builder the HTTP
+            // route and the archived arm also use, so no transport can show a
+            // different environment than another.
+            let snapshot = match shell_snapshot(&state, mark, false).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::error!(%e, "subscribeShell: project store unreadable");
-                    exit_failure(
-                        tx,
-                        &id,
-                        &format!("subscribeShell: project store unreadable: {e}"),
-                    );
+                    tracing::error!(%e, "subscribeShell: shell snapshot unreadable");
+                    exit_failure(tx, &id, &format!("subscribeShell: {e}"));
                     return;
                 }
             };
-            chunk(
-                tx,
-                &id,
-                json!({ "kind": "snapshot", "snapshot": {
-                "snapshotSequence": mark, "projects": projects, "threads": threads, "updatedAt": now_iso() } }),
-            );
+            chunk(tx, &id, json!({ "kind": "snapshot", "snapshot": snapshot }));
             spawn_thread_tail(tail, tx.clone(), id.clone(), "__shell__".to_string());
         }
         // ── source control, entirely over cairn (see `vcs.rs`) ──────────────
@@ -4353,35 +4343,15 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // in a schema-valid archived snapshot alongside durable
             // threads is the mixed-authority defect this arm existed to
             // avoid.
-            let projects = match state.rt.projects().await {
+            let snapshot = match shell_snapshot(&state, mark, true).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::error!(%e, "getArchivedShellSnapshot: project store unreadable");
-                    exit_failure(
-                        tx,
-                        &id,
-                        &format!("getArchivedShellSnapshot: project store unreadable: {e}"),
-                    );
+                    tracing::error!(%e, "getArchivedShellSnapshot: shell snapshot unreadable");
+                    exit_failure(tx, &id, &format!("getArchivedShellSnapshot: {e}"));
                     return;
                 }
             };
-            let threads: Vec<Value> = state
-                .rt
-                .threads()
-                .await
-                .into_iter()
-                .filter(|t| !t.get("archivedAt").map(Value::is_null).unwrap_or(true))
-                .collect();
-            exit_success(
-                tx,
-                &id,
-                json!({
-                    "snapshotSequence": mark,
-                    "projects": projects,
-                    "threads": threads,
-                    "updatedAt": now_iso(),
-                }),
-            );
+            exit_success(tx, &id, snapshot);
         }
         "orchestration.dispatchCommand" => {
             let command = payload.get("input").cloned().unwrap_or(payload.clone());
@@ -5030,14 +5000,46 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // The binding identity: thread + configured provider instance + model.
         // The runtime keys the durable session on all three, so switching the
         // instance never resumes a native provider thread under the wrong config.
-        // the durable thread record: the source for anything the command did
-        // not repeat (mode, model selection).
-        let stored = state
-            .rt
-            .threads()
-            .await
-            .into_iter()
-            .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id.as_str()));
+        // THE DURABLE THREAD RECORD IS THE AUTHORITY, AND IT HAS TO PROVE
+        // ITSELF (#237). A follow-up turn legitimately carries only text, so
+        // every gate that decides HOW this turn runs — provider binding,
+        // runtime mode, interaction mode, options, worktree — comes from the
+        // row. Reading that through the display helper `threads()` made a
+        // store/decode failure indistinguishable from "no such thread", and
+        // the code below then invented `full-access` / `default` / workspace
+        // root for it: a damaged row silently became a maximally-privileged
+        // turn in the wrong directory. `thread_record` is the typed fallible
+        // accessor — `Err` is "unreadable", `Ok(None)` is "not there", and
+        // neither is a licence to guess.
+        let stored: Value = match state.rt.thread_record(&thread_id).await {
+            Ok(Some(rec)) => rec.to_row(),
+            Ok(None) => {
+                let reason = format!(
+                    "thread {thread_id} has no durable record; refusing to run a turn whose \
+                     runtime mode, interaction mode, provider binding and worktree cannot be \
+                     proven"
+                );
+                tracing::error!(%thread_id, %reason, "turn refused");
+                let projector = turn_projector(&state, state.cwd.clone());
+                state
+                    .rt
+                    .refuse_turn(&thread_id, prompt_id.as_deref(), &text, &reason, &projector)
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let reason =
+                    format!("thread {thread_id} record unreadable: {e}; refusing to run the turn");
+                tracing::error!(%thread_id, %reason, "turn refused");
+                let projector = turn_projector(&state, state.cwd.clone());
+                state
+                    .rt
+                    .refuse_turn(&thread_id, prompt_id.as_deref(), &text, &reason, &projector)
+                    .await;
+                return;
+            }
+        };
+        let stored = Some(stored);
         // The binding identity is the CONFIGURED instance the user picked, not
         // one derived from the resolved backend. Two instances of the same
         // driver pointing at the same base url and model — different creds,
@@ -5147,7 +5149,17 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // UI shows the worktree (#207).
         if let Some(wt) = def.cwd.as_deref() {
             if let Err(e) = state.tool_roots.ensure(std::path::Path::new(wt)).await {
-                tracing::error!(%thread_id, %wt, %e, "worktree shell unavailable");
+                // Same rule as the record read above (#237): a precondition the
+                // host cannot satisfy ends the turn WHERE THE CLIENT CAN SEE
+                // IT. Returning here left a UI that had already rendered the
+                // user's message parked on a turn with no terminal event.
+                let reason = format!("worktree shell unavailable at {wt}: {e}");
+                tracing::error!(%thread_id, %wt, %e, "turn refused");
+                let projector = turn_projector(&state, state.cwd.clone());
+                state
+                    .rt
+                    .refuse_turn(&thread_id, prompt_id.as_deref(), &text, &reason, &projector)
+                    .await;
                 return;
             }
         }
@@ -5409,7 +5421,69 @@ async fn asset_http(
     }
 }
 
-async fn capture_http(method: Method, uri: Uri, body: Bytes) -> impl IntoResponse {
+/// THE shell snapshot, built once for every caller.
+///
+/// `orchestration.subscribeShell`, `orchestration.getArchivedShellSnapshot` and
+/// the HTTP route `GET /api/orchestration/shell` all hand the client the
+/// contract's `OrchestrationShellSnapshot`. They used to build that object in
+/// three places (and the HTTP one did not exist at all — the catch-all answered
+/// it `200 {}`), which is how the transport a client picks could change the
+/// projects and threads it sees. One builder, three callers.
+///
+/// Fails closed on a store read error: a schema-valid snapshot carrying
+/// `projects: []` next to durable threads is mixed authority, not an empty
+/// environment.
+async fn shell_snapshot(state: &AppState, mark: i64, archived_only: bool) -> Result<Value, String> {
+    let projects = state
+        .rt
+        .projects()
+        .await
+        .map_err(|e| format!("project store unreadable: {e}"))?;
+    let threads: Vec<Value> = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .filter(|t| !archived_only || !t.get("archivedAt").map(Value::is_null).unwrap_or(true))
+        .collect();
+    Ok(json!({
+        "snapshotSequence": mark,
+        "projects": projects,
+        "threads": threads,
+        "updatedAt": now_iso(),
+    }))
+}
+
+/// `GET /api/orchestration/shell` — the HTTP half of the shell snapshot.
+///
+/// The client prefers this over the socket-embedded first frame precisely so the
+/// (potentially large) projects+threads list stays off the socket and can be
+/// gzipped by the transport. Before this route existed the catch-all answered
+/// `200 {}`, the client's contract decode failed, and every session silently
+/// fell back to the socket — visible in the browser console as
+/// "Could not load the environment shell snapshot over HTTP".
+async fn shell_snapshot_http(State(state): State<AppState>) -> axum::response::Response {
+    let mark = match state.rt.current_sequence().await {
+        Ok(mark) => mark,
+        Err(e) => return http_failure(&format!("shell snapshot: sequence unreadable: {e}")),
+    };
+    match shell_snapshot(&state, mark, false).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => http_failure(&format!("shell snapshot: {e}")),
+    }
+}
+
+/// A backend that cannot answer says so. 503 + a reason, never a schema-shaped lie.
+fn http_failure(reason: &str) -> axum::response::Response {
+    tracing::error!(%reason, "http: refused");
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": reason })),
+    )
+        .into_response()
+}
+
+async fn capture_http(method: Method, uri: Uri, body: Bytes) -> axum::response::Response {
     let path = uri.path().to_string();
     tracing::info!(%method, %path, "http");
     let auth = json!({ "policy": "unsafe-no-auth", "bootstrapMethods": [], "sessionMethods": [], "sessionCookieName": "t3_session" });
@@ -5420,9 +5494,24 @@ async fn capture_http(method: Method, uri: Uri, body: Bytes) -> impl IntoRespons
             "scopes": ["orchestration:read","orchestration:operate","terminal:operate","review:write","access:read","access:write"] }),
         "/api/auth/websocket-ticket" => json!({ "ticket": "dev-ticket" }),
         p if p.contains("pairing-links") || p.contains("clients") => json!([]),
-        _ => json!({}),
+        // FAIL CLOSED (browser-validated). This arm used to answer EVERY
+        // unrouted path `200 {}`. That is worse than a 404: the client cannot
+        // tell "this backend does not implement the route" from "the route
+        // answered, and the environment is empty". `GET
+        // /api/orchestration/shell` is exactly how that bit: the shell snapshot
+        // decoded as an empty object, the contract decode failed, and the app
+        // fell back to the socket on every single connection while the server
+        // reported success. An unimplemented route is a 404.
+        _ => {
+            tracing::warn!(%method, %path, "http: no route — 404");
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("no route for {method} {path}") })),
+            )
+                .into_response();
+        }
     };
-    Json(json)
+    Json(json).into_response()
 }
 
 // Tests live in their own files (#403). `server_main.rs` was 9,977 lines,

@@ -350,6 +350,14 @@ export function createDevRunnerEnv({
 
     if (!isDesktopMode) {
       output.T3CODE_PORT = String(serverPort);
+      // The RUST backend binds `T3CODE_SERVER_PORT` (backend/src/server_main.rs),
+      // not `T3CODE_PORT`, and its own default is 13774 while BASE_SERVER_PORT
+      // here is 13773. Exporting only T3CODE_PORT meant the runner could allocate
+      // a port, tell the web client to proxy /api and /ws at it, and leave the
+      // Rust server binding a different one — off by one before any hashed
+      // offset is even applied. Both names, one number, so whichever backend
+      // `apps/server` starts is the one the browser is talking to.
+      output.T3CODE_SERVER_PORT = String(serverPort);
       // HOST is Vite's own bind address, and the desktop branch below is the
       // only place we set it. An inherited one (an exported HOST, a container,
       // a `HOST=0.0.0.0 npm start` habit) would otherwise reach Vite and pin
@@ -380,6 +388,9 @@ export function createDevRunnerEnv({
       }
     } else {
       output.T3CODE_PORT = String(serverPort);
+      // Same reason as the browser branch above: whichever backend runs, it must
+      // bind the port the renderer was told to dial.
+      output.T3CODE_SERVER_PORT = String(serverPort);
       output.VITE_HTTP_URL = `http://${DESKTOP_DEV_LOOPBACK_HOST}:${serverPort}`;
       output.VITE_WS_URL = `ws://${DESKTOP_DEV_LOOPBACK_HOST}:${serverPort}`;
       // Desktop pins the renderer to loopback on purpose; an ambient marker
@@ -706,7 +717,10 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
     const baseDir = env.T3CODE_HOME ?? (yield* DEFAULT_T3_HOME);
 
     yield* Effect.logInfo(
-      `[dev-runner] mode=${input.mode} source=${source}${selectionSuffix} serverPort=${String(env.T3CODE_PORT)} webPort=${String(env.PORT)} baseDir=${baseDir}`,
+      // `backend` is on this line because for a long time there was no way to
+      // tell which server you were driving, and the answer was always the Node
+      // one. A screenshot of the wrong backend is worse than no screenshot.
+      `[dev-runner] mode=${input.mode} source=${source}${selectionSuffix} backend=${env.T3CODE_BACKEND ?? "node"} serverPort=${String(env.T3CODE_SERVER_PORT ?? env.T3CODE_PORT)} webPort=${String(env.PORT)} baseDir=${baseDir}`,
     );
 
     // Before the share block: --dry-run only resolves and prints. Sharing would
