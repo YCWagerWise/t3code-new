@@ -387,6 +387,11 @@ pub async fn list_refs(cwd: &str, input: &Value) -> Value {
     list_refs_payload(refs, worktrees, default, has_remote)
 }
 
+/// The refs themselves could not be listed. `refs: []` here means UNKNOWN, and
+/// the flag is what says so — `statusUnavailable`/`statusError` used to be
+/// emitted instead, which are fields of the VCS *status* schema and are not in
+/// `VcsListRefsResult` at all, so the client decoder dropped them and read the
+/// payload as a repository with no branches (#258).
 fn refs_unavailable(why: String) -> Value {
     json!({
         "refs": [],
@@ -394,8 +399,8 @@ fn refs_unavailable(why: String) -> Value {
         "hasPrimaryRemote": false,
         "nextCursor": null,
         "totalCount": 0,
-        "statusUnavailable": true,
-        "statusError": why,
+        "refsUnavailable": true,
+        "refsError": why,
     })
 }
 
@@ -1055,6 +1060,7 @@ pub async fn run_stacked_action_streaming_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use agent_sdk_do::do_rs::{Error as DoError, Param, Result as DoResult};
     use agent_sdk_do::ObjectDb;
     use std::sync::Arc;
@@ -1416,10 +1422,19 @@ mod tests {
             true,
         );
         assert_eq!(out["isRepo"], json!(true), "the repo was detected: {out}");
-        assert_eq!(out["statusUnavailable"], json!(true), "the failure must be explicit: {out}");
+        // #258: the marker moved to `refsUnavailable`/`refsError`.
+        // `statusUnavailable`/`statusError` are fields of the VCS *status*
+        // schema and are absent from `VcsListRefsResult`, so the client decoder
+        // dropped them — reporting there was the same as not reporting, and the
+        // client read `refs: []` as a repository with no branches.
+        assert_eq!(out["refsUnavailable"], json!(true), "the failure must be explicit: {out}");
         assert!(
-            out["statusError"].as_str().unwrap_or("").contains("git for-each-ref exploded"),
+            out["refsError"].as_str().unwrap_or("").contains("git for-each-ref exploded"),
             "the cairn failure reason must survive: {out}"
+        );
+        assert!(
+            out.get("statusUnavailable").is_none(),
+            "the marker must live on a field the refs schema carries: {out}"
         );
         assert!(
             out["refs"].as_array().unwrap().is_empty(),
