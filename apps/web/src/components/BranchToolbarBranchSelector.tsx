@@ -24,6 +24,10 @@ import { useComposerDraftStore, type DraftId } from "../composerDraftStore";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { readLocalApi } from "../localApi";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
+import {
+  branchOwnershipReason,
+  branchPickerRowBlock,
+} from "@t3tools/client-runtime/state/branchOwnership";
 import { shouldLoadNextBranchPageAfterScroll } from "../state/paginatedBranches";
 import { usePaginatedBranches } from "../state/queries";
 import { useProject, useThread } from "../state/entities";
@@ -677,25 +681,57 @@ export function BranchToolbarBranchSelector({
     const refName = branchByName.get(itemValue);
     if (!refName) return null;
 
-    const hasSecondaryWorktree =
-      refName.worktreePath && activeProjectCwd && refName.worktreePath !== activeProjectCwd;
+    // #341: ownership decides through the shared helper, NOT through a
+    // `worktreePath` null test. When the worktree listing failed every
+    // `worktreePath` arrives as null, and a null test reads that as "free" —
+    // so the picker offered a switch onto a branch another worktree may hold
+    // checked out, for every branch at once. A remote ref has no local
+    // worktree to conflict with, so ownership does not gate it.
+    const ownershipBlock = branchPickerRowBlock(
+      {
+        worktreePath: refName.worktreePath ?? null,
+        current: refName.current,
+        isRemote: refName.isRemote,
+      },
+      {
+        ownershipUnavailable: branchRefState.ownershipUnavailable,
+        currentWorktreePath: activeProjectCwd,
+      },
+    );
+    const hasSecondaryWorktree = ownershipBlock === "held-by-other-worktree";
     const badge = refName.current
       ? "current"
       : hasSecondaryWorktree
         ? "worktree"
-        : refName.isRemote
-          ? "remote"
-          : refName.isDefault
-            ? "default"
-            : null;
+        : ownershipBlock === "ownership-unknown"
+          ? "unknown"
+          : refName.isRemote
+            ? "remote"
+            : refName.isDefault
+              ? "default"
+              : null;
     return (
       <ComboboxItem
         hideIndicator
         key={itemValue}
         index={index}
         value={itemValue}
-        className="pe-1.5"
-        onClick={() => selectBranch(refName)}
+        className={cn("pe-1.5", ownershipBlock !== null && "opacity-50")}
+        disabled={ownershipBlock !== null}
+        title={
+          ownershipBlock === null
+            ? undefined
+            : branchOwnershipReason(ownershipBlock, branchRefState.refsError)
+        }
+        onClick={() => {
+          // Belt AND braces: `disabled` stops the pointer path, this stops
+          // every other route to the same handler (keyboard activation, a
+          // future programmatic click). An affordance that merely LOOKS
+          // disabled over a handler that still fires is the shape of bug this
+          // finding is about.
+          if (ownershipBlock !== null) return;
+          selectBranch(refName);
+        }}
         onContextMenu={(event) => handleBranchContextMenu(event, itemValue)}
       >
         <div className="flex w-full min-w-0 items-center justify-between gap-2">

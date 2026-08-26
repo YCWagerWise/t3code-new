@@ -231,13 +231,14 @@ pub async fn read_file(cwd: &str, input: &Value) -> Result<Value, String> {
         // can land in the middle of a multibyte codepoint, and slicing a
         // `String` there panics — a valid large file (any non-ASCII source,
         // any CJK text) took the backend down instead of returning a preview.
-        let mut cap = MAX_READ_BYTES.min(contents.len());
-        while cap > 0 && !contents.is_char_boundary(cap) {
-            cap -= 1;
-        }
-        // Prefer a whole final line, but only if that boundary is itself valid.
-        let cut = contents[..cap].rfind('\n').unwrap_or(cap);
-        contents[..cut].to_string()
+        //
+        // The logic that used to live here now lives in `crate::text` (#353),
+        // because it was ALSO hand-written in review.rs and that copy was the
+        // pre-fix version. Fixing an incident only where it was observed leaves
+        // its siblings shipping the bug; deleting the duplicate is the fix.
+        crate::text::cap_at_line_boundary(&contents, MAX_READ_BYTES)
+            .0
+            .to_string()
     } else {
         contents
     };

@@ -40,10 +40,17 @@ fn source(
 ) -> Value {
     let truncated = diff.len() > MAX_DIFF_BYTES;
     let diff_hash = diff_hash(&diff);
+    // #353: this used to be `diff[..MAX_DIFF_BYTES].rfind('\n')`, a BYTE slice
+    // evaluated BEFORE the newline search — so a diff whose 400_000th byte fell
+    // inside a multi-byte character panicked, deterministically, before `rfind`
+    // ever ran. Any non-ASCII in a large diff did it: an accented identifier, an
+    // emoji in a fixture, CJK text. `projects.rs` had already hit the identical
+    // bug (#229) and fixed it in place; the fix was never extracted, so this
+    // sibling kept shipping the pre-fix version. One helper now, both callers.
     let diff = if truncated {
-        // cut on a line boundary so the client never renders half a hunk header
-        let cut = diff[..MAX_DIFF_BYTES].rfind('\n').unwrap_or(MAX_DIFF_BYTES);
-        diff[..cut].to_string()
+        crate::text::cap_at_line_boundary(&diff, MAX_DIFF_BYTES)
+            .0
+            .to_string()
     } else {
         diff
     };
@@ -337,6 +344,49 @@ mod tests {
             .expect("previews");
         assert_ne!(changed["sources"][0]["diffHash"], s["diffHash"], "moves when the diff does");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #353: the preview path itself, on a diff whose cap lands mid-character.
+    ///
+    /// `crate::text` covers the helper; this covers `source()` — the actual
+    /// `review.getDiffPreview` path a user reaches by opening the DiffPanel on
+    /// a branch with a large non-ASCII diff. It panicked here, deterministically,
+    /// so the panel stayed broken for that branch rather than failing once.
+    ///
+    /// Asserting on the RETURNED VALUE, not on `is_ok()`: a panic is not an
+    /// `Err`, so a test that caught unwind and checked for absence of an error
+    /// would pass for the wrong reason. If this regresses, the test aborts.
+    #[test]
+    fn a_large_non_ascii_diff_previews_instead_of_panicking() {
+        // Pad so a 3-byte character straddles byte MAX_DIFF_BYTES exactly.
+        let mut diff = "a".repeat(MAX_DIFF_BYTES - 1);
+        diff.push('☃');
+        diff.push_str("\ntail\n");
+        assert!(
+            !diff.is_char_boundary(MAX_DIFF_BYTES),
+            "the fixture must actually straddle the cap, or this proves nothing"
+        );
+
+        let out = source(
+            "working-tree",
+            "working-tree",
+            "Uncommitted changes",
+            Some("HEAD"),
+            Some("main"),
+            diff,
+        );
+
+        assert_eq!(out["truncated"], json!(true));
+        let shown = out["diff"].as_str().expect("a preview is still returned");
+        assert!(shown.len() < MAX_DIFF_BYTES);
+        assert!(
+            !shown.contains('\u{FFFD}'),
+            "the preview must be valid UTF-8, not a half-sliced character"
+        );
+        assert!(
+            out["diffHash"].as_str().is_some_and(|h| !h.is_empty()),
+            "identity still covers the whole diff: {out}"
+        );
     }
 
     #[test]

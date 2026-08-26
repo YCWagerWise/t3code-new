@@ -1,3 +1,9 @@
+import {
+  branchOwnershipReason,
+  branchOwnershipSubtitle,
+  branchPickerRowBlock,
+  type BranchOwnershipBlock,
+} from "@t3tools/client-runtime/state/branchOwnership";
 import { sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { useState } from "react";
@@ -49,13 +55,28 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
   );
   const [worktreeBranchName, setWorktreeBranchName] = useState("");
 
-  const disabledExistingBranchNames: Array<string> = [];
+  // #341: ownership decides through the shared helper, not a `worktreePath`
+  // null test. With the worktree listing failed every `worktreePath` is null
+  // because it is UNKNOWN, and the old test read that as free — so this sheet
+  // enabled a checkout onto every branch at once, including ones another
+  // worktree holds. Fail closed until ownership is known.
+  const ownershipContext = {
+    ownershipUnavailable: gitState.selectedThreadOwnershipUnavailable,
+    currentWorktreePath,
+  };
+  const refsError = gitState.selectedThreadRefsError;
+  const ownershipBlockByName = new Map<string, BranchOwnershipBlock>();
   for (const branch of availableBranches) {
-    if (branch.worktreePath !== null && branch.worktreePath !== currentWorktreePath) {
-      disabledExistingBranchNames.push(branch.name);
-    }
+    const block = branchPickerRowBlock(
+      {
+        worktreePath: branch.worktreePath ?? null,
+        current: branch.current,
+        isRemote: branch.isRemote,
+      },
+      ownershipContext,
+    );
+    if (block !== null) ownershipBlockByName.set(branch.name, block);
   }
-  const disabledExistingBranches = new Set(disabledExistingBranchNames);
 
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
@@ -146,14 +167,15 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
             </Text>
           ) : null}
           {availableBranches.map((branch) => {
-            const disabled = disabledExistingBranches.has(branch.name);
-            const subtitle = branch.worktreePath
-              ? branch.worktreePath === currentWorktreePath
-                ? "Checked out in this thread"
-                : "Checked out in another worktree"
-              : branch.isDefault
-                ? "Default branch"
-                : "Local branch";
+            const ownershipBlock = ownershipBlockByName.get(branch.name) ?? null;
+            const disabled = ownershipBlock !== null;
+            // The subtitle comes from the SAME reading of ownership as the
+            // disabled state. Rendering "Local branch" under a row the user
+            // cannot tap reads as a broken button rather than a safety refusal.
+            const subtitle =
+              ownershipBlock === "ownership-unknown"
+                ? branchOwnershipReason(ownershipBlock, refsError)
+                : branchOwnershipSubtitle(branch, ownershipContext);
 
             return (
               <Pressable
@@ -164,6 +186,10 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
                 )}
                 disabled={busy || disabled}
                 onPress={() => {
+                  // Belt AND braces, as on web: `disabled` is a prop, this is
+                  // the invariant. An affordance that only LOOKS disabled over
+                  // a live handler is exactly the defect #341 names.
+                  if (disabled) return;
                   void gitActions.onCheckoutSelectedThreadBranch(branch.name).then(() => {
                     navigation.goBack();
                   });

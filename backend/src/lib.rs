@@ -11,5 +11,6 @@ pub mod review;
 pub mod settings;
 pub mod sourcecontrol;
 pub mod terminal;
+pub mod text;
 pub mod tools;
 pub mod vcs;

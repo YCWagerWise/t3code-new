@@ -52,5 +52,13 @@ export function useSelectedThreadGitState() {
     sourceControlDiscovery,
     selectedThreadBranches,
     selectedThreadBranchesLoading: selectedThreadBranchState.isPending,
+    // #341: whether worktree ownership is KNOWN, carried beside the branches
+    // rather than left on `data`. When cairn cannot list linked worktrees every
+    // ref arrives with `worktreePath: null`, which a null check reads as
+    // "free" — so the sheet offered a checkout onto branches another worktree
+    // may hold. The picker needs this to fail closed.
+    selectedThreadOwnershipUnavailable:
+      selectedThreadBranchState.data?.ownershipUnavailable === true,
+    selectedThreadRefsError: selectedThreadBranchState.data?.refsError,
   };
 }

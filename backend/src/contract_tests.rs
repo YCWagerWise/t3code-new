@@ -31,6 +31,18 @@ async fn drop_runtime_kv(state: &AppState) {
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
 }
 
+/// #202: break the broker's subscriber table so every `topic_publish` fails.
+///
+/// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
+/// and `Broker::publish` starts with `SELECT sub_id, topic FROM subs` — so
+/// dropping that table is a real, deterministic publish failure at the exact
+/// seam, with no test-only fault hook bolted onto the product.
+async fn break_topic_publish(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE subs", vec![]).await.unwrap();
+}
+
 /// PROOF (#320 anti-regression, packet AE): the product backend must not
 /// re-grow authority the SDK/do-rs now owns. Each symbol below was
 /// previously a live product-owned hidden authority and its deletion is
@@ -4875,6 +4887,86 @@ async fn a_vcs_watch_status_error_reaches_the_subscriber_as_unavailable() {
     assert!(
         saw,
         "a post-subscription status error was not published as statusUnavailable"
+    );
+}
+
+/// #174: a status read that fails while the watch is being PLACED is the same
+/// visible failure as one that fails after it is live (#49).
+///
+/// By the time `watch_one_tree` runs, `subscribeVcsStatus` has already sent a
+/// snapshot and registered a durable watch claim. If placement then returns an
+/// error and we only log it, the subscriber keeps a live subscription that no
+/// watcher will ever feed: the panel freezes on the last good status with no
+/// error anywhere. This corrupts the index BETWEEN the snapshot/claim and
+/// placement, which is the exact window the earlier test cannot reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vcs_watch_that_cannot_be_placed_reaches_the_subscriber_as_unavailable() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let sh = |c: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(c)
+            .current_dir(&dir)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "`{c}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    sh("git config user.email t@t && git config user.name t");
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    sh("git add -A && git commit -qm base");
+
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+    request(&state, &sub_tx, "subscribeVcsStatus", json!({"cwd": cwd})).await;
+    assert_eq!(drain(&mut sub_rx)[0]["values"][0]["_tag"], "snapshot");
+
+    let (watched, baseline) = state
+        .rt
+        .watch_marks("vcs")
+        .await
+        .expect("the watch registry is readable")
+        .into_iter()
+        .next()
+        .expect("the subscriber registered a watch");
+
+    // The repository is readable for the snapshot and the claim, then stops
+    // being readable before placement gets its own status read.
+    std::fs::write(dir.join(".git/index"), b"\x00not a git index\x00").unwrap();
+
+    let watcher = tokio::spawn(watch_one_tree(state.clone(), watched, baseline, None));
+
+    let mut saw = false;
+    while let Ok(Some((raw, _))) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), sub_rx.recv()).await
+    {
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        if v["values"][0]["_tag"] == "localUpdated" {
+            let local = &v["values"][0]["local"];
+            if local["statusUnavailable"] == json!(true) {
+                assert_eq!(
+                    local["isRepo"],
+                    json!(true),
+                    "the repo was demoted instead of degraded: {local}"
+                );
+                assert!(
+                    local["statusError"].as_str().is_some_and(|e| !e.is_empty()),
+                    "the unavailable status carries no error: {local}"
+                );
+                saw = true;
+                break;
+            }
+        }
+    }
+    watcher.abort();
+    assert!(
+        saw,
+        "a watch that could not be placed was swallowed: the subscriber holds a \
+         live subscription and a durable claim that nothing will ever feed"
     );
 }
 
@@ -10500,4 +10592,80 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
         found.len() * 5
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// #202: a terminal lifecycle command must not acknowledge success when the
+/// frame announcing it could not be published.
+///
+/// `terminal.clear` and `terminal.close` change PTY state and then ack on the
+/// wire. The ONLY way a live or reconnecting subscriber learns about that
+/// change is the broker frame `broadcast_terminal_event` publishes. When that
+/// publish failed it was logged and dropped: the command reported Success while
+/// every other surface kept rendering a pane that no longer exists, with
+/// nothing anywhere saying so. The publish is part of the command's result
+/// contract, so a failed publish is a visible failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_published() {
+    let (state, _dir) = test_state().await;
+
+    for pane in ["pane-a", "pane-b"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "terminal.open",
+            json!({ "threadId": "t-1", "terminalId": pane, "cwd": state.cwd.clone() }),
+        )
+        .await;
+        assert_eq!(
+            drain(&mut rx)[0]["exit"]["_tag"],
+            json!("Success"),
+            "the pane opened"
+        );
+    }
+
+    break_topic_publish(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "terminal.clear",
+        json!({ "threadId": "t-1", "terminalId": "pane-a" }),
+    )
+    .await;
+    let cleared = drain(&mut rx);
+    assert_eq!(
+        cleared[0]["exit"]["_tag"],
+        json!("Failure"),
+        "terminal.clear acked success over a fanout nobody received: {cleared:?}"
+    );
+    assert!(
+        cleared[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .is_some_and(|e| e.contains("subscribers could not be notified")),
+        "the failure does not say the pane WAS cleared and only the fanout failed: {cleared:?}"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "terminal.close",
+        json!({ "threadId": "t-1", "terminalId": "pane-b" }),
+    )
+    .await;
+    let closed = drain(&mut rx);
+    assert_eq!(
+        closed[0]["exit"]["_tag"],
+        json!("Failure"),
+        "terminal.close acked success over a fanout nobody received: {closed:?}"
+    );
+    assert!(
+        closed[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .is_some_and(|e| e.contains("subscribers could not be notified")),
+        "the failure does not distinguish the close from the fanout: {closed:?}"
+    );
 }
