@@ -4,19 +4,16 @@ import {
   isDeclaredCredentialName,
   isPreviouslyExposedCredentialRow,
   missingDeclaredCredentials,
+  preparePublishedCredentialVariable,
   resolveEnvironmentRowSensitive,
-  type ProviderCredentialDeclaration,
-} from "./ProviderInstanceCard.logic";
+  type ProviderCredentialName,
+} from "./providerCredentials.ts";
 
-// A fixture, not the real Atlas declaration: these tests prove the generic
+// A fixture, not a real driver's declaration: these tests prove the
 // mechanism works for any declared credential, not just the one provider
 // that happens to use it today.
-const FIXTURE_CREDENTIALS: ReadonlyArray<ProviderCredentialDeclaration> = [
-  {
-    name: "FIXTURE_BEARER_TOKEN",
-    label: "Bearer token",
-    description: "A fixture credential used only by this test.",
-  },
+const FIXTURE_CREDENTIALS: ReadonlyArray<ProviderCredentialName> = [
+  { name: "FIXTURE_BEARER_TOKEN" },
 ];
 
 describe("isDeclaredCredentialName", () => {
@@ -97,5 +94,76 @@ describe("missingDeclaredCredentials", () => {
   it("is empty for a driver that declares no credentials", () => {
     expect(missingDeclaredCredentials(undefined, [])).toEqual([]);
     expect(missingDeclaredCredentials([], [])).toEqual([]);
+  });
+});
+
+describe("preparePublishedCredentialVariable", () => {
+  it("drops the value of a previously-exposed declared credential instead of republishing it", () => {
+    expect(
+      preparePublishedCredentialVariable(FIXTURE_CREDENTIALS, {
+        name: "FIXTURE_BEARER_TOKEN",
+        value: "leaked-value",
+        sensitive: false,
+      }),
+    ).toEqual({ name: "FIXTURE_BEARER_TOKEN", value: "", sensitive: true });
+  });
+
+  it("does this even when the row was not the one the user just edited", () => {
+    // The exact regression this function exists to close: publishing the
+    // full row set after editing an unrelated variable must not carry an
+    // untouched declared-credential row's old value forward.
+    const untouchedLegacyRow = {
+      name: "FIXTURE_BEARER_TOKEN",
+      value: "leaked-value",
+      sensitive: false,
+    };
+    const editedOtherRow = { name: "OTHER_VAR", value: "new-value", sensitive: false };
+
+    const published = [untouchedLegacyRow, editedOtherRow].map((variable) =>
+      preparePublishedCredentialVariable(FIXTURE_CREDENTIALS, variable),
+    );
+
+    expect(published).toEqual([
+      { name: "FIXTURE_BEARER_TOKEN", value: "", sensitive: true },
+      { name: "OTHER_VAR", value: "new-value", sensitive: false },
+    ]);
+  });
+
+  it("passes a fresh, user-supplied value through once the row is marked sensitive", () => {
+    // Once `sensitive` is true, the row is no longer "previously exposed" —
+    // this is how a user's own replacement value survives publish.
+    expect(
+      preparePublishedCredentialVariable(FIXTURE_CREDENTIALS, {
+        name: "FIXTURE_BEARER_TOKEN",
+        value: "rotated-value",
+        sensitive: true,
+      }),
+    ).toEqual({ name: "FIXTURE_BEARER_TOKEN", value: "rotated-value", sensitive: true });
+  });
+
+  it("leaves an ordinary, non-declared variable's value untouched regardless of sensitivity", () => {
+    expect(
+      preparePublishedCredentialVariable(FIXTURE_CREDENTIALS, {
+        name: "SOME_OTHER_VAR",
+        value: "plain-value",
+        sensitive: false,
+      }),
+    ).toEqual({ name: "SOME_OTHER_VAR", value: "plain-value", sensitive: false });
+  });
+
+  it("preserves a genuine redacted-secret round trip untouched", () => {
+    expect(
+      preparePublishedCredentialVariable(FIXTURE_CREDENTIALS, {
+        name: "FIXTURE_BEARER_TOKEN",
+        value: "",
+        sensitive: true,
+        valueRedacted: true,
+      }),
+    ).toEqual({
+      name: "FIXTURE_BEARER_TOKEN",
+      value: "",
+      sensitive: true,
+      valueRedacted: true,
+    });
   });
 });

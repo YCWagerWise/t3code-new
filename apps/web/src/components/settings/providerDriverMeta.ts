@@ -6,6 +6,7 @@ import {
   OpenCodeSettings,
   OpenaiCompatSettings,
   ProviderDriverKind,
+  type ProviderCredentialName,
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
 import { AtlasIcon, ClaudeAI, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
@@ -43,12 +44,19 @@ export interface ProviderClientDefinition {
    * (see e.g. `AtlasDriver.readAtlasCredential`'s `refused-insecure`
    * result), so a free sensitive toggle on a declared credential row is a
    * silent footgun, not a real choice.
+   *
+   * `label`/`description` are presentation-only, which is why this extends
+   * `@t3tools/contracts`'s `ProviderCredentialName` rather than living there
+   * in full — the safety-critical decisions (forced-sensitive, dropped on
+   * publish if previously exposed) key on `name` alone and are shared with
+   * the server via `packages/contracts/src/providerCredentials.ts`.
    */
-  readonly credentials?: readonly {
-    readonly name: string;
-    readonly label: string;
-    readonly description: string;
-  }[];
+  readonly credentials?: readonly ProviderClientCredentialDeclaration[];
+}
+
+export interface ProviderClientCredentialDeclaration extends ProviderCredentialName {
+  readonly label: string;
+  readonly description: string;
 }
 
 export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [

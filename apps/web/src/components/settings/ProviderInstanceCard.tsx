@@ -14,8 +14,13 @@ import * as Arr from "effect/Array";
 import * as Result from "effect/Result";
 import { useState, type ReactNode } from "react";
 import {
+  isDeclaredCredentialName,
   isProviderDriverKind,
+  missingDeclaredCredentials,
+  preparePublishedCredentialVariable,
+  resolveEnvironmentRowSensitive,
   resolveProviderInstanceEnabled,
+  isPreviouslyExposedCredentialRow,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   type ProviderInstanceId,
@@ -38,14 +43,7 @@ import { Switch } from "../ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import type { DriverOption } from "./providerDriverMeta";
-import {
-  isDeclaredCredentialName,
-  isPreviouslyExposedCredentialRow,
-  missingDeclaredCredentials,
-  resolveEnvironmentRowSensitive,
-  type ProviderCredentialDeclaration,
-} from "./ProviderInstanceCard.logic";
+import type { DriverOption, ProviderClientCredentialDeclaration } from "./providerDriverMeta";
 import { ProviderSettingsForm } from "./ProviderSettingsForm";
 import { ProviderModelsSection } from "./ProviderModelsSection";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
@@ -70,24 +68,11 @@ type EnvironmentDraftRow = {
   readonly value: string;
   readonly sensitive: boolean;
   readonly valueRedacted?: boolean;
-  /**
-   * Set once, at the moment this row entered local state: it is a declared
-   * credential that was persisted `sensitive: false`, so `value` already
-   * reached this browser unprotected (see `isPreviouslyExposedCredentialRow`
-   * in `ProviderInstanceCard.logic.ts`). Cleared the moment the user commits
-   * a replacement value — a value they just typed cannot itself be the
-   * historically-leaked one — mirroring how `valueRedacted` clears on edit.
-   * Never set from anywhere else: this is a fact about what shipped to the
-   * browser on load, not a live derivation, so it must survive edits to
-   * *other* rows and other fields on the card.
-   */
-  readonly wasStoredInsecure?: boolean;
 };
 
 function makeEnvironmentDraftRow(
   variable: ProviderInstanceEnvironmentVariable,
   index: number,
-  credentials: ReadonlyArray<ProviderCredentialDeclaration> | undefined,
 ): EnvironmentDraftRow {
   return {
     id: `${index}:${variable.name}`,
@@ -95,9 +80,6 @@ function makeEnvironmentDraftRow(
     value: variable.value,
     sensitive: variable.sensitive,
     ...(variable.valueRedacted !== undefined ? { valueRedacted: variable.valueRedacted } : {}),
-    ...(isPreviouslyExposedCredentialRow(credentials, variable.name, variable.sensitive)
-      ? { wasStoredInsecure: true }
-      : {}),
   };
 }
 
@@ -186,12 +168,10 @@ export function ProviderEnvironmentSection(props: {
    * sensitive toggle below — undefined/empty for drivers that declare none,
    * which leaves every row exactly as generic as it was before this existed.
    */
-  readonly credentials?: ReadonlyArray<ProviderCredentialDeclaration> | undefined;
+  readonly credentials?: ReadonlyArray<ProviderClientCredentialDeclaration> | undefined;
 }) {
   const [rows, setRows] = useState<ReadonlyArray<EnvironmentDraftRow>>(() =>
-    props.environment.map((variable, index) =>
-      makeEnvironmentDraftRow(variable, index, props.credentials),
-    ),
+    props.environment.map(makeEnvironmentDraftRow),
   );
 
   const publishRows = (nextRows: ReadonlyArray<EnvironmentDraftRow>) => {
@@ -209,23 +189,17 @@ export function ProviderEnvironmentSection(props: {
         }
         continue;
       }
-      // `wasStoredInsecure` is a local-only draft flag (see `EnvironmentDraftRow`)
-      // with no place in `ProviderInstanceEnvironmentVariable` — drop it here so
-      // it never leaks into the payload sent to `onChange` / the server.
-      const { id: _id, wasStoredInsecure: _wasStoredInsecure, ...rest } = row;
-      // A declared credential (e.g. Atlas's `ATLAS_ACCESS_TOKEN`) is always
-      // saved sensitive, regardless of what the row's own toggle says: the
-      // driver that reads it refuses a matching non-sensitive entry outright,
-      // so publishing anything else would silently produce a dead credential.
-      // This is a strictly forward-safe correction — it stops *future*
-      // exposure of whatever value ends up in this row — and is NOT a claim
-      // that a value already rendered to this browser was never exposed.
-      // That honesty lives in the render below (`wasStoredInsecure`), not here.
-      published.push({
-        ...rest,
-        name,
-        sensitive: resolveEnvironmentRowSensitive(props.credentials, name, rest.sensitive),
-      });
+      const { id: _id, ...rest } = row;
+      // The full row set republishes on every edit within this section, not
+      // only the row the user touched — so an untouched declared-credential
+      // row loaded `sensitive: false` (already leaked to this browser) would
+      // otherwise carry its old value forward on every unrelated edit,
+      // letting the server quietly promote a compromised secret into the
+      // secret store. `preparePublishedCredentialVariable` is the single,
+      // shared (web + server, see `@t3tools/contracts`) place that instead
+      // drops that value — fail closed — rather than forcing `sensitive:
+      // true` while still carrying it. See its doc comment for why.
+      published.push(preparePublishedCredentialVariable(props.credentials, { ...rest, name }));
     }
     props.onChange(published);
   };
@@ -235,7 +209,7 @@ export function ProviderEnvironmentSection(props: {
     rows.map((row) => row.name),
   );
 
-  const seedCredentialRow = (credential: ProviderCredentialDeclaration) => {
+  const seedCredentialRow = (credential: ProviderClientCredentialDeclaration) => {
     const nextRows = [
       ...rows,
       {
@@ -250,20 +224,25 @@ export function ProviderEnvironmentSection(props: {
   };
 
   const updateVariable = (id: string, patch: Partial<Omit<EnvironmentDraftRow, "id">>) => {
-    const nextRows = rows.map((row) =>
-      row.id === id
-        ? {
-            ...row,
-            ...patch,
-            // A freshly-typed value can't be the historically-leaked one —
-            // clear the exposure flag the same moment a stored secret's
-            // redaction placeholder clears, for the same reason.
-            ...(patch.value !== undefined
-              ? { valueRedacted: false, wasStoredInsecure: false }
-              : {}),
-          }
-        : row,
-    );
+    const nextRows = rows.map((row) => {
+      if (row.id !== id) return row;
+      // A value the user just typed for a declared credential can't be the
+      // historically-leaked one — mark it sensitive immediately so this row
+      // stops being "previously exposed" (see `isPreviouslyExposedCredentialRow`,
+      // which reads this same `sensitive` flag live on every render and in
+      // `publishRows`) the moment a real replacement is supplied. The
+      // checkbox for a declared-credential row is disabled precisely because
+      // this is the only path that should ever flip it.
+      const isCredentialReplacement =
+        patch.value !== undefined && isDeclaredCredentialName(props.credentials, row.name);
+      return {
+        ...row,
+        ...patch,
+        ...(patch.value !== undefined
+          ? { valueRedacted: false, ...(isCredentialReplacement ? { sensitive: true } : {}) }
+          : {}),
+      };
+    });
     setRows(nextRows);
     publishRows(nextRows);
   };
@@ -274,11 +253,16 @@ export function ProviderEnvironmentSection(props: {
     publishRows(nextRows);
   };
 
-  // Rows whose value already reached this browser unprotected (see
-  // `wasStoredInsecure`). Surfaced as a standing, always-visible notice —
-  // not only a hover tooltip — because a past secret leak isn't something a
-  // user should have to discover by hovering the right checkbox.
-  const exposedRows = rows.filter((row) => row.wasStoredInsecure === true);
+  // Rows currently showing the exact state `preparePublishedCredentialVariable`
+  // exists to fail closed on: a declared credential still loaded/held
+  // `sensitive: false`. Recomputed live from each row's own `sensitive` flag
+  // (not a captured-at-load snapshot) so this can never go stale — it clears
+  // the instant `updateVariable` marks a row sensitive, and remains accurate
+  // after a remount because the server never persists the old value under
+  // `sensitive: false` for a declared credential in the first place.
+  const exposedRows = rows.filter((row) =>
+    isPreviouslyExposedCredentialRow(props.credentials, row.name, row.sensitive),
+  );
 
   return (
     <div className="grid gap-2">
@@ -336,8 +320,8 @@ export function ProviderEnvironmentSection(props: {
           {exposedRows.map((row) => row.name).join(", ")}{" "}
           {exposedRows.length === 1 ? "was" : "were"} previously stored without the Sensitive flag
           and {exposedRows.length === 1 ? "has" : "have"} already been sent to this browser
-          unprotected — treat the current value as compromised. Enter a new value below to rotate
-          it; marking the row sensitive alone does not undo the earlier exposure.
+          unprotected — treat the current value as compromised. It will be discarded (not saved) on
+          your next change here; enter a new value below to set a working credential.
         </p>
       ) : null}
       {rows.length === 0 ? (
@@ -369,7 +353,11 @@ export function ProviderEnvironmentSection(props: {
                   variable.name,
                   variable.sensitive,
                 );
-                const previouslyExposed = variable.wasStoredInsecure === true;
+                const previouslyExposed = isPreviouslyExposedCredentialRow(
+                  props.credentials,
+                  variable.name,
+                  variable.sensitive,
+                );
                 return (
                   <TableRow
                     key={variable.id}
@@ -418,7 +406,7 @@ export function ProviderEnvironmentSection(props: {
                             />
                             <TooltipPopup side="top">
                               {previouslyExposed
-                                ? "Previously stored without protection and already sent to this browser unredacted - enter a new value to rotate it."
+                                ? "Previously stored without protection and already sent to this browser unredacted - the old value is discarded on save. Enter a new value to set a working credential."
                                 : "Always sensitive - the driver refuses this credential otherwise."}
                             </TooltipPopup>
                           </Tooltip>

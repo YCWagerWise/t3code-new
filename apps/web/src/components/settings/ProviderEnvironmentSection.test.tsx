@@ -1,13 +1,23 @@
 /**
  * Rendered-component coverage for the environment editor's credential
- * handling — specifically for the exact regression finding #18 reported
- * against #10 (commit e4665901c): a declared-credential row whose value had
- * already been persisted `sensitive: false` was displayed in a plaintext
- * input while the checkbox next to it claimed "always sensitive". The pure
- * `.logic.ts` tests cover the decision functions in isolation but, as the
- * reviewer noted, cannot see what actually gets rendered — the checkbox and
- * the value field are two separate JSX branches that each read their own
- * source of truth, and only mounting the component proves they agree.
+ * handling.
+ *
+ * Round 1 (finding #18 against #10, commit e4665901c): a declared-credential
+ * row whose value had already been persisted `sensitive: false` was
+ * displayed in a plaintext input while the checkbox next to it claimed
+ * "always sensitive".
+ *
+ * Round 2 (finding #18 again, against the round-1 fix): the display fix was
+ * accepted, but publishing still carried the leaked value forward on an
+ * UNRELATED row's edit, because the whole row set republishes on every edit
+ * — the server then promoted that leaked value into the secret store. The
+ * component-only test could not close this alone, which is why
+ * `@t3tools/contracts`'s `preparePublishedCredentialVariable` (the actual
+ * function `publishRows` calls) is also proven end to end, through server
+ * persistence/redaction and the Atlas driver's credential decision, in
+ * `apps/server/src/provider/Drivers/AtlasDriver.credentialPersistence.test.ts`.
+ * This file proves the component wires that shared function correctly;
+ * that file proves what happens to its output.
  *
  * This repo has no DOM renderer for unit tests; the established pattern
  * (see `ProviderUpdateEnvironmentRows.test.tsx`,
@@ -15,7 +25,10 @@
  * function under a `useState` shim and walk the returned element tree.
  */
 import { isValidElement, type ReactElement } from "react";
-import type { ProviderInstanceEnvironmentVariable } from "@t3tools/contracts";
+import type {
+  ProviderCredentialName,
+  ProviderInstanceEnvironmentVariable,
+} from "@t3tools/contracts";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { visitElements } from "../../test/reactElementTree";
@@ -35,12 +48,13 @@ vi.mock("react/compiler-runtime", async () => {
   return { c: reactHookHarness.useMemoCache };
 });
 
-import type { ProviderCredentialDeclaration } from "./ProviderInstanceCard.logic";
 import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
 
 // A fixture, not the real Atlas declaration: proves the mechanism generically
 // rather than re-testing one provider's literal variable name.
-const FIXTURE_CREDENTIALS: ReadonlyArray<ProviderCredentialDeclaration> = [
+const FIXTURE_CREDENTIALS: ReadonlyArray<
+  ProviderCredentialName & { label: string; description: string }
+> = [
   {
     name: "FIXTURE_BEARER_TOKEN",
     label: "Bearer token",
@@ -73,17 +87,21 @@ function flattenText(node: unknown): string {
 function renderSection(props: {
   readonly environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>;
   readonly onChange: (environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>) => void;
-  readonly credentials?: ReadonlyArray<ProviderCredentialDeclaration> | undefined;
+  readonly credentials?: typeof FIXTURE_CREDENTIALS | undefined;
 }): ReactElement<Record<string, unknown>> {
   hooks.beginRender();
   return ProviderEnvironmentSection(props) as ReactElement<Record<string, unknown>>;
 }
 
-function findValueInput(tree: ReactElement<Record<string, unknown>>) {
+function findValueInputAt(tree: ReactElement<Record<string, unknown>>, index: number) {
   return visitElements(
     tree,
-    (element) => element.props["aria-label"] === "Environment variable value 1",
+    (element) => element.props["aria-label"] === `Environment variable value ${index}`,
   );
+}
+
+function findValueInput(tree: ReactElement<Record<string, unknown>>) {
+  return findValueInputAt(tree, 1);
 }
 
 function findAlert(tree: ReactElement<Record<string, unknown>>) {
@@ -193,5 +211,34 @@ describe("ProviderEnvironmentSection credential rendering", () => {
     expect(valueInput?.props.value).toBe("not-a-secret");
     expect(valueInput?.props.type).toBeUndefined();
     expect(findAlert(tree)).toBeNull();
+  });
+
+  it("drops the leaked value from what is published when only an UNRELATED row is edited", () => {
+    // Round-2 regression: the whole row set republishes on every edit, not
+    // only the touched row. Editing OTHER_VAR must not let the untouched,
+    // still-`sensitive:false` FIXTURE_BEARER_TOKEN row carry its old value
+    // into the payload `onChange` receives — that payload is what a save
+    // sends to the server, and from there into the secret store.
+    const onChange = vi.fn();
+    const tree = renderSection({
+      environment: [
+        legacyInsecureRow(),
+        { name: "OTHER_VAR", value: "old-value", sensitive: false },
+      ],
+      onChange,
+      credentials: FIXTURE_CREDENTIALS,
+    });
+
+    const otherValueInput = findValueInputAt(tree, 2);
+    expect(otherValueInput).not.toBeNull();
+    const onCommit = otherValueInput?.props.onCommit as ((value: string) => void) | undefined;
+    onCommit?.("new-value");
+
+    expect(onChange).toHaveBeenCalledWith([
+      { name: "FIXTURE_BEARER_TOKEN", value: "", sensitive: true },
+      { name: "OTHER_VAR", value: "new-value", sensitive: false, valueRedacted: false },
+    ]);
+    const publishedWire = JSON.stringify(onChange.mock.calls.at(-1));
+    expect(publishedWire).not.toContain(LEAKED_VALUE);
   });
 });
