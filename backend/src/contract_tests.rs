@@ -8090,6 +8090,32 @@ async fn source_control_repository_actions_are_wired() {
         f[0]["exit"]["cause"]
     );
 
+    // #189: repository is product input, not raw argv. A flag-shaped value
+    // must be rejected before `gh repo create` can reinterpret it as an option.
+    cairn::init_repository(&dir).await.unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "sourceControl.publishRepository",
+        json!({
+            "cwd": dir.to_string_lossy(), "provider": "github",
+            "repository": "--template", "visibility": "private",
+        }),
+    )
+    .await;
+    let f = drain(&mut rx);
+    assert_eq!(f[0]["exit"]["_tag"], "Failure");
+    let why = f[0]["exit"]["cause"].to_string();
+    assert!(
+        why.contains("repository") && why.contains("CLI option"),
+        "flag-shaped repository was rejected by source-control policy: {why}"
+    );
+    assert!(
+        !why.contains("gh repo create"),
+        "the refusal must happen before invoking gh: {why}"
+    );
+
     // a lookup for a repository that needs the network either works or fails
     // with gh's own message — never with "unsupported method"
     let (tx, mut rx) = mpsc::unbounded_channel();
