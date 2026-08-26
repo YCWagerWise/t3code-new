@@ -5903,7 +5903,8 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     };
     assert!(mark > 0, "the first process actually advanced the sequence");
 
-    // Second process over the SAME data dir. Nothing is carried in memory —
+    // A fresh AppState over the SAME data dir — proves the durable read path,
+    // not crash recovery (#375). Nothing is carried in memory —
     // this is the restart the old counter could not survive.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5988,7 +5989,8 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         }
     }
 
-    // Second process over the same directory — nothing carried in memory.
+    // A fresh AppState over the same directory — proves the durable read
+    // path, not crash recovery (#375). Nothing carried in memory.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -8396,7 +8398,8 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         "the seeded project carries createdAt: {projects_a:#?}"
     );
 
-    // Second process over the SAME data dir. If projects were still a
+    // A fresh AppState over the SAME data dir — proves the durable read
+    // path, not crash recovery (#375). If projects were still a
     // boot-time constant on `Store`, this snapshot would carry a fresh
     // `createdAt` for the same id — the divergence the finding names.
     // Instead, the second process's boot check sees the row already
