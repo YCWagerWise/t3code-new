@@ -766,14 +766,22 @@ fn now_iso() -> String {
 
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
-async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
+/// FALLIBLE (#362). This returned `()`, so `thread.turn.start` could not gate
+/// its ACK on the bootstrap being durable — every failure inside was a
+/// `tracing::error!` and a bare `return`, and the caller had already told the
+/// client the turn was accepted. The first turn is exactly the one that
+/// creates the thread, so the failure the client cannot see is the one that
+/// loses their thread entirely.
+async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(), String> {
     let thread_id = command
         .get("threadId")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
     if thread_id.is_empty() {
-        return;
+        // Not a failure: a turn on an already-established thread carries no
+        // bootstrap and has nothing to ensure.
+        return Ok(());
     }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
@@ -821,14 +829,12 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
-                    return;
+                    return Err(
+                        "no seed project in store; refusing to invent a project id".into()
+                    )
                 }
             },
-            Err(e) => {
-                tracing::error!(%e, "ensure_thread_on_shell: project store unreadable");
-                return;
-            }
+            Err(e) => return Err(format!("project store unreadable: {e}")),
         },
     };
     // A worktree the client prepared (or asked us to prepare) is where this
@@ -896,10 +902,10 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // fails to persist, do not announce it (it would vanish on reload). No
     // process-local rollback to do — the store IS the state.
     if let Err(e) = state.rt.save_thread(&thread).await {
-        tracing::error!(%e, %thread_id, "persist thread failed — not announcing on shell");
-        return;
+        return Err(format!("persisting thread {thread_id}: {e}"));
     }
     upsert_thread_on_shell(state, thread).await;
+    Ok(())
 }
 
 /// Refresh the shell projection for one thread and announce it to every shell
@@ -4466,15 +4472,28 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             //   request, one terminal.
             //
             // So: accepted-ack for the async lane, applied-ack for the rest.
+            // #362: the accepted-ack for `thread.turn.start` is sent INSIDE its
+            // arm below, after `ensure_thread_on_shell` has durably committed
+            // the first-turn bootstrap. It used to be sent here, before it —
+            // so a bootstrap that failed to persist still ACKed success, and
+            // the thread the user had just created vanished on reload with
+            // nothing on the wire to say why. Accepted still means accepted;
+            // it just cannot precede the durable write it depends on.
             let async_lane =
                 command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            if async_lane {
-                exit_success(tx, &id, json!({ "sequence": seq }));
-            }
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
                     if let Some(model) = model {
-                        ensure_thread_on_shell(&state, &command).await;
+                        // Durable bootstrap FIRST, then the accepted-ack, then
+                        // the turn (#362). A failure here is reported as a
+                        // failed request rather than logged behind a success
+                        // frame the client already has.
+                        if let Err(e) = ensure_thread_on_shell(&state, &command).await {
+                            tracing::error!(%e, "thread.turn.start bootstrap failed");
+                            exit_failure(tx, &id, &format!("thread.turn.start: {e}"));
+                            return;
+                        }
+                        exit_success(tx, &id, json!({ "sequence": seq }));
                         run_turn(command, model, state.clone());
                     }
                 }
