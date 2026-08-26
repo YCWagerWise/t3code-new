@@ -8429,6 +8429,77 @@ async fn approval_failure_projection_failure_is_not_reported_as_applied() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #261: `respond_to_approval` returning `Ok(false)` means no durable pending
+/// approval row was answered. The product must not publish `approval.resolved`
+/// or send the applied success ACK for a stale request id.
+#[tokio::test]
+async fn an_approval_that_matched_no_pending_request_fails_the_rpc() {
+    let (state, dir) = test_state().await;
+    state
+        .rt
+        .save_thread(&json!({
+            "runtimeMode": "full-access",
+            "id": "t-appr-stale",
+            "projectId": "p-workspace",
+            "title": "approval stale",
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    let before = state.rt.current_sequence().await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.approval.respond",
+            "threadId": "t-appr-stale",
+            "requestId": "missing-session|7|missing-call",
+            "decision": "accept",
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a stale approval request must not be acknowledged as applied: {frames:#?}"
+    );
+    assert!(
+        exit["exit"]["cause"].to_string().contains("pending request"),
+        "failure names the missing durable pending approval: {exit}"
+    );
+
+    let replayed = state
+        .rt
+        .events_after("t-appr-stale", before, 100)
+        .await
+        .unwrap();
+    assert!(
+        replayed.iter().all(|e| {
+            e.pointer("/event/payload/activity/kind")
+                != Some(&json!("approval.resolved"))
+        }),
+        "a stale answer must not clear the pending banner via approval.resolved: {replayed:#?}"
+    );
+    assert!(
+        replayed.iter().any(|e| {
+            e.pointer("/event/payload/activity/kind")
+                == Some(&json!("approval.requested"))
+                && e.pointer("/event/payload/activity/tone") == Some(&json!("error"))
+        }),
+        "the failure mirror should keep the approval visible with an error: {replayed:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// PROOF (#103): a successfully delivered answer is still not "applied" until
 /// the resolved lifecycle activity is durably recorded for replay.
 #[tokio::test]
