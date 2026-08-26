@@ -876,7 +876,7 @@ async fn thread_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() {
         "hasPendingUserInput": false,
         "hasActionableProposedPlan": false,
     });
-    upsert_thread_on_shell(&state, thread).await;
+    upsert_thread_on_shell(&state, thread).await.unwrap();
 
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
         f.get("values")
@@ -2624,7 +2624,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "first", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     // The prompt itself is written by `run_turn_with_prompt_id`, not by
     // thread bootstrap, so a test that never runs a turn seeds it the way
     // the runtime would. What is under test here is the SWITCH, and the
@@ -2638,7 +2639,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "second", "messageId": "m2"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     seed_prompt(&state, "t-switch", "m2", "second").await;
 
     // the DURABLE thread row carries the new selection
@@ -2896,6 +2898,54 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
     assert_eq!(
         exit["exit"]["_tag"], "Success",
         "a routable selection dispatches: {exit}"
+    );
+}
+
+/// #362: the accepted ACK for an async first turn means the durable launch
+/// state exists, not just that model selection parsed.
+#[tokio::test]
+async fn first_turn_bootstrap_store_failure_fails_before_success_ack() {
+    let (state, _d) = test_state().await;
+    let db = state.rt.store().db().clone();
+    db.execute("DROP TABLE threads", vec![]).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.start",
+            "threadId": "t-bootstrap-fails",
+            "modelSelection": {"instanceId": "codex", "model": "codex-default"},
+            "message": {"text": "hi", "messageId": "m-bootstrap-fails"},
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "one terminal frame for failed bootstrap: {frames:#?}"
+    );
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "bootstrap persistence failure must not be acked as Success: {frames:#?}"
+    );
+    assert!(
+        exit_defect(exits[0]).contains("thread.turn.start bootstrap admission failed"),
+        "failure names the pre-ACK bootstrap boundary: {frames:#?}"
+    );
+    assert!(
+        !frames.iter().any(exit_is_success),
+        "a failed bootstrap must not also send Success{{sequence}}: {frames:#?}"
+    );
+    assert_eq!(
+        state.rt.claimed_turn("t-bootstrap-fails").await.unwrap(),
+        None,
+        "no async turn starts after bootstrap admission fails"
     );
 }
 
@@ -4545,7 +4595,7 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
     ensure_thread_on_shell(&state, &json!({
         "threadId": "t-meta", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
         "message": {"text": "hi", "messageId": "m1"},
-    })).await;
+    })).await.unwrap();
 
     // change the mode + title OUTSIDE a turn
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5593,7 +5643,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
 
     let t = state
         .rt
@@ -5641,7 +5692,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     let t = state
         .rt
         .threads()
@@ -5755,7 +5807,8 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
                 json!({"id": format!("t-{i}"), "title": "before", "projectId": "p",
                        "createdAt": now_iso(), "updatedAt": now_iso()}),
             )
-            .await;
+            .await
+            .unwrap();
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
         request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -5782,7 +5835,8 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
         json!({"id": "t-after-restart", "title": "after", "projectId": "p",
                "createdAt": now_iso(), "updatedAt": now_iso()}),
     )
-    .await;
+    .await
+    .unwrap();
 
     // Match on the NEW thread id, not just kind — subscribe delivers the
     // broker's retained latest frame (seq 5, from the pre-restart upserts)
@@ -5910,10 +5964,14 @@ async fn model_switch_persists_in_thread_snapshot() {
         })
     };
     // First turn creates the thread on instance A.
-    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await;
+    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-a", "hi").await;
     // Second turn SWITCHES to instance B on the same thread.
-    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again")).await;
+    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-b", "again").await;
 
     // The snapshot must reflect the switched selection, and keep both msgs.
@@ -6456,7 +6514,7 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
             "worktreePath": wt.to_string_lossy(),
         }},
     });
-    ensure_thread_on_shell(&state, &command).await;
+    ensure_thread_on_shell(&state, &command).await.unwrap();
 
     // the thread the shell announced carries what the user picked
     let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
@@ -8662,6 +8720,63 @@ async fn a_turn_is_reviewable_and_revertable_through_the_contract() {
         .expect("the reverted event");
     assert_eq!(reverted["event"]["payload"]["turnCount"], 1);
     assert_eq!(reverted["event"]["payload"]["threadId"], "t-ck");
+}
+
+/// #138/#139: a broken checkpoint substrate is not an empty checkpoint list.
+///
+/// The snapshot reducer can legitimately render `checkpoints: []` for a plain
+/// unversioned directory. A directory that has repository metadata git cannot
+/// read is different: cairn reports it as unavailable, and subscribeThread must
+/// fail the snapshot instead of publishing lifecycle-valid JSON that hides the
+/// recovery history.
+#[tokio::test]
+async fn subscribe_thread_fails_when_checkpoint_substrate_is_unavailable() {
+    let (state, dir) = test_state().await;
+    let broken = dir.join("broken-worktree");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "not a gitdir\n").unwrap();
+    let broken_s = broken.to_string_lossy().into_owned();
+
+    let row = agent_sdk_shell::ThreadRecord::new(
+        "t-broken-checkpoints",
+        "p-workspace",
+        "broken checkpoints",
+        Value::Null,
+        agent_sdk_shell::RuntimeMode::FullAccess,
+        "2026-08-24T00:00:00Z",
+    )
+    .on_worktree(Some(broken_s), None)
+    .project(json!({ "session": Value::Null }))
+    .unwrap();
+    state.rt.save_thread(&row).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({ "threadId": "t-broken-checkpoints" }),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.pointer("/values/0/kind").and_then(Value::as_str) == Some("snapshot")),
+        "must not publish a snapshot with checkpoints:[] over an unreadable stack: {frames:#?}"
+    );
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("checkpoint substrate failure is terminal");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "checkpoint substrate failure must be visible: {frames:#?}"
+    );
+    assert!(
+        exit_defect(exit).contains("checkpoint summaries unavailable"),
+        "failure names checkpoint projection, not a generic stream close: {frames:#?}"
+    );
 }
 
 /// PROOF (#376): the checkpoint substrate is CAIRN's, and it behaves like

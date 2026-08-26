@@ -761,14 +761,14 @@ fn now_iso() -> String {
 
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
-async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
+async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(), String> {
     let thread_id = command
         .get("threadId")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
     if thread_id.is_empty() {
-        return;
+        return Err("threadId is required".into());
     }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
@@ -816,13 +816,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
-                    return;
+                    return Err("ensure_thread_on_shell: no seed project in store; refusing to invent an id".into());
                 }
             },
             Err(e) => {
-                tracing::error!(%e, "ensure_thread_on_shell: project store unreadable");
-                return;
+                return Err(format!("ensure_thread_on_shell: project store unreadable: {e}"));
             }
         },
     };
@@ -892,16 +890,16 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // process-local rollback to do — the store IS the state.
     if let Err(e) = state.rt.save_thread(&thread).await {
         tracing::error!(%e, %thread_id, "persist thread failed — not announcing on shell");
-        return;
+        return Err(format!("persist thread failed: {e}"));
     }
-    upsert_thread_on_shell(state, thread).await;
+    upsert_thread_on_shell(state, thread).await
 }
 
 /// Refresh the shell projection for one thread and announce it to every shell
 /// subscriber. Shared by turn bootstrap and metadata updates, so a thread
 /// renamed or re-modelled outside a turn moves in the list exactly as one
 /// created by a turn does.
-async fn upsert_thread_on_shell(state: &AppState, thread: Value) {
+async fn upsert_thread_on_shell(state: &AppState, thread: Value) -> Result<(), String> {
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
@@ -919,9 +917,10 @@ async fn upsert_thread_on_shell(state: &AppState, thread: Value) {
     // upsert it missed was unobtainable, and the ordering/record decisions were
     // re-derived here where a second call site could get them wrong.
     let frame = json!({ "kind": "thread-upserted", "thread": thread });
-    if let Err(e) = state.rt.emit_shell_event(frame).await {
+    state.rt.emit_shell_event(frame).await.map_err(|e| {
         tracing::error!(%e, %thread_id, "shell emission failed — subscribers may miss this upsert");
-    }
+        format!("shell emission failed: {e}")
+    }).map(|_| ())
 }
 
 /// Apply a thread metadata patch DURABLY and announce it.
@@ -964,7 +963,7 @@ async fn update_thread_meta(
     }
     state.rt.save_thread(&thread).await?;
     // the shell list and every thread subscriber both need to see it
-    upsert_thread_on_shell(state, thread.clone()).await;
+    upsert_thread_on_shell(state, thread.clone()).await?;
     // Recorded, not just published (#318): a rename or model switch that only
     // went out live is invisible to a client that reconnects with
     // `afterSequence` — it catches up over the gap and keeps showing the old
@@ -4298,13 +4297,15 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // So: accepted-ack for the async lane, applied-ack for the rest.
             let async_lane =
                 command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            if async_lane {
-                exit_success(tx, &id, json!({ "sequence": seq }));
-            }
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
                     if let Some(model) = model {
-                        ensure_thread_on_shell(&state, &command).await;
+                        if let Err(e) = ensure_thread_on_shell(&state, &command).await {
+                            tracing::error!(%e, "thread.turn.start bootstrap admission failed");
+                            exit_failure(tx, &id, &format!("thread.turn.start bootstrap admission failed: {e}"));
+                            return;
+                        }
+                        exit_success(tx, &id, json!({ "sequence": seq }));
                         run_turn(command, model, state.clone());
                     }
                 }
