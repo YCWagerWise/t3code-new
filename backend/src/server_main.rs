@@ -2288,12 +2288,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Read the stored rules BEFORE taking the catalog lock: the config
             // body needs both, and holding the lock across an await would let a
             // concurrent settings write stall every boot handshake.
-            let custom = match keybindings::load_custom(state.rt.store()).await {
-                Ok(custom) => custom,
+            let loaded = match keybindings::load_custom(state.rt.store()).await {
+                Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
             let cat = state.catalog.read().await;
-            exit_success(tx, &id, server_config(&cat, &custom));
+            exit_success(tx, &id, server_config(&cat, &loaded.rules, &loaded.issues));
         }
 
         // Diagnostics (#67). The settings Diagnostics page is the one screen that
@@ -2425,10 +2425,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // and a partial answer would blank every other binding.
         "server.upsertKeybinding" | "server.removeKeybinding" => {
             let input = keybindings::input_of(&payload);
-            let custom = match keybindings::load_custom(state.rt.store()).await {
-                Ok(custom) => custom,
+            let loaded = match keybindings::load_custom(state.rt.store()).await {
+                Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
+            let custom = loaded.rules;
             let next = if method == "server.upsertKeybinding" {
                 keybindings::upsert(&custom, &input)
             } else {
@@ -2445,7 +2446,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 exit_failure(tx, &id, &format!("persist keybindings failed: {e}"));
                 return;
             }
-            let wire = keybindings::result_wire(&next);
+            // The issues carried here are the ones this load found and this
+            // write did not repair: `save_custom` only persists the rules that
+            // DECODED, so a malformed blob or a bad entry is rewritten away and
+            // its issue is stale the moment the write lands. Recomputing from
+            // the tree we just wrote is the honest report.
+            let wire = keybindings::result_wire(&next, &[]);
             exit_success(tx, &id, wire.clone());
             // Every other open surface (a second window, the command palette's
             // hint column) reads the projection this stream feeds, not this
@@ -3072,14 +3078,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "subscribeServerConfig" => {
             // an initial snapshot, so a late subscriber is not stuck with
             // whatever it cached before connecting
-            let custom = match keybindings::load_custom(state.rt.store()).await {
-                Ok(custom) => custom,
+            let loaded = match keybindings::load_custom(state.rt.store()).await {
+                Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
             chunk(
                 tx,
                 &id,
-                config_snapshot_event(server_config(&*state.catalog.read().await, &custom)),
+                config_snapshot_event(server_config(
+                    &*state.catalog.read().await,
+                    &loaded.rules,
+                    &loaded.issues,
+                )),
             );
             // Fanout attaches through the SDK's durable config topic (packet
             // DL). Retained::Skip so the caller does not re-receive the
@@ -5316,7 +5326,11 @@ fn spawn_metadata_tail(
 /// dispatches on is the defaults with those merged over (#71). It is passed in
 /// rather than read here because this is called while the catalog lock is held
 /// and the store read is `async`.
-fn server_config(catalog: &Catalog, custom: &[keybindings::Rule]) -> Value {
+fn server_config(
+    catalog: &Catalog,
+    custom: &[keybindings::Rule],
+    issues: &[Value],
+) -> Value {
     let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
         std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
@@ -5328,7 +5342,11 @@ fn server_config(catalog: &Catalog, custom: &[keybindings::Rule]) -> Value {
         "cwd": cwd,
         "keybindingsConfigPath": keybindings::config_path(),
         "keybindings": keybindings::resolved(custom),
-        "issues": [], "availableEditors": [],
+        // NOT `[]`. This is where a `keybindings.malformed-config` /
+        // `keybindings.invalid-entry` reaches the settings page; hard-coding it
+        // empty is what made a dropped rule indistinguishable from a rule the
+        // user never wrote.
+        "issues": issues, "availableEditors": [],
         // enumerated from the catalog — a configured provider is in the picker
         // by virtue of being configured, and an unusable one stays visible with
         // its reason instead of vanishing (#35).
