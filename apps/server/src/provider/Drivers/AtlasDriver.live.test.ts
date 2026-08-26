@@ -435,10 +435,23 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     expect(seen.some((event) => event.type === "turn.completed")).toBe(true);
   }, 120_000);
 
-  it("cancels an ACTIVE attempt and the lens sees the turn actually end", async () => {
+  /**
+   * Cancellation, against an attempt that CANNOT finish on its own.
+   *
+   * The previous version of this test raced a model: it started an ollama turn, waited for
+   * `turn.started` and cancelled. Whether work remained when the cancel landed depended on how
+   * fast the model happened to be, so it passed on a slow one and failed on a fast one — and a
+   * lost race read as a green tick, which is worse than having no test.
+   *
+   * `/_test/hold` commits a real run through the supervisor's own `/command` and `/observation`
+   * seams and never reports a provider outcome. The attempt is genuinely `running` with nothing
+   * behind it, so the ONLY way it can leave that state is the cancellation path under test.
+   * The oracle is therefore strict: `completed` here is counter-evidence, not an alternative.
+   */
+  it("cancels an attempt that cannot finish on its own, and the lens sees it end", async () => {
     const created = await instance({});
     const adapter = created.adapter;
-    const threadId = ThreadId.make(`live-active-cancel-${Date.now()}`);
+    const threadId = ThreadId.make(`live-held-cancel-${Date.now()}`);
     const seen: Array<Record<string, unknown>> = [];
     const fiber = Effect.runFork(
       Stream.runForEach(adapter.streamEvents, (event) =>
@@ -446,67 +459,49 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
       ),
     );
     await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
-    await Effect.runPromise(
-      adapter.sendTurn({
-        threadId,
-        // Long enough to still be running when the cancel lands. A local model is slow, which
-        // is the one thing that makes it useful here.
-        input: "Write a very long detailed essay about distributed systems, at least 2000 words.",
-        modelSelection: { model: "ollama/qwen2.5-coder:7b" },
-      } as never),
-    );
-    // Wait until the provider has actually connected — cancelling a run that has not started
-    // yet would prove nothing about stopping work in flight — then interrupt IMMEDIATELY. A
-    // pause here is a race against the model: an ollama turn is one long HTTP call with no
-    // Action boundary, so a model that finishes first leaves nothing to cancel, and the essay
-    // prompt above exists to make that outcome vanishingly unlikely.
+
+    const held = (await (
+      await fetch(`${BASE_URL}/_test/hold`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: String(threadId) }),
+      })
+    ).json()) as { run_id: string; attempt_id: string; state: string };
+
+    // The attempt is in flight before the cancel is issued — stated by the authority, not
+    // inferred from timing.
+    expect(held.state).toEqual("running");
+    expect(held.attempt_id.length).toBeGreaterThan(0);
+
+    // The lens is watching that same run.
     await waitForEvent(seen, (event) => event["type"] === "turn.started");
+
     await Effect.runPromise(adapter.interruptTurn(threadId));
 
-    const readSnapshot = async (): Promise<Record<string, unknown>> => {
+    const readRun = async (): Promise<Record<string, unknown>> => {
       const response = await fetch(`${BASE_URL}/console/v1/threads/${String(threadId)}`, {
         headers: { Authorization: `Bearer ${TOKEN}` },
       });
       return ((await response.json()) as { run?: Record<string, unknown> }).run ?? {};
     };
 
-    // The attempt was ACTIVE: the supervisor only accepts a cancel from a cancellable state and
-    // moves it to `cancelling` on the spot (`run_supervisor.rs`). A run that had already
-    // finished would have refused the command instead.
-    const during = await readSnapshot();
-    expect(["cancelling", "cancelled"]).toContain(String(during["state"]));
-
-    // And it comes to REST. `cancelling` is transient by construction — the supervisor stamps
-    // a deadline so it cannot be a place a run stops.
-    //
-    // Which terminal it reaches is NOT deterministic here, and pretending otherwise would make
-    // this test lie. Cancelling a non-cooperative backend is best-effort: an ollama turn is one
-    // long HTTP call with no Action boundary, so `signal_cancel` finds nothing listening. Either
-    // the supervisor's deadline sweeps it to `cancelled`, or the model returns first and the run
-    // completes normally. Both are correct behaviour; asserting only the first produced a test
-    // that passed on a slow model and failed on a fast one.
-    //
-    // What must ALWAYS hold is that the run stops being in flight and the lens is told.
-    const terminals = ["cancelled", "completed", "failed", "stalled"];
-    let final: Record<string, unknown> = during;
-    for (let attempt = 0; attempt < 90; attempt += 1) {
-      final = await readSnapshot();
-      if (terminals.includes(String(final["state"]))) break;
+    let run: Record<string, unknown> = {};
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      run = await readRun();
+      if (String(run["state"]) === "cancelled") break;
       await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
     }
-    expect(terminals).toContain(String(final["state"]));
+    // Strict: the intended attempt stopped, and it stopped BECAUSE it was cancelled.
+    expect(String(run["state"])).toEqual("cancelled");
+    expect(String((run["attempt"] as Record<string, unknown>)?.["attempt_id"])).toEqual(
+      held.attempt_id,
+    );
 
-    // The turn must END, and the lens must be told. Before this, a cancelled ollama-backed run
-    // terminated through `run.stalled` with no `provider.stopped`, which the projector ignored
-    // — so the composer showed a turn that started and never finished.
+    // And the lens is told the turn ended — the projection gap that made a cancelled turn spin
+    // in the composer forever.
     const completed = await waitForEvent(seen, (event) => event["type"] === "turn.completed");
     const payload = completed["payload"] as Record<string, unknown>;
-    // If the supervisor swept it, the lens must say cancelled — that mapping is the bug this
-    // fixed, and it is pinned deterministically in AtlasConsole.test.ts rather than left to a
-    // race. If the model beat the cancel, a completed turn is the honest answer.
-    if (String(final["state"]) === "cancelled") {
-      expect(["cancelled", "interrupted"]).toContain(String(payload["state"]));
-    }
+    expect(["cancelled", "interrupted"]).toContain(String(payload["state"]));
 
     await Effect.runPromise(adapter.stopSession(threadId));
     await Effect.runPromise(Fiber.interrupt(fiber));
