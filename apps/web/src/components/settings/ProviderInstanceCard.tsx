@@ -39,6 +39,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { DriverOption } from "./providerDriverMeta";
+import {
+  isDeclaredCredentialName,
+  missingDeclaredCredentials,
+  resolveEnvironmentRowSensitive,
+  type ProviderCredentialDeclaration,
+} from "./ProviderInstanceCard.logic";
 import { ProviderSettingsForm } from "./ProviderSettingsForm";
 import { ProviderModelsSection } from "./ProviderModelsSection";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
@@ -157,6 +163,13 @@ function ProviderAuthEmail(props: {
 function ProviderEnvironmentSection(props: {
   readonly environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>;
   readonly onChange: (environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>) => void;
+  /**
+   * Credentials this driver declares (see `ProviderClientDefinition.credentials`).
+   * Drives the "add this for me" seeding action and the forced, disabled
+   * sensitive toggle below — undefined/empty for drivers that declare none,
+   * which leaves every row exactly as generic as it was before this existed.
+   */
+  readonly credentials?: ReadonlyArray<ProviderCredentialDeclaration> | undefined;
 }) {
   const [rows, setRows] = useState<ReadonlyArray<EnvironmentDraftRow>>(() =>
     props.environment.map(makeEnvironmentDraftRow),
@@ -178,9 +191,36 @@ function ProviderEnvironmentSection(props: {
         continue;
       }
       const { id: _id, ...rest } = row;
-      published.push({ ...rest, name });
+      // A declared credential (e.g. Atlas's `ATLAS_ACCESS_TOKEN`) is always
+      // saved sensitive, regardless of what the row's own toggle says: the
+      // driver that reads it refuses a matching non-sensitive entry outright,
+      // so publishing anything else would silently produce a dead credential.
+      published.push({
+        ...rest,
+        name,
+        sensitive: resolveEnvironmentRowSensitive(props.credentials, name, rest.sensitive),
+      });
     }
     props.onChange(published);
+  };
+
+  const missingCredentials = missingDeclaredCredentials(
+    props.credentials,
+    rows.map((row) => row.name),
+  );
+
+  const seedCredentialRow = (credential: ProviderCredentialDeclaration) => {
+    const nextRows = [
+      ...rows,
+      {
+        id: nextEnvironmentVariableDraftId(),
+        name: credential.name,
+        value: "",
+        sensitive: true,
+      },
+    ];
+    setRows(nextRows);
+    publishRows(nextRows);
   };
 
   const updateVariable = (id: string, patch: Partial<Omit<EnvironmentDraftRow, "id">>) => {
@@ -228,6 +268,29 @@ function ProviderEnvironmentSection(props: {
           Add
         </Button>
       </div>
+      {missingCredentials.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {missingCredentials.map((credential) => (
+            <Tooltip key={credential.name}>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 gap-1.5 px-2 text-xs"
+                    onClick={() => seedCredentialRow(credential)}
+                  >
+                    <PlusIcon className="size-3" />
+                    Add {credential.label}
+                  </Button>
+                }
+              />
+              <TooltipPopup side="top">{credential.description}</TooltipPopup>
+            </Tooltip>
+          ))}
+        </div>
+      ) : null}
       {rows.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           Add variables to pass API keys, base URLs, or other per-instance CLI settings.
@@ -277,19 +340,38 @@ function ProviderEnvironmentSection(props: {
                   </TableCell>
                   <TableCell className="w-20">
                     <div className="flex h-8 items-center justify-center">
-                      <Checkbox
-                        checked={variable.sensitive}
-                        onCheckedChange={(checked) => {
-                          const sensitive = Boolean(checked);
-                          updateVariable(variable.id, {
-                            sensitive,
-                            ...(sensitive && variable.valueRedacted === undefined
-                              ? {}
-                              : { valueRedacted: sensitive ? variable.valueRedacted : false }),
-                          });
-                        }}
-                        aria-label={`Mark environment variable ${variable.name || index + 1} as sensitive`}
-                      />
+                      {isDeclaredCredentialName(props.credentials, variable.name) ? (
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <span className="inline-flex">
+                                <Checkbox
+                                  checked
+                                  disabled
+                                  aria-label={`Environment variable ${variable.name || index + 1} is always sensitive`}
+                                />
+                              </span>
+                            }
+                          />
+                          <TooltipPopup side="top">
+                            Always sensitive - the driver refuses this credential otherwise.
+                          </TooltipPopup>
+                        </Tooltip>
+                      ) : (
+                        <Checkbox
+                          checked={variable.sensitive}
+                          onCheckedChange={(checked) => {
+                            const sensitive = Boolean(checked);
+                            updateVariable(variable.id, {
+                              sensitive,
+                              ...(sensitive && variable.valueRedacted === undefined
+                                ? {}
+                                : { valueRedacted: sensitive ? variable.valueRedacted : false }),
+                            });
+                          }}
+                          aria-label={`Mark environment variable ${variable.name || index + 1} as sensitive`}
+                        />
+                      )}
                     </div>
                   </TableCell>
                   <TableCell className="w-12">
@@ -759,6 +841,7 @@ export function ProviderInstanceCard({
               <ProviderEnvironmentSection
                 environment={instance.environment ?? []}
                 onChange={updateEnvironment}
+                credentials={driverOption?.credentials}
               />
             </div>
 

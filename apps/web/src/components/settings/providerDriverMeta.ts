@@ -1,4 +1,5 @@
 import {
+  ATLAS_ACCESS_TOKEN_ENV,
   AtlasSettings,
   ClaudeSettings,
   CodexSettings,
@@ -32,6 +33,22 @@ export interface ProviderClientDefinition {
    * built-in default or custom — advertises the same marker.
    */
   readonly badgeLabel?: string;
+  /**
+   * Instance-environment variables this driver reads a credential from,
+   * declared once here and rendered generically by the environment editor
+   * (a labelled one-click "add this variable" action, plus a forced,
+   * disabled sensitive toggle for a row with a matching name). Every entry
+   * here MUST be presented as sensitive-only: the server-side driver that
+   * reads it refuses to send a matching entry that isn't marked sensitive
+   * (see e.g. `AtlasDriver.readAtlasCredential`'s `refused-insecure`
+   * result), so a free sensitive toggle on a declared credential row is a
+   * silent footgun, not a real choice.
+   */
+  readonly credentials?: readonly {
+    readonly name: string;
+    readonly label: string;
+    readonly description: string;
+  }[];
 }
 
 export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
@@ -90,6 +107,16 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     // secret-store backed. Putting it in this form would have shipped the credential in
     // settings JSON and in every client snapshot.
     settingsSchema: AtlasSettings,
+    credentials: [
+      {
+        name: ATLAS_ACCESS_TOKEN_ENV,
+        label: "Access token",
+        description:
+          "Bearer token this instance authenticates to the Atlas node with. Must be " +
+          "sensitive: the driver refuses to send a matching, non-sensitive entry rather " +
+          "than risk it round-tripping through settings in clear text.",
+      },
+    ],
   },
   // Cursor and Grok were removed from this build (#150). Their entries stayed
   // here after the drivers were deleted, so Add Provider still offered Grok
