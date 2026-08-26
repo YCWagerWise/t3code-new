@@ -491,10 +491,12 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
       return ((await response.json()) as { run?: Record<string, unknown> }).run ?? {};
     };
 
-    // Deliberately WELL under CANCEL_TIMEOUT_MS (30s). If the cancel had merely been accepted
+    // Deliberately far under CANCEL_TIMEOUT_MS (30s). If the cancel had merely been accepted
     // and left to the supervisor's deadline to sweep, this window would expire and the test
     // would fail — which is the difference between proving actuation and proving bookkeeping.
-    const deadline = Date.now() + 15_000;
+    // Measured against this fixture, actuation lands in ~90ms even when the cancel is issued
+    // with no delay at all, so 5s is generous without being able to hide a sweep.
+    const deadline = Date.now() + 5_000;
     let run: Record<string, unknown> = {};
     while (Date.now() < deadline) {
       run = await readRun();
