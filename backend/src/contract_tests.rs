@@ -3044,6 +3044,50 @@ async fn unreadable_kv_fails_settings_and_keybinding_reads() {
     );
 }
 
+#[tokio::test]
+async fn corrupt_provider_settings_fail_closed_instead_of_restoring_defaults() {
+    let (state, _dir) = test_state().await;
+    state.rt.store().put_kv("server_settings:provider_instances", "not json").await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "server.getSettings", json!({})).await;
+    let settings = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("settings exits");
+    assert_eq!(
+        settings["exit"]["_tag"], "Failure",
+        "corrupt provider settings must not be reported as default settings: {settings}"
+    );
+    assert!(
+        settings.to_string().contains("server_settings:provider_instances"),
+        "failure should name the corrupt durable provider settings key: {settings}"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "server.getConfig", json!({})).await;
+    let config = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("config exits");
+    assert_eq!(
+        config["exit"]["_tag"], "Failure",
+        "config/catalog reads must not acknowledge usable providers over corrupt provider settings: {config}"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_other_settings_fail_closed_instead_of_acknowledging_a_usable_settings_page() {
+    let (state, _dir) = test_state().await;
+    state.rt.store().put_kv("server_settings:other", "{\"newWorktreesStartFromOrigin\":").await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "server.getSettings", json!({})).await;
+    let settings = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("settings exits");
+    assert_eq!(
+        settings["exit"]["_tag"], "Failure",
+        "corrupt non-provider settings must not be treated as an empty settings patch: {settings}"
+    );
+    assert!(
+        settings.to_string().contains("server_settings:other"),
+        "failure should name the corrupt durable non-provider settings key: {settings}"
+    );
+}
+
 /// The client pings this on a timer; failing it made every connected client
 /// log an error every few seconds. It is an ACK, not an unsupported method.
 #[tokio::test]

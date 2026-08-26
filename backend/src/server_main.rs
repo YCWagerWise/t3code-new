@@ -2194,12 +2194,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "server.getConfig" => {
             // Read the stored rules BEFORE taking the catalog lock: the config
             // body needs both, and holding the lock across an await would let a
-            // concurrent settings write stall every boot handshake.
+            // concurrent settings write stall every boot handshake. Provider
+            // settings are durable routing authority too: a corrupt row must
+            // fail the boot/config handshake instead of serving the stale boot
+            // catalog as if all default providers were still authorized.
             let custom = match keybindings::load_custom(state.rt.store()).await {
                 Ok(custom) => custom,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
-            let cat = state.catalog.read().await;
+            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
+                Ok(instances) => instances,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let mut cat = state.catalog.write().await;
+            settings::reconcile(&mut cat, &instances);
             exit_success(tx, &id, server_config(&cat, &custom));
         }
 
