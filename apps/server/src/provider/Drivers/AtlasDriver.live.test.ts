@@ -20,7 +20,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
+import { ATLAS_ACCESS_TOKEN_ENV, ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
 
 import { makeAtlasDriver, probeAtlasHost } from "./AtlasDriver.ts";
 import {
@@ -59,7 +59,13 @@ const instance = (config: Record<string, unknown>) =>
         instanceId: "atlas-live" as never,
         displayName: "Atlas",
         enabled: true,
-        config: { baseUrl: BASE_URL, accessToken: TOKEN, ...config } as never,
+        config: { baseUrl: BASE_URL, ...config } as never,
+        // The driver takes its credential from the instance ENVIRONMENT, never from config —
+        // a token in config is silently ignored, so a live test that puts it there proves
+        // nothing about the path a real user takes and every command comes back 401.
+        environment: [
+          { name: ATLAS_ACCESS_TOKEN_ENV, value: String(TOKEN), sensitive: true },
+        ] as never,
       } as never)
       .pipe(
         // The driver now REQUIRES the session directory — that requirement is what makes the
