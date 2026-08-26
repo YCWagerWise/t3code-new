@@ -1774,37 +1774,19 @@ async fn stop_thread_checked(
     thread_id: &str,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    // A stop has TWO legs — hearth's foreground interrupt and the SDK's durable
-    // cancel — and they fail independently. Short-circuiting on the first one
-    // let a dead PTY mask an unwritten durable cancel: the user saw "stop
-    // failed" for the shell while the turn kept running with nothing recorded.
-    // So attempt both, and report every leg that failed.
-    let shell = terminal::interrupt(&state.terminal)
-        .await
-        .map_err(|e| format!("terminal interrupt failed: {e}"));
-    let runtime = if kind == "thread.session.stop" {
+    // Durable runtime cancellation is the authority for Stop. Hearth foreground
+    // interruption is allowed only after the SDK recorded the cancel, so a local
+    // PTY side effect cannot race ahead of durable turn state (#267).
+    let sessions = if kind == "thread.session.stop" {
         state.rt.stop(thread_id).await
     } else {
         state.rt.interrupt(thread_id).await
     }
     .map_err(|e| format!("runtime cancel failed: {e}"));
 
-    let (shell_out, sessions) = match (shell, runtime) {
-        (Ok(out), Ok(sessions)) => (out, sessions),
-        (shell, runtime) => {
-            let mut legs = Vec::new();
-            if let Err(e) = shell {
-                legs.push(e);
-            }
-            if let Err(e) = runtime {
-                legs.push(e);
-            }
-            return Err(legs.join("; "));
-        }
-    };
-    if shell_out.starts_with("ERROR:") {
-        return Err(format!("terminal interrupt failed: {shell_out}"));
-    }
+    interrupt_foreground_terminal(&state.terminal)
+        .await
+        .map_err(|e| format!("terminal interrupt failed: {e}"))?;
     Ok(sessions)
 }
 
@@ -4422,15 +4404,6 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             return;
                         }
                     };
-                    let shell_out = match interrupt_foreground_terminal(&state.terminal).await {
-                        Ok(out) => out,
-                        Err(e) => {
-                            tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
-                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
-                            return;
-                        }
-                    };
-                    tracing::info!(%thread_id, %kind, %shell_out, "stop dispatched");
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
                 // and doing nothing was the worst available behaviour — the UI
