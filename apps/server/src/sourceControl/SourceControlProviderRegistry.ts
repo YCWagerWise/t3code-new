@@ -8,7 +8,7 @@ import {
   SourceControlProviderError,
   type SourceControlProviderDiscoveryItem,
 } from "@t3tools/contracts";
-import type { SourceControlProviderKind } from "@t3tools/contracts";
+import type { SourceControlProviderKind, VcsError } from "@t3tools/contracts";
 import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/sourceControl";
 
 import * as AzureDevOpsSourceControlProvider from "./AzureDevOpsSourceControlProvider.ts";
@@ -17,8 +17,11 @@ import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "./GitLabSourceControlProvider.ts";
 import * as SourceControlProvider from "./SourceControlProvider.ts";
 import {
+  makeCliPresenceCache,
   probeSourceControlProvider,
   refineUnknownRemoteProvider,
+  type CliPresenceResult,
+  type SourceControlCliDiscoverySpec,
   type SourceControlProviderDiscoverySpec,
 } from "./SourceControlProviderDiscovery.ts";
 import { ServerConfig } from "../config.ts";
@@ -37,6 +40,39 @@ export interface SourceControlProviderRegistration {
 export interface SourceControlProviderHandle {
   readonly provider: SourceControlProvider.SourceControlProvider["Service"];
   readonly context: SourceControlProvider.SourceControlProviderContext | null;
+}
+
+/**
+ * Identifies a caller-supplied context for the refinement cache below. `refineUnknownRemoteProvider`
+ * only shells out when `context.provider.kind === "unknown"`, and its answer depends solely on
+ * `cwd` (where the CLI runs) and the remote it is asked to classify — not on anything else in the
+ * request — so those fields are exactly what the key needs to stay correct while still
+ * deduplicating repeat callers.
+ */
+function refinementCacheKey(input: {
+  readonly cwd: string;
+  readonly context: SourceControlProvider.SourceControlProviderContext;
+}): string {
+  const { provider, remoteName, remoteUrl } = input.context;
+  return [input.cwd, provider.kind, provider.name, provider.baseUrl, remoteName, remoteUrl].join(
+    "\0",
+  );
+}
+
+function parseRefinementCacheKey(key: string): {
+  readonly cwd: string;
+  readonly context: SourceControlProvider.SourceControlProviderContext;
+} {
+  const [cwd = "", kind = "unknown", name = "", baseUrl = "", remoteName = "", remoteUrl = ""] =
+    key.split("\0");
+  return {
+    cwd,
+    context: {
+      provider: { kind: kind as SourceControlProviderKind, name, baseUrl },
+      remoteName,
+      remoteUrl,
+    },
+  };
 }
 
 export class SourceControlProviderRegistry extends Context.Service<
@@ -204,6 +240,14 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       SourceControlProvider.SourceControlProvider["Service"]
     >(registrations.map((registration) => [registration.kind, registration.provider]));
     const discoverySpecs = registrations.map((registration) => registration.discovery);
+    // Shared by every `discover` call so that once this process has learned `az`/`glab`/whichever
+    // CLI is missing, it stops re-spawning that CLI on every command-palette open, settings visit,
+    // or publish-dialog mount. See makeCliPresenceCache's own comment for the TTL rationale.
+    const cliPresenceCache: Cache.Cache<string, CliPresenceResult, VcsError> =
+      yield* makeCliPresenceCache(
+        discoverySpecs.filter((spec): spec is SourceControlCliDiscoverySpec => spec.type === "cli"),
+        { process, cwd: config.cwd },
+      );
 
     const get: SourceControlProviderRegistry["Service"]["get"] = (kind) =>
       Effect.succeed(providers.get(kind) ?? unsupportedProvider(kind));
@@ -254,15 +298,36 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       timeToLive: (exit) => (Exit.isSuccess(exit) ? PROVIDER_DETECTION_CACHE_TTL : Duration.zero),
     });
 
+    // Mirrors providerContextCache above, but for callers (PullRequestService's per-repository
+    // unknown-remote refinement, in particular) that already know which remote they mean and pass
+    // it as `context`. Before this cache existed, that branch called refineUnknownRemoteProvider
+    // raw on every call, so every `pullRequestsList`/`listStats`/`detail` RPC re-shelled out to
+    // `glab auth status` for every project on an unrecognized host — uncached, unlike the
+    // auto-detect branch a few lines up. Same capacity and TTL as providerContextCache: the two
+    // caches answer the same question (which host owns this remote?) for the same class of
+    // "unknown" remotes, just keyed on what each caller already has in hand.
+    const providerRefinementCache = yield* Cache.makeWith<
+      string,
+      SourceControlProvider.SourceControlProviderContext | null,
+      SourceControlProviderError
+    >(
+      (key) => {
+        const { cwd, context } = parseRefinementCacheKey(key);
+        return refineUnknownRemoteProvider({ specs: discoverySpecs, process, cwd, context });
+      },
+      {
+        capacity: PROVIDER_DETECTION_CACHE_CAPACITY,
+        timeToLive: (exit) => (Exit.isSuccess(exit) ? PROVIDER_DETECTION_CACHE_TTL : Duration.zero),
+      },
+    );
+
     const resolveHandle: SourceControlProviderRegistry["Service"]["resolveHandle"] = (input) =>
       (input.context === undefined
         ? Cache.get(providerContextCache, input.cwd)
-        : refineUnknownRemoteProvider({
-            specs: discoverySpecs,
-            process,
-            cwd: input.cwd,
-            context: input.context,
-          })
+        : Cache.get(
+            providerRefinementCache,
+            refinementCacheKey({ cwd: input.cwd, context: input.context }),
+          )
       ).pipe(
         Effect.map((context) => {
           const kind = context?.provider.kind ?? "unknown";
@@ -284,6 +349,7 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
             spec,
             process,
             cwd: config.cwd,
+            presenceCache: cliPresenceCache,
           }),
         ),
         { concurrency: "unbounded" },

@@ -204,6 +204,31 @@ describe("VcsProcess.run", () => {
     }).pipe(provideLive),
   );
 
+  it.effect(
+    "reports a real absent command as a non-failing result when opted in, instead of failing",
+    () =>
+      Effect.gen(function* () {
+        // Same genuinely nonexistent binary as the default-behavior test above (proving that
+        // test still fails unchanged) — the only difference is `commandNotFoundBehavior`. This
+        // exercises the real spawner's ENOENT, not a scripted double, so a Failure here would be
+        // real evidence the classification did not happen before this span could close as one.
+        const result = yield* Effect.exit(
+          run({
+            operation: "test.command-not-found",
+            command: "definitely-not-a-t3code-executable",
+            args: [],
+            cwd: process.cwd(),
+            commandNotFoundBehavior: "result",
+          }),
+        );
+
+        expect(result._tag).toBe("Success");
+        if (result._tag === "Success") {
+          expect(result.value.commandNotFound).toBe(true);
+        }
+      }).pipe(provideLive),
+  );
+
   it.effect("preserves real boundary causes without manufacturing structural ones", () =>
     Effect.gen(function* () {
       const cause = new Error("secret stdin failure");

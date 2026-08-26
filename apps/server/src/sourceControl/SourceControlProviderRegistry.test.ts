@@ -235,6 +235,50 @@ it.effect("refines the caller-selected remote instead of choosing another config
   }),
 );
 
+it.effect(
+  "answers a repeated caller-supplied unknown-remote context from cache, not a fresh glab spawn",
+  () =>
+    Effect.gen(function* () {
+      let callCount = 0;
+      const registry = yield* makeRegistry({
+        remotes: [{ name: "origin", url: "git@github.com:fork/project.git" }],
+        process: {
+          run: () => {
+            callCount += 1;
+            return Effect.succeed(
+              processOutput(`self-hosted.example.test
+  ✓ Logged in to self-hosted.example.test as gitlab-user
+`),
+            );
+          },
+        },
+      });
+      const input = {
+        cwd: "/repo",
+        context: {
+          provider: {
+            kind: "unknown" as const,
+            name: "self-hosted.example.test",
+            baseUrl: "https://self-hosted.example.test",
+          },
+          remoteName: "upstream",
+          remoteUrl: "https://self-hosted.example.test/group/project.git",
+        },
+      };
+
+      const first = yield* registry.resolveHandle(input);
+      const second = yield* registry.resolveHandle(input);
+
+      assert.strictEqual(first.context?.provider.kind, "gitlab");
+      assert.strictEqual(second.context?.provider.kind, "gitlab");
+      // Before the refinement cache existed, this branch of `resolveHandle` called
+      // `refineUnknownRemoteProvider` raw on every call — this is the path PullRequestService's
+      // per-repository refinement always takes, so it re-spawned `glab auth status` on every
+      // `pullRequestsList`/`listStats`/`detail` RPC for every project on an unrecognized host.
+      assert.strictEqual(callCount, 1);
+    }),
+);
+
 it.effect("routes authenticated self-hosted GitLab remotes on non-standard ports", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({

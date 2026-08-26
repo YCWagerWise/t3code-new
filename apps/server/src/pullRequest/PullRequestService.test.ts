@@ -1,7 +1,9 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import type {
   OrchestrationProjectShell,
   ProjectId,
@@ -10,9 +12,16 @@ import type {
   SourceControlProviderKind,
 } from "@t3tools/contracts";
 
+import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as AzureDevOpsCli from "../sourceControl/AzureDevOpsCli.ts";
+import * as BitbucketApi from "../sourceControl/BitbucketApi.ts";
+import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import * as GitLabCli from "../sourceControl/GitLabCli.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as SourceControlRateLimit from "../sourceControl/SourceControlRateLimit.ts";
+import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   PullRequestProviderError,
   type ProviderChangeRequest,
@@ -278,6 +287,87 @@ it.effect("tries another checkout when provider refinement remains unknown", () 
 
     assert.deepStrictEqual(asked, ["/gone", "/healthy"]);
     assert.strictEqual(result.providers[0]?.kind, "gitlab");
+  }),
+);
+
+/**
+ * Regression coverage for the uncached `glab auth status` spawn: `refineUnknownProjectKinds`
+ * always called `resolveHandle({ cwd, context })` with an explicit context, and that branch used
+ * to call `refineUnknownRemoteProvider` raw — no cache — so every `list`/`listStats`/`detail` RPC
+ * re-shelled out to `glab` for every project on an unrecognized host. This wires the *real*
+ * `SourceControlProviderRegistry` (not the bare `resolveHandle` mock the other tests in this file
+ * use) behind a spawn-counting `VcsProcess` fake, so the assertion exercises the actual cache
+ * inside `SourceControlProviderRegistry.makeWithProviders`, not just how many times
+ * `PullRequestService` happens to call its dependency.
+ */
+it.effect("answers a second list call from cache instead of re-spawning glab", () =>
+  Effect.gen(function* () {
+    const glabInvocations: string[] = [];
+    const selfHosted = project({
+      id: "p1",
+      title: "self-hosted",
+      workspaceRoot: "/gitlab",
+      repository: "group/project",
+      provider: "unknown",
+      host: "code.example.test",
+    });
+
+    const processMock = {
+      run: (input: VcsProcess.VcsProcessInput) => {
+        if (input.command === "glab") {
+          glabInvocations.push(input.cwd);
+        }
+        return Effect.succeed({
+          exitCode: ChildProcessSpawner.ExitCode(0),
+          stdout: `code.example.test
+  ✓ Logged in to code.example.test as gitlab-user
+`,
+          stderr: "",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        } satisfies VcsProcess.VcsProcessOutput);
+      },
+    } satisfies Partial<VcsProcess.VcsProcess["Service"]>;
+
+    const realSourceControlProviderRegistryLayer = SourceControlProviderRegistry.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ServerConfig.layerTest(process.cwd(), {
+            prefix: "t3-pull-request-service-refinement-cache-",
+          }),
+          Layer.mock(AzureDevOpsCli.AzureDevOpsCli)({}),
+          Layer.mock(BitbucketApi.BitbucketApi)({}),
+          Layer.mock(GitHubCli.GitHubCli)({}),
+          Layer.mock(GitLabCli.GitLabCli)({}),
+          Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({}),
+          Layer.mock(VcsProcess.VcsProcess)(processMock),
+        ),
+      ),
+    );
+
+    const testLayer = Layer.mergeAll(
+      Layer.succeed(PullRequestProviderRegistry, fromProviders([fakeProvider("gitlab")])),
+      realSourceControlProviderRegistryLayer,
+      Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+        getShellSnapshot: () =>
+          Effect.succeed({
+            snapshotSequence: 1,
+            projects: [selfHosted],
+            threads: [],
+            updatedAt: "2026-07-01T00:00:00Z",
+          }),
+      }),
+      SourceControlRateLimit.layer,
+    ).pipe(Layer.provideMerge(NodeServices.layer));
+
+    const service = yield* PullRequestService.make.pipe(Effect.provide(testLayer));
+
+    const first = yield* service.list({ state: "open" });
+    const second = yield* service.list({ state: "open" });
+
+    assert.strictEqual(first.providers[0]?.kind, "gitlab");
+    assert.strictEqual(second.providers[0]?.kind, "gitlab");
+    assert.strictEqual(glabInvocations.length, 1);
   }),
 );
 

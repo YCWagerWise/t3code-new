@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -33,6 +34,17 @@ export interface ProcessRunInput {
    * Partial stdout/stderr are not preserved.
    */
   readonly timeoutBehavior?: "error" | "timedOutResult" | undefined;
+  /**
+   * When set to `"result"`, a command that could not be found (POSIX ENOENT at spawn time, or the
+   * Windows shell's "not recognized" exit) is reported as `{ commandNotFound: true }` instead of
+   * failing. Absence is classified at the exact point the spawn error is first known — inside this
+   * function, before the failure ever reaches an `Effect.fn` span boundary — so a probe for an
+   * optional CLI's presence never opens `processRunner.runProcessCore` as a Failure for the
+   * ordinary case of "not installed". Every other spawn fault (EACCES, ENOEXEC, timeout, ...)
+   * still fails exactly as it does when this option is left unset, because those are genuine
+   * operational errors, not an absence.
+   */
+  readonly commandNotFoundBehavior?: "result" | undefined;
 }
 
 export interface ProcessRunOutput {
@@ -44,6 +56,13 @@ export interface ProcessRunOutput {
   readonly stderrTruncated: boolean;
   readonly stdoutInvalidUtf8: boolean;
   readonly stderrInvalidUtf8: boolean;
+  /**
+   * True only when `commandNotFoundBehavior: "result"` was requested and the command could not be
+   * found. Every other field is a placeholder in that case: there was no process to read output
+   * or an exit code from. Optional, like the two fields above, so existing test doubles that
+   * predate this option do not need updating; treat a missing value as `false`.
+   */
+  readonly commandNotFound?: boolean;
 }
 
 const ProcessInvocationFields = {
@@ -172,6 +191,15 @@ export const isWindowsCommandNotFound = Effect.fn("processRunner.isWindowsComman
   },
 );
 
+/**
+ * POSIX absence: the spawner never found an executable to run at all. Every other spawn cause
+ * (EACCES, ENOEXEC, a bad cwd, ...) is a genuine operational fault, not an absence, and is left to
+ * fail normally.
+ */
+function isCommandNotFoundPlatformError(error: PlatformError.PlatformError): boolean {
+  return error.reason._tag === "NotFound";
+}
+
 const collectText = Effect.fn("processRunner.collectText")(function* (input: {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
@@ -273,6 +301,7 @@ function finalizeRunProcess<R>(
           stderrTruncated: false,
           stdoutInvalidUtf8: false,
           stderrInvalidUtf8: false,
+          commandNotFound: false,
         } satisfies ProcessRunOutput);
       }
       return Effect.fail(
@@ -302,8 +331,15 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
     input.env === undefined ? {} : { env: input.env, extendEnv },
   );
 
-  const child = yield* spawner
-    .spawn(
+  // Classified as a `Result` rather than piped straight through `Effect.mapError`: when the
+  // caller has opted into `commandNotFoundBehavior: "result"` and the raw cause is ENOENT, this
+  // function must return an ordinary (non-failing) value, not fail. Doing that conversion here —
+  // at the exact point the spawn error is first known, before it is ever wrapped as a
+  // `ProcessSpawnError` or allowed to fail this `Effect.fn` span — is what keeps an absent CLI
+  // from being recorded as a Failure trace. Every other spawn cause (EACCES, ENOEXEC, or anything
+  // that is not ENOENT) still fails exactly as it always has.
+  const spawnResult = yield* Effect.result(
+    spawner.spawn(
       ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         ...((input.spawnCwd ?? input.cwd) ? { cwd: input.spawnCwd ?? input.cwd } : {}),
         ...(input.env !== undefined
@@ -314,22 +350,37 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
           : {}),
         shell: spawnCommand.shell,
       }),
-    )
-    .pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProcessSpawnError({
-            command: input.command,
-            argumentCount: input.args.length,
-            cwd: input.cwd,
-            spawnCwd: input.spawnCwd,
-            resolvedCommand: spawnCommand.command,
-            resolvedArgumentCount: spawnCommand.args.length,
-            shell: spawnCommand.shell,
-            cause,
-          }),
-      ),
-    );
+    ),
+  );
+  if (Result.isFailure(spawnResult)) {
+    if (
+      input.commandNotFoundBehavior === "result" &&
+      isCommandNotFoundPlatformError(spawnResult.failure)
+    ) {
+      return {
+        stdout: "",
+        stderr: "",
+        code: null,
+        timedOut: false,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutInvalidUtf8: false,
+        stderrInvalidUtf8: false,
+        commandNotFound: true,
+      } satisfies ProcessRunOutput;
+    }
+    return yield* new ProcessSpawnError({
+      command: input.command,
+      argumentCount: input.args.length,
+      cwd: input.cwd,
+      spawnCwd: input.spawnCwd,
+      resolvedCommand: spawnCommand.command,
+      resolvedArgumentCount: spawnCommand.args.length,
+      shell: spawnCommand.shell,
+      cause: spawnResult.failure,
+    });
+  }
+  const child = spawnResult.success;
 
   const stdin = input.stdin;
   const writeStdin =
@@ -392,6 +443,27 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
     ),
   );
 
+  // Windows absence never fails to spawn: PATH resolution happens inside the shell, which starts
+  // fine and exits with a "not recognized" message instead. Same classification point as the
+  // POSIX ENOENT case above — checked before this function returns, so nothing downstream ever
+  // has to distinguish "genuinely ran and failed" from "was never there to run" after the fact.
+  if (
+    input.commandNotFoundBehavior === "result" &&
+    (yield* isWindowsCommandNotFound(Number(exitCode), stderr.text))
+  ) {
+    return {
+      stdout: "",
+      stderr: "",
+      code: null,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      stdoutInvalidUtf8: false,
+      stderrInvalidUtf8: false,
+      commandNotFound: true,
+    } satisfies ProcessRunOutput;
+  }
+
   return {
     stdout: stdout.text,
     stderr: stderr.text,
@@ -401,6 +473,7 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
     stderrTruncated: stderr.truncated,
     stdoutInvalidUtf8: stdout.invalidUtf8,
     stderrInvalidUtf8: stderr.invalidUtf8,
+    commandNotFound: false,
   } satisfies ProcessRunOutput;
 });
 

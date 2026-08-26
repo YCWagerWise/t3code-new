@@ -29,6 +29,15 @@ export interface VcsProcessInput {
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly appendTruncationMarker?: boolean;
+  /**
+   * When set to `"result"`, a command that could not be found (POSIX ENOENT, or the Windows
+   * shell's "not recognized" exit — see `ProcessRunInput.commandNotFoundBehavior`) comes back as
+   * `{ commandNotFound: true }` instead of failing `run`. Every other spawn fault — a timeout,
+   * EACCES, ENOEXEC, or any other reason the process could not run — still fails exactly as it
+   * does when this option is left unset. Only the caller asking "is this command here at all?"
+   * should opt in; a caller running a command it expects to exist wants the ordinary failure.
+   */
+  readonly commandNotFoundBehavior?: "result";
 }
 
 export interface VcsProcessOutput {
@@ -40,6 +49,11 @@ export interface VcsProcessOutput {
   /** Present on real process output; optional so narrow test doubles remain lightweight. */
   readonly stdoutInvalidUtf8?: boolean;
   readonly stderrInvalidUtf8?: boolean;
+  /**
+   * True only when `commandNotFoundBehavior: "result"` was requested and the command could not be
+   * found. `exitCode` is a placeholder in that case — there was no process to exit.
+   */
+  readonly commandNotFound?: boolean;
 }
 
 export class VcsProcess extends Context.Service<
@@ -123,6 +137,9 @@ export const make = Effect.gen(function* () {
         outputMode: "truncate",
         truncatedMarker: input.appendTruncationMarker ? OUTPUT_TRUNCATED_MARKER : "",
         timeoutBehavior: "error",
+        ...(input.commandNotFoundBehavior !== undefined
+          ? { commandNotFoundBehavior: input.commandNotFoundBehavior }
+          : {}),
       })
       .pipe(
         Effect.mapError(
@@ -154,6 +171,23 @@ export const make = Effect.gen(function* () {
         ),
       );
 
+    // Classified by `processRunner.run` itself, at the point the spawn error (or the Windows
+    // shell's "not recognized" exit) was first known — never as a failure of this `VcsProcess.run`
+    // span. `exitCode` is a placeholder here; nothing downstream reads it once `commandNotFound`
+    // is set.
+    if (result.commandNotFound) {
+      return {
+        exitCode: ChildProcessSpawner.ExitCode(-1),
+        stdout: "",
+        stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutInvalidUtf8: false,
+        stderrInvalidUtf8: false,
+        commandNotFound: true,
+      } satisfies VcsProcessOutput;
+    }
+
     if (result.code === null) {
       return yield* new VcsProcessMissingExitCodeError(baseError);
     }
@@ -178,6 +212,7 @@ export const make = Effect.gen(function* () {
       stderrTruncated: result.stderrTruncated,
       stdoutInvalidUtf8: result.stdoutInvalidUtf8 ?? false,
       stderrInvalidUtf8: result.stderrInvalidUtf8 ?? false,
+      commandNotFound: false,
     } satisfies VcsProcessOutput;
   });
 

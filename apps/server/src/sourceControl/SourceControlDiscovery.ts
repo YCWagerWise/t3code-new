@@ -3,6 +3,7 @@ import {
   type VcsDiscoveryItem,
   type VcsDriverKind,
 } from "@t3tools/contracts";
+import * as Cache from "effect/Cache";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -10,7 +11,7 @@ import * as Option from "effect/Option";
 
 import { ServerConfig } from "../config.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
-import { detailFromCause, firstNonEmptyLine } from "./SourceControlProviderDiscovery.ts";
+import { detailFromCause, makeCliPresenceCache } from "./SourceControlProviderDiscovery.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 
 interface DiscoveryProbe {
@@ -68,6 +69,14 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const process = yield* VcsProcess.VcsProcess;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
+  // Shared across every `discover` call for the lifetime of this process: see
+  // SourceControlProviderDiscovery.makeCliPresenceCache for why "missing" gets a much longer TTL
+  // than "available". Without this, opening the command palette re-spawned `git --version` and
+  // `jj --version` on every open, forever.
+  const cliPresenceCache = yield* makeCliPresenceCache(
+    VCS_PROBES.map(({ executable, versionArgs }) => ({ executable, versionArgs })),
+    { process, cwd: config.cwd },
+  );
 
   const probe = <Kind extends VcsDriverKind>(
     input: DiscoveryProbe & { readonly kind: Kind },
@@ -87,33 +96,36 @@ export const make = Effect.gen(function* () {
       } satisfies DiscoveryProbeResult<Kind>);
     }
 
-    return process
-      .run({
-        operation: "source-control.discovery.probe",
-        command: executable,
-        args: versionArgs,
-        cwd: config.cwd,
-        timeoutMs: 5_000,
-        maxOutputBytes: 8_000,
-        appendTruncationMarker: true,
-      })
-      .pipe(
-        Effect.map(
-          (result) =>
-            ({
-              kind: input.kind,
-              label: input.label,
-              executable,
-              implemented: input.implemented,
-              status: "available" as const,
-              version: Option.orElse(firstNonEmptyLine(result.stdout), () =>
-                firstNonEmptyLine(result.stderr),
-              ),
-              installHint: input.installHint,
-              detail: Option.none<string>(),
-            }) satisfies DiscoveryProbeResult<Kind>,
-        ),
-        Effect.catch((cause) =>
+    return Cache.get(cliPresenceCache, executable).pipe(
+      Effect.map(
+        (presence): DiscoveryProbeResult<Kind> =>
+          presence.status === "available"
+            ? {
+                kind: input.kind,
+                label: input.label,
+                executable,
+                implemented: input.implemented,
+                status: "available",
+                version: presence.version,
+                installHint: input.installHint,
+                detail: Option.none<string>(),
+              }
+            : {
+                kind: input.kind,
+                label: input.label,
+                executable,
+                implemented: input.implemented,
+                status: "missing",
+                version: Option.none<string>(),
+                installHint: input.installHint,
+                detail: Option.some("Command not found on the server PATH."),
+              },
+      ),
+      // Reached only for a genuine operational error (timeout, EACCES, ...): the cache never
+      // holds one, so this is always this call's own failed attempt, whose Failure trace already
+      // stands. This only decides what the discovery panel shows for it.
+      Effect.catch(
+        (cause): Effect.Effect<DiscoveryProbeResult<Kind>> =>
           Effect.succeed({
             kind: input.kind,
             label: input.label,
@@ -123,9 +135,9 @@ export const make = Effect.gen(function* () {
             version: Option.none<string>(),
             installHint: input.installHint,
             detail: detailFromCause(cause),
-          } satisfies DiscoveryProbeResult<Kind>),
-        ),
-      );
+          }),
+      ),
+    );
   };
 
   return SourceControlDiscovery.of({

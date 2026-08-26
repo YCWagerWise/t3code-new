@@ -281,3 +281,77 @@ Logged in to gitlab.com as gitlab-user
     );
   }).pipe(Effect.provide(testLayer));
 });
+
+it.effect("does not re-spawn a known-missing CLI across repeated discover calls", () => {
+  // `git` is always installed for this test; everything else (`jj`, `gh`, `glab`, `az`) is not.
+  // Without the presence cache, a second `discover` would re-shell out to every one of those
+  // missing executables — this is exactly the "thousands of ENOENT trace failures" regression.
+  const callCountsByCommand = new Map<string, number>();
+  const processMock = {
+    run: (input: VcsProcess.VcsProcessInput) => {
+      callCountsByCommand.set(input.command, (callCountsByCommand.get(input.command) ?? 0) + 1);
+      if (input.command === "git" && input.args[0] === "--version") {
+        return Effect.succeed(processOutput("git version 2.51.0\n"));
+      }
+      // A version probe always asks with `commandNotFoundBehavior: "result"` (see
+      // SourceControlProviderDiscovery.probeCliPresenceUncached), so a real `VcsProcess.run`
+      // answers an absent command with this shape — a success, not a failure — and this double
+      // has to match that or it is testing a scenario `discover` can no longer produce.
+      if (input.commandNotFoundBehavior === "result") {
+        return Effect.succeed({
+          exitCode: ChildProcessSpawner.ExitCode(-1),
+          stdout: "",
+          stderr: "",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+          commandNotFound: true,
+        } satisfies VcsProcess.VcsProcessOutput);
+      }
+      return Effect.fail(
+        new VcsProcessSpawnError({
+          operation: input.operation,
+          command: input.command,
+          cwd: input.cwd,
+          cause: new Error(`${input.command} not found`),
+        }),
+      );
+    },
+  } satisfies Partial<VcsProcess.VcsProcess["Service"]>;
+  const testLayer = SourceControlDiscovery.layer.pipe(
+    Layer.provide(
+      ServerConfig.layerTest(process.cwd(), {
+        prefix: "t3-source-control-discovery-cache-",
+      }),
+    ),
+    Layer.provide(Layer.mock(VcsProcess.VcsProcess)(processMock)),
+    Layer.provide(
+      sourceControlProviderRegistryTestLayer({
+        process: processMock,
+        bitbucket: {
+          probeAuth: Effect.succeed({
+            status: "unauthenticated",
+            account: Option.none(),
+            host: Option.some("bitbucket.org"),
+            detail: Option.none(),
+          }),
+        },
+      }),
+    ),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+  return Effect.gen(function* () {
+    const discovery = yield* SourceControlDiscovery.SourceControlDiscovery;
+
+    yield* discovery.discover;
+    yield* discovery.discover;
+
+    // Every executable — available (`git`) and missing (`jj`, `gh`, `glab`, `az`) alike — is
+    // probed once by the first `discover` and answered from the cache by the second.
+    assert.strictEqual(callCountsByCommand.get("git"), 1);
+    assert.strictEqual(callCountsByCommand.get("jj"), 1);
+    assert.strictEqual(callCountsByCommand.get("gh"), 1);
+    assert.strictEqual(callCountsByCommand.get("glab"), 1);
+    assert.strictEqual(callCountsByCommand.get("az"), 1);
+  }).pipe(Effect.provide(testLayer));
+});
