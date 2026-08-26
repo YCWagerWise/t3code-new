@@ -55,6 +55,10 @@
       "types": "./src/state/assets.ts",
       "default": "./src/state/assets.ts"
     },
+    "./state/branchOwnership": {
+      "types": "./src/state/branchOwnership.ts",
+      "default": "./src/state/branchOwnership.ts"
+    },
     "./state/connections": {
       "types": "./src/state/connections.ts",
       "default": "./src/state/connections.ts"

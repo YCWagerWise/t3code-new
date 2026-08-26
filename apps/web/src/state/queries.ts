@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { foldOwnershipUnavailable } from "@t3tools/client-runtime/state/branchOwnership";
 import {
   type CheckpointDiffTarget,
   type ComposerPathSearchTarget,
@@ -183,6 +184,14 @@ export function usePaginatedBranches(target: VcsRefTarget) {
   }
   const first = values[0] ?? null;
   const last = values.at(-1) ?? null;
+  // #341: ownership is folded across ALL pages, not read off one of them. The
+  // pages share a single backend owner map, so a page that could not read it
+  // makes ownership unknown for the whole set; taking `first`'s or `last`'s
+  // value would let one successful page silently re-enable every affordance a
+  // failed page disabled. This used to be dropped here entirely — the backend
+  // set the flag and nothing downstream could ever see it.
+  const ownershipUnavailable = foldOwnershipUnavailable(values);
+  const refsError = values.find((value) => value.refsError !== undefined)?.refsError;
   const data: VcsListRefsResult | null =
     first === null || last === null
       ? null
@@ -192,6 +201,8 @@ export function usePaginatedBranches(target: VcsRefTarget) {
           hasPrimaryRemote: first.hasPrimaryRemote,
           nextCursor: last.nextCursor,
           totalCount: Math.max(...values.map((value) => value.totalCount)),
+          ...(ownershipUnavailable ? { ownershipUnavailable } : {}),
+          ...(refsError === undefined ? {} : { refsError }),
         };
   const failed = results.find((result) => result._tag === "Failure");
   const isFetchingNextPage = isPaginatedBranchesNextPagePending(results);
@@ -227,6 +238,11 @@ export function usePaginatedBranches(target: VcsRefTarget) {
   return {
     data,
     refs: data?.refs ?? EMPTY_REFS,
+    // Surfaced separately from `data` so a caller cannot forget to look: every
+    // consumer that offers a switch/delete affordance needs this, and reading
+    // it off an optional field on an optional object is how it got missed.
+    ownershipUnavailable,
+    refsError,
     error,
     isPending: results.some((result) => result.waiting),
     isFetchingNextPage,
