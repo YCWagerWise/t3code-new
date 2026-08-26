@@ -2807,12 +2807,17 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         // marker carries the SAME turn id the live session-set event
                         // used, so the running/stop affordance is fully restored (#92).
                         let active_turn = if live {
-                            state
-                                .rt
-                                .active_turn_id(thread_id)
-                                .await
-                                .map(Value::String)
-                                .unwrap_or(Value::Null)
+                            match state.rt.active_turn_id(thread_id).await {
+                                Ok(Some(turn_id)) => Value::String(turn_id),
+                                Ok(None) => Value::Null,
+                                Err(e) => {
+                                    tracing::error!(%e, %thread_id, "active turn marker unreadable");
+                                    snapshot_tail.close().await;
+                                    chunk(tx, &id, json!({ "kind": "error",
+                                        "error": { "message": format!("active turn marker unreadable: {e}") } }));
+                                    return;
+                                }
+                            }
                         } else {
                             Value::Null
                         };

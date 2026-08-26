@@ -7,7 +7,7 @@
 //! assertion below is about the CONTENT of the payload.
 
 use super::diagnostics;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 fn seed_claude(home: &std::path::Path, ts: &str, out: i64) {
     let file = home.join("projects/p/session.jsonl");
