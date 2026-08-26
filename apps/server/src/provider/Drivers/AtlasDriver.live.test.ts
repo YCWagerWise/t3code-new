@@ -221,7 +221,36 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     await Effect.runPromise(Fiber.interrupt(fiber2));
   });
 
-  it("cancels through the authority rather than locally", async () => {
+  it("cancels a real turn through the authority, and a repeated cancel commits once", async () => {
+    const created = await instance({});
+    const adapter = created.adapter;
+    const threadId = ThreadId.make(`live-cancel-real-${Date.now()}`);
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+    await Effect.runPromise(
+      adapter.sendTurn({
+        threadId,
+        input: "say ok",
+        modelSelection: { model: "ollama/nomic-embed-text:latest" },
+      } as never),
+    );
+
+    // The driver's own cancel, twice — as a lost response would produce.
+    await Effect.runPromise(adapter.interruptTurn(threadId));
+    await Effect.runPromise(adapter.interruptTurn(threadId));
+
+    const page = await readEvents(endpoint(), String(threadId), { epoch: 1, after: 0 });
+    const cancels = page.events.filter(
+      (event) =>
+        event.kind === "command.accepted" &&
+        (event.payload["command"] as Record<string, unknown> | undefined)?.["kind"] === "cancel",
+    );
+    // Atlas dedupes the second on its receipt table, so the repeat did not commit a second
+    // cancel — the identity is stable rather than clock-derived.
+    expect(cancels).toHaveLength(1);
+    await Effect.runPromise(adapter.stopSession(threadId));
+  });
+
+  it("reports the authority's refusal when there is nothing to cancel", async () => {
     const created = await instance({});
     const threadId = ThreadId.make(`live-cancel-${Date.now()}`);
     await Effect.runPromise(
