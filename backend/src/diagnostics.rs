@@ -21,6 +21,8 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// How many samples the ring buffer keeps. At the 2s cadence the UI polls on,
 /// this is ~30 minutes of history — enough for the "what spiked five minutes
@@ -44,6 +46,46 @@ pub struct Proc {
 pub struct Sample {
     pub at_ms: i64,
     pub procs: Vec<Proc>,
+}
+
+const PS_COMMAND: &str = "ps -Ao pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args=";
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+const PS_OUTPUT_MAX_BYTES: usize = 512 * 1024;
+
+#[async_trait::async_trait]
+pub trait ProcessSource: Send + Sync {
+    async fn ps_output(&self) -> Result<String, String>;
+}
+
+#[derive(Clone)]
+pub struct HearthProcessSource {
+    runner: Arc<hearth::Runner>,
+}
+
+impl HearthProcessSource {
+    pub fn new(runner: Arc<hearth::Runner>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessSource for HearthProcessSource {
+    async fn ps_output(&self) -> Result<String, String> {
+        let cap = PS_OUTPUT_MAX_BYTES + 1;
+        let command = format!("{PS_COMMAND} | head -c {cap}");
+        let out = self.runner.run_full(&command, Some(PS_TIMEOUT.as_secs())).await;
+        if out.interrupted {
+            return Err(format!("ps exceeded {}s budget", PS_TIMEOUT.as_secs()));
+        }
+        if out.exit_code != 0 {
+            return Err(format!("ps exited {}", out.exit_code));
+        }
+        let stdout = out.output.split_once('\n').map(|(_, tail)| tail).unwrap_or("").to_string();
+        if stdout.len() > PS_OUTPUT_MAX_BYTES {
+            return Err(format!("ps output exceeded {PS_OUTPUT_MAX_BYTES} byte diagnostics ceiling"));
+        }
+        Ok(stdout)
+    }
 }
 
 /// `ps` elapsed time — `[[dd-]hh:]mm:ss` — as seconds.
@@ -81,7 +123,7 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
     // tail of the numbers inside `command`. Fields are taken by whitespace RUN;
     // `command` is then the untouched remainder, so argv keeps its own spacing.
     let mut rest = line.trim_start();
-    let mut field = |rest: &mut &str| -> Option<String> {
+    let field = |rest: &mut &str| -> Option<String> {
         if rest.is_empty() {
             return None;
         }
@@ -115,20 +157,15 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
     })
 }
 
-/// Every process on the box, as `ps` sees it.
-pub async fn ps_all() -> Result<Vec<Proc>, String> {
-    let out = tokio::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args="])
-        .output()
+/// Every process on the box, as the supervised process source sees it.
+pub async fn ps_all_from(source: &dyn ProcessSource) -> Result<Vec<Proc>, String> {
+    let stdout = tokio::time::timeout(PS_TIMEOUT + Duration::from_millis(250), source.ps_output())
         .await
-        .map_err(|e| format!("ps failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("ps exited {}", out.status));
+        .map_err(|_| format!("ps source exceeded {}ms deadline", (PS_TIMEOUT + Duration::from_millis(250)).as_millis()))??;
+    if stdout.len() > PS_OUTPUT_MAX_BYTES {
+        return Err(format!("ps output exceeded {PS_OUTPUT_MAX_BYTES} byte diagnostics ceiling"));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect())
+    Ok(stdout.lines().filter_map(parse_ps_line).collect())
 }
 
 /// The server process and everything under it, with each row's depth from the
@@ -182,8 +219,8 @@ fn iso(ms: i64) -> String {
 }
 
 /// Take one sample of the server's process tree.
-pub async fn sample(root: i64) -> Result<Sample, String> {
-    let all = ps_all().await?;
+pub async fn sample_from(root: i64, source: &dyn ProcessSource) -> Result<Sample, String> {
+    let all = ps_all_from(source).await?;
     let at_ms = chrono::Utc::now().timestamp_millis();
     let procs = descendants(&all, root)
         .into_iter()
@@ -193,9 +230,9 @@ pub async fn sample(root: i64) -> Result<Sample, String> {
 }
 
 /// `ServerProcessDiagnosticsResult`.
-pub async fn process_diagnostics(root: i64) -> Value {
+pub async fn process_diagnostics_from(root: i64, source: &dyn ProcessSource) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let all = match ps_all_from(source).await {
         Ok(a) => a,
         // A failed read is reported AS a failed read. The alternative — an empty
         // process list — renders as "nothing is running", which is a lie the
@@ -485,6 +522,25 @@ pub fn trace_diagnostics(trace_path: &str) -> Value {
 mod tests {
     use super::*;
 
+    struct StaticSource(Result<String, String>);
+
+    #[async_trait::async_trait]
+    impl ProcessSource for StaticSource {
+        async fn ps_output(&self) -> Result<String, String> {
+            self.0.clone()
+        }
+    }
+
+    struct HangingSource;
+
+    #[async_trait::async_trait]
+    impl ProcessSource for HangingSource {
+        async fn ps_output(&self) -> Result<String, String> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
     #[test]
     fn etime_parses_every_ps_layout() {
         assert_eq!(parse_etime("05:10"), Some(310));
@@ -701,17 +757,35 @@ mod tests {
     async fn a_failed_scan_is_an_error_not_an_empty_list() {
         // pid 0 has no descendants to find; the shape still has to be complete
         // and decodable, with an explicit (not fabricated) error field.
-        let d = process_diagnostics(-1).await;
+        let d = process_diagnostics_from(-1, &StaticSource(Err("ps failed under test".into()))).await;
         assert!(d["serverPid"].as_i64().unwrap() >= 1, "PositiveInt: {d}");
         assert!(d["error"]["_id"] == "Option", "error is an Option: {d}");
+        assert_eq!(d["error"]["_tag"], "Some", "failed ps is explicit: {d}");
     }
 
-    /// The real tree of THIS test process must come back non-empty and
-    /// well-formed — the end-to-end proof that the ps walk works on this box.
+    #[tokio::test]
+    async fn hung_process_source_returns_a_deadline_error() {
+        let start = std::time::Instant::now();
+        let err = ps_all_from(&HangingSource).await.expect_err("hung source must fail");
+        assert!(err.contains("deadline"), "deadline error: {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(4), "deadline bounded the caller");
+    }
+
+    #[tokio::test]
+    async fn oversized_process_source_is_rejected_not_silently_truncated() {
+        let line = "  4321  1000  1000 Ss    0.1   2048 00:00:01 command\n";
+        let rows = line.repeat((PS_OUTPUT_MAX_BYTES / line.len()) + 2);
+        let err = ps_all_from(&StaticSource(Ok(rows))).await.expect_err("oversized ps output must fail");
+        assert!(err.contains("ceiling"), "ceiling error: {err}");
+    }
+
+    /// A well-formed snapshot comes back non-empty when the supervised source
+    /// reports the current process row.
     #[tokio::test]
     async fn process_diagnostics_reads_this_real_process() {
         let me = std::process::id() as i64;
-        let d = process_diagnostics(me).await;
+        let source = StaticSource(Ok(format!("{me} 1 {me} Ss 0.1 2048 00:00:01 t3code-test-process\n")));
+        let d = process_diagnostics_from(me, &source).await;
         assert_eq!(d["error"]["_tag"], "None", "live ps read failed: {d}");
         assert_eq!(d["serverPid"], me);
         let procs = d["processes"].as_array().expect("array");
@@ -765,9 +839,9 @@ fn empty_aggregate() -> Value {
 /// what the backend can observe (its own descendant tree). `power`,
 /// `attribution` and `health` are the contract's explicit unavailable states
 /// pending a per-source sampler.
-pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> Value {
+pub async fn resource_telemetry_snapshot_from(root: i64, sample_interval_ms: i64, source: &dyn ProcessSource) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let all = match ps_all_from(source).await {
         Ok(v) => v,
         Err(e) => {
             return json!({

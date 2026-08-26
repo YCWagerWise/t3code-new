@@ -451,6 +451,7 @@ async fn state_built(
         checkpoints: tools::checkpoint_pool(data.join("checkpoints")),
         checkpoints_dir: data.join("checkpoints"),
         diag_history: Arc::new(open_diag_history(&data).await),
+        diag_process_source: Arc::new(diagnostics::HearthProcessSource::new(runner.clone())),
         store: Arc::new(Mutex::new(Store::default())),
         _contract_test_fd_slot: Some(Arc::new(contract_test_fd_slot)),
         terminals: Arc::new(
@@ -8423,6 +8424,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         checkpoints: tools::checkpoint_pool(data.join("checkpoints")),
         checkpoints_dir: data.join("checkpoints"),
         diag_history: state_a.diag_history.clone(),
+        diag_process_source: Arc::new(diagnostics::HearthProcessSource::new(runner_b.clone())),
         store: Arc::new(Mutex::new(Store::default())),
         _contract_test_fd_slot: state_a._contract_test_fd_slot.clone(),
         terminals: state_a.terminals.clone(),

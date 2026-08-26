@@ -175,6 +175,9 @@ struct AppState {
     /// the store. A sample is still taken on each diagnostics read, so an idle
     /// server never forks `ps`.
     diag_history: Arc<agent_sdk_metrics::ResourceHistory>,
+    /// Supervised source for Diagnostics process snapshots. hearth owns the
+    /// process budget/interrupt path; the product only projects the rows.
+    diag_process_source: Arc<dyn diagnostics::ProcessSource>,
     /// The work roots this environment can hand an agent, and the one durable
     /// shell each gets. The turn path opens a worktree's shell here before the
     /// registry factory (which cannot await) looks it up.
@@ -435,6 +438,7 @@ async fn main() {
     let workspace_runner = tools::open_workspace_shell(&ws_root, agent_data.clone())
         .await
         .expect("open the workspace shell");
+    let diag_process_source = Arc::new(diagnostics::HearthProcessSource::new(workspace_runner.clone()));
     let checkpoints_dir = agent_data.join("checkpoints");
     // The SAME pool the boot workspace's coding tools use. Two `DbPool::new`
     // calls over one directory is two isolate caches over one set of files —
@@ -509,6 +513,7 @@ async fn main() {
         checkpoints,
         checkpoints_dir,
         diag_history: Arc::new(diag_history),
+        diag_process_source,
         store: Arc::new(Mutex::new(store)),
         #[cfg(test)]
         _contract_test_fd_slot: None,
@@ -2254,7 +2259,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         | "server.getProcessResourceHistory"
         | "server.getResourceTelemetryHistory" => {
             let me = std::process::id() as i64;
-            if let Ok(s) = diagnostics::sample(me).await {
+            if let Ok(s) = diagnostics::sample_from(me, state.diag_process_source.as_ref()).await {
                 // A sample that cannot be RECORDED is reported, not swallowed:
                 // the next read would otherwise show a gap the panel renders as
                 // "the sampler was not running", which is a different fact.
@@ -2263,7 +2268,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 }
             }
             if method == "server.getProcessDiagnostics" {
-                exit_success(tx, &id, diagnostics::process_diagnostics(me).await);
+                exit_success(
+                    tx,
+                    &id,
+                    diagnostics::process_diagnostics_from(me, state.diag_process_source.as_ref()).await,
+                );
             } else {
                 // Defaults match what the panel asks for when it sends nothing:
                 // a 5-minute window in 10s buckets.
@@ -2341,10 +2350,16 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // than as fabricated healthy zeros.
             let me = std::process::id() as i64;
             let sample_interval_ms: i64 = 2000;
-            let first = diagnostics::resource_telemetry_snapshot(me, sample_interval_ms).await;
+            let first = diagnostics::resource_telemetry_snapshot_from(
+                me,
+                sample_interval_ms,
+                state.diag_process_source.as_ref(),
+            )
+            .await;
             chunk(tx, &id, first);
             let tx_pump = tx.clone();
             let req_id = id.clone();
+            let source = state.diag_process_source.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
                     sample_interval_ms as u64,
@@ -2352,8 +2367,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 ticker.tick().await; // first tick fires immediately; we already sent the snapshot
                 loop {
                     ticker.tick().await;
-                    let snap =
-                        diagnostics::resource_telemetry_snapshot(me, sample_interval_ms).await;
+                    let snap = diagnostics::resource_telemetry_snapshot_from(
+                        me,
+                        sample_interval_ms,
+                        source.as_ref(),
+                    )
+                    .await;
                     let frame = json!({ "_tag": "Chunk", "clientId": 0, "requestId": req_id, "values": [snap] }).to_string();
                     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                     if tx_pump.send((frame, Some(done_tx))).is_err() {
