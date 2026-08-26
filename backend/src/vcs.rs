@@ -939,9 +939,21 @@ pub async fn run_stacked_action_streaming_with(
             { let (p, m): (Value, String) = (json!("commit"), e.to_string()); for f in failed(p.clone(), m.clone()) { sink(f); }
             return Ok(Some((p, m))); }
         }
-        // nothing staged is "skipped_no_changes", a real outcome the UI shows —
-        // not an error and not a fake commit.
-        let staged = repo.staged().await.ok().flatten();
+        // Nothing staged is "skipped_no_changes", a real outcome the UI shows —
+        // not an error and not a fake commit. But a staged read that FAILED is
+        // not that outcome (#147). `.ok().flatten()` mapped both onto `None`,
+        // so an unreadable index answered the user "there were no changes" in a
+        // schema-valid SUCCESS frame, about a workspace nobody had read. cairn
+        // is the workspace authority here, so its error IS the commit-phase
+        // result — this does not fall back to a second product-side git probe,
+        // which would just be a different unverified opinion.
+        let staged = match repo.staged().await {
+            Ok(staged) => staged,
+            Err(e) => {
+                { let (p, m): (Value, String) = (json!("commit"), format!("the staged changes could not be read, so it is unknown whether there was anything to commit: {e}")); for f in failed(p.clone(), m.clone()) { sink(f); }
+                return Ok(Some((p, m))); }
+            }
+        };
         if staged.is_none() {
             commit_step = json!({"status": "skipped_no_changes"});
         } else {
@@ -1505,6 +1517,99 @@ mod tests {
 
     /// #63: the progress stream speaks the FRONTEND contract — the client
     /// filters on actionId+cwd and errors out if no terminal event arrives.
+    /// #147: an unreadable staged query is a commit FAILURE, never
+    /// `skipped_no_changes`.
+    ///
+    /// The commit phase used to do `repo.staged().await.ok().flatten()`, folding
+    /// "cairn could not read the stage" into the same `None` as "there is
+    /// nothing staged". The user was then told, in a schema-valid SUCCESS
+    /// frame, that there were no changes to commit — about a workspace that had
+    /// never been successfully read. Their work is still there and the product
+    /// just said it was not.
+    ///
+    /// The fault is real repository corruption rather than a mock: HEAD's tree
+    /// object is deleted. `git add` does not need it and still succeeds, so this
+    /// reproduces the exact interleaving the bug lives in — a stage that WORKED
+    /// followed by a staged read that cannot answer.
+    async fn repo_whose_stage_reads_fail() -> std::path::PathBuf {
+        let dir = scratch_repo().await;
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        commit_all(&dir, "base").await;
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+
+        let out = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse: {}", String::from_utf8_lossy(&out.stderr));
+        let tree = String::from_utf8(out.stdout).unwrap();
+        let tree = tree.trim();
+        std::fs::remove_file(dir.join(format!(".git/objects/{}/{}", &tree[..2], &tree[2..])))
+            .expect("HEAD's tree object exists");
+        dir
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_stage_fails_the_commit_instead_of_reporting_no_changes() {
+        let dir = repo_whose_stage_reads_fail().await;
+        let cwd = dir.to_str().unwrap();
+
+        let frames = run_stacked_action(cwd, &json!({
+            "actionId": "s1", "cwd": cwd, "action": "commit", "commitMessage": "work",
+        }))
+        .await
+        .expect("the action still produces a frame sequence");
+
+        let last = frames.last().expect("a terminal frame");
+        assert_eq!(
+            last["kind"], "action_failed",
+            "an unreadable stage must be a terminal failure, not a success frame: {frames:?}"
+        );
+        assert_eq!(last["phase"], "commit", "the failing phase is named: {last}");
+        assert!(
+            last["message"].as_str().is_some_and(|m| m.contains("could not be read")),
+            "the message must say the stage could not be READ, not that nothing changed: {last}"
+        );
+        for f in &frames {
+            assert_ne!(
+                f["result"]["commit"]["status"], "skipped_no_changes",
+                "the exact lie #147 is about: {f}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same fault through the STREAMING entry point the server actually
+    /// calls — the collecting form drops the verdict, and the verdict is what
+    /// `server_main` turns into the process exit status.
+    #[tokio::test]
+    async fn an_unreadable_stage_fails_the_streaming_action_verdict_too() {
+        let dir = repo_whose_stage_reads_fail().await;
+        let cwd = dir.to_str().unwrap();
+
+        let mut frames: Vec<Value> = Vec::new();
+        let verdict = run_stacked_action_streaming(
+            cwd,
+            &json!({"actionId": "s2", "cwd": cwd, "action": "commit", "commitMessage": "work"}),
+            &mut |v| frames.push(v),
+            None,
+        )
+        .await
+        .expect("the streaming action returns a verdict, not a transport error");
+
+        let (phase, message) = verdict.expect(
+            "a failed commit phase must produce a VERDICT — without it server_main reports \
+             exit_success for an action that did not commit",
+        );
+        assert_eq!(phase, json!("commit"), "the verdict names the phase: {phase}");
+        assert!(
+            message.contains("could not be read"),
+            "the verdict carries the read failure: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_stacked_action_speaks_the_contract_progress_protocol() {
         let dir = scratch_repo().await;

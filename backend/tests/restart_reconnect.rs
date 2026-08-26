@@ -17,8 +17,8 @@
 
 use agent_sdk_core::{ActionDesc, Message, Model, ModelOutput, ModelResp, Registry, Usage};
 use agent_sdk_shell::{
-    AgentDefinition, BusProjector, Lifecycle, ModelRef, SessionBinding, Shell, ThreadRuntime,
-    TurnOutcome,
+    AgentDefinition, Lifecycle, ModelRef, SessionBinding, Shell, ThreadEventVocab, ThreadRuntime,
+    TurnOutcome, VocabProjector,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -89,19 +89,57 @@ fn binding(thread: &str) -> SessionBinding {
     }
 }
 
-/// The projector the product runs a turn through: lifecycle facts encoded as
-/// stream items and published to the durable bus.
-fn projector(rt: &ThreadRuntime) -> BusProjector {
-    BusProjector {
-        bus: rt.bus().clone(),
-        encode: Arc::new(|e: &Lifecycle| match e {
-            Lifecycle::Delta { text, .. } => vec![json!({"kind": "delta", "text": text})],
-            Lifecycle::MessageFinal { message_id, text, .. } => {
-                vec![json!({"kind": "final", "messageId": message_id, "text": text})]
+/// This suite's wire vocabulary — the ONE thing a product owns of the
+/// projection path (#324).
+///
+/// The durable sequence, the envelope and the record-then-publish ordering are
+/// the SDK's, in [`VocabProjector`], which is why this is a vocabulary and not
+/// a projector. `T3Vocab` itself lives in the `t3code-server` binary's
+/// `event_adapter` module and is not reachable from an integration test, so
+/// this stands in for it; what is under test here is the SDK path both of them
+/// run through, not the names.
+struct RestartVocab;
+
+impl ThreadEventVocab for RestartVocab {
+    fn project(&self, event: &Lifecycle, _now: &str) -> (String, Vec<(String, Value)>) {
+        let thread_id = match event {
+            Lifecycle::TurnStarted { thread_id, .. }
+            | Lifecycle::Delta { thread_id, .. }
+            | Lifecycle::MessageFinal { thread_id, .. }
+            | Lifecycle::ApprovalRequested { thread_id, .. }
+            | Lifecycle::UserInputRequested { thread_id, .. }
+            | Lifecycle::ApprovalResolved { thread_id, .. }
+            | Lifecycle::ApprovalFailed { thread_id, .. }
+            | Lifecycle::UserInputResolved { thread_id, .. }
+            | Lifecycle::UserInputFailed { thread_id, .. }
+            | Lifecycle::ToolStarted { thread_id, .. }
+            | Lifecycle::ToolCompleted { thread_id, .. }
+            | Lifecycle::ShellCommand { thread_id, .. }
+            | Lifecycle::TurnEnded { thread_id, .. } => thread_id.clone(),
+        };
+        let items = match event {
+            Lifecycle::Delta { text, .. } => {
+                vec![("delta".to_string(), json!({"kind": "delta", "text": text}))]
             }
-            _ => vec![json!({"kind": "lifecycle"})],
-        }),
+            Lifecycle::MessageFinal { message_id, text, .. } => vec![(
+                "final".to_string(),
+                json!({"kind": "final", "messageId": message_id, "text": text}),
+            )],
+            _ => vec![("lifecycle".to_string(), json!({"kind": "lifecycle"}))],
+        };
+        (thread_id, items)
     }
+}
+
+/// The projector the product runs a turn through.
+///
+/// This used to be a `BusProjector`, which published without recording and
+/// without allocating a sequence — so every lifecycle fact this suite produced
+/// was unreplayable, in the suite whose entire job is proving replay after
+/// reconnect. It passed because the turn tests assert on the transcript and the
+/// cursor and never asked whether a projected event could be replayed (#324).
+fn projector(rt: &ThreadRuntime) -> VocabProjector<RestartVocab> {
+    VocabProjector::new(rt.clone(), RestartVocab)
 }
 
 fn thread_row(id: &str) -> Value {
@@ -173,6 +211,86 @@ async fn a_restart_rehydrates_the_thread_list_history_and_session() {
 /// The reconnect contract itself. A client holds the sequence its last snapshot
 /// advertised; after the restart it must receive every event published while it
 /// was away, each numbered ABOVE that mark, and no event it already had.
+/// #324: a TURN's lifecycle events must be replayable after a reconnect.
+///
+/// This is the test the suite was missing, and its absence is why the suite
+/// passed while running every turn through a projector that could not record.
+/// The other tests here drive the durable path by hand through `emit()` — which
+/// does record-then-publish correctly — and assert on the transcript and the
+/// cursor. None of them ever asked whether an event the PROJECTOR produced
+/// could be replayed, so the one path the product actually runs turns through
+/// was the one path unexercised.
+///
+/// With the old `BusProjector` this cannot pass: it allocated no sequence and
+/// called no `record_event`, so there is nothing above the mark to come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turns_lifecycle_events_replay_after_a_reconnect() {
+    let env = Env::new("turn-replay");
+    let data = env.path();
+    let b = binding("thread-1");
+
+    let rt = boot(&data).await;
+    rt.save_thread(&thread_row("thread-1")).await.unwrap();
+
+    // The client's mark BEFORE the turn: everything the turn projects is owed
+    // to a client reconnecting from here.
+    let mark = rt.current_sequence().await.unwrap();
+
+    let out = rt
+        .run_turn_with_prompt_id(&b, definition(), "hello", Some("umsg-replay"), &projector(&rt))
+        .await;
+    assert!(
+        matches!(out, TurnOutcome::Completed { .. }),
+        "the turn must complete for its events to be worth replaying: {out:?}"
+    );
+
+    // THE POINT: reconnect below the turn and read the durable log. A projector
+    // that publishes without recording leaves this empty while live delivery
+    // looked perfect — which is precisely why it never reproduced.
+    let replayed = rt.events_after("thread-1", mark, 1000).await.unwrap();
+    assert!(
+        !replayed.is_empty(),
+        "the turn projected NOTHING replayable — a client reconnecting from \
+         sequence {mark} catches up over a hole it can never fill"
+    );
+
+    // Every replayed event carries a sequence above the mark, in order. Without
+    // a sequence there is no cursor and no replay, only live delivery.
+    let seqs: Vec<i64> = replayed
+        .iter()
+        .map(|e| {
+            agent_sdk_shell::event_sequence(e)
+                .or_else(|| agent_sdk_shell::event_sequence(&e["event"]))
+                .unwrap_or_else(|| panic!("a replayed event carries no sequence: {e}"))
+        })
+        .collect();
+    assert!(
+        seqs.iter().all(|s| *s > mark),
+        "replayed events must sit above the client's mark {mark}: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "replay must be strictly ordered: {seqs:?}"
+    );
+
+    // And the turn's own content is in there — not merely some event.
+    let text = serde_json::to_string(&replayed).unwrap();
+    assert!(
+        text.contains("delta") || text.contains("final"),
+        "the replay carries none of the turn's own lifecycle facts: {text}"
+    );
+
+    // Survives the restart too, which is this suite's whole subject.
+    drop(rt);
+    let rt = boot(&data).await;
+    let after_restart = rt.events_after("thread-1", mark, 1000).await.unwrap();
+    assert_eq!(
+        after_restart.len(),
+        replayed.len(),
+        "the turn's replayable events did not survive the restart"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnecting_client_resumes_above_its_snapshot_sequence() {
     let env = Env::new("resume");

@@ -1425,9 +1425,23 @@ fn terminal_meta_topic(thread_id: &str) -> String {
 /// `ThreadRuntime::topic_publish` on a product-named topic — the process-local
 /// `Vec<Sender>` used to leak a dead subscriber on every reconnect, and a
 /// second backend process attached to the same isolate never saw the frame.
-async fn broadcast_terminal_event(state: &AppState, event: Value) {
+/// FAIL CLOSED (#202). This used to log both publish failures and return `()`,
+/// and its callers — `terminal.clear`, `terminal.close`, the restart path —
+/// then answered `exit_success` on the wire. The pane really was cleared or
+/// closed, but no live or reconnecting subscriber ever received the frame, so
+/// every other client kept rendering a pane that is gone while the client that
+/// asked was told it worked. Publication is not telemetry about the operation;
+/// for a fan-out RPC it is half of the operation, so it belongs in the result.
+///
+/// BOTH publishes are attempted before returning, and both failures are
+/// reported. They are separate facts: the lifecycle event is what an attached
+/// pane redraws from, the metadata snapshot is what the pane LIST redraws from,
+/// and a caller told only about the first would repair the wrong thing.
+async fn broadcast_terminal_event(state: &AppState, event: Value) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
     if let Err(e) = state.rt.topic_publish(TERMINAL_EVENTS_TOPIC, &event).await {
         tracing::error!(%e, "terminal event publish failed");
+        failures.push(format!("terminal event was not published to subscribers: {e}"));
     }
 
     let thread = event
@@ -1456,6 +1470,12 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
     let topic = terminal_meta_topic(&thread);
     if let Err(e) = state.rt.topic_publish(&topic, &payload).await {
         tracing::error!(%e, %thread, "terminal metadata publish failed");
+        failures.push(format!("terminal metadata snapshot was not published: {e}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -3782,11 +3802,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             if restarting {
                 // the contract has a distinct `restarted` event; a pane that only
                 // saw a new snapshot could not tell a restart from a repaint.
-                broadcast_terminal_event(
+                if let Err(e) = broadcast_terminal_event(
                     &state,
                     json!({ "type": "restarted", "threadId": owner.thread_id(), "terminalId": term, "snapshot": snap }),
                 )
-                .await;
+                .await
+                {
+                    // The pane WAS restarted — say so, rather than reporting a
+                    // clean failure that reads as "nothing happened".
+                    return exit_failure(
+                        tx,
+                        &id,
+                        &format!("terminal.open: the pane was restarted, but {e}"),
+                    );
+                }
             }
             exit_success(tx, &id, snap);
         }
@@ -3853,12 +3882,21 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
             };
             terminal::clear(&runner).await;
-            broadcast_terminal_event(
+            if let Err(e) = broadcast_terminal_event(
                 &state,
                 json!({ "type": "output", "threadId": owner.thread_id(), "terminalId": term,
                         "data": terminal::repaint("") }),
             )
-            .await;
+            .await
+            {
+                // The pane WAS cleared. Acknowledging success here would tell
+                // this client the fan-out reached the others when it did not.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!("terminal.clear: the pane was cleared, but {e}"),
+                );
+            }
             exit_success(tx, &id, Value::Null);
         }
         "terminal.close" => {
@@ -3874,11 +3912,21 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(killed) => killed,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
             };
-            broadcast_terminal_event(
+            if let Err(e) = broadcast_terminal_event(
                 &state,
                 json!({ "type": "closed", "threadId": owner.thread_id(), "terminalId": term, "killedShell": killed }),
             )
-            .await;
+            .await
+            {
+                // The pane IS closed and is not coming back. Other clients still
+                // have it on screen, so this is the one case where a silent
+                // success is worst: nothing later will correct them.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!("terminal.close: the pane was closed, but {e}"),
+                );
+            }
             exit_success(tx, &id, Value::Null);
         }
         "terminal.attach" => {

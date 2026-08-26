@@ -471,6 +471,44 @@ where
     out
 }
 
+/// Like [`drain_until`], but the predicate judges the WHOLE accumulated set
+/// rather than one frame (#315).
+///
+/// `drain_until` stops at the first frame satisfying a per-frame predicate,
+/// which is sampling rather than draining whenever a test needs to have seen
+/// SEVERAL things. The subscribe-window guard needs exactly that: the frame
+/// carrying the last sequence AND the snapshot frame that advertises the
+/// watermark it is judged against. Those can legitimately arrive in either
+/// order, so stopping on the first one leaves the other out of the capture and
+/// the assertion is then computed against a set the test never finished
+/// collecting.
+///
+/// Returns `(frames, satisfied)` — `satisfied == false` means it drained to the
+/// deadline without the predicate ever holding, which is a DIFFERENT outcome
+/// from "collected everything and something was missing" and must not be
+/// reported as the same thing.
+async fn drain_until_all<F>(
+    rx: &mut mpsc::UnboundedReceiver<OutFrame>,
+    deadline: std::time::Duration,
+    pred: F,
+) -> (Vec<Value>, bool)
+where
+    F: Fn(&[Value]) -> bool,
+{
+    let start = std::time::Instant::now();
+    let mut out: Vec<Value> = vec![];
+    while start.elapsed() < deadline {
+        out.extend(drain(rx));
+        if pred(&out) {
+            return (out, true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    out.extend(drain(rx));
+    let satisfied = pred(&out);
+    (out, satisfied)
+}
+
 /// Write a user prompt the way `run_turn_with_prompt_id` does, for tests
 /// that exercise thread bootstrap without running a turn.
 async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: &str) {
@@ -1490,7 +1528,8 @@ async fn disconnected_subscribers_are_dropped_from_the_fan_out_lists() {
         &state,
         json!({ "type": "upsert", "threadId": "t-sub", "terminalId": "term-1" }),
     )
-    .await;
+    .await
+    .expect("the fan-out succeeds over a healthy broker (#202)");
 
     // No product-owned subscriber list to inspect; assert observable
     // behavior instead — the live sender is still open.
@@ -3282,6 +3321,90 @@ async fn drop_thread_session_table(dir: &std::path::Path) {
     let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
     let db = pool.object_db("threadruntime", "main").await.unwrap();
     db.execute("DROP TABLE thread_session", vec![]).await.unwrap();
+}
+
+/// Break the SDK pubsub broker inside the ThreadRuntime isolate, so every
+/// `topic_publish` fails while the rest of the backend keeps working. `subs` is
+/// the first table `Broker::publish` reads, so the publish cannot even
+/// determine its audience — the real "the fan-out did not happen" condition.
+async fn drop_broker_subs_table(dir: &std::path::Path) {
+    let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE subs", vec![]).await.unwrap();
+}
+
+/// #202: `terminal.clear` and `terminal.close` must not ack Success when the
+/// terminal event fan-out failed.
+///
+/// `broadcast_terminal_event` used to log both publish failures and return
+/// `()`, after which the handler sent `Exit(Success)`. The pane really was
+/// cleared or closed — but no live or reconnecting subscriber received the
+/// frame, so every OTHER client kept rendering a pane that is gone while the
+/// client that asked was told it worked. For close in particular nothing later
+/// corrects them: the pane is not coming back and there is no further event to
+/// miss.
+///
+/// The ack must therefore say both things — the local effect happened AND the
+/// fan-out did not — rather than picking the half that sounds better.
+#[tokio::test]
+async fn terminal_clear_and_close_fail_when_the_event_fanout_fails() {
+    let (state, dir) = test_state().await;
+    let open = json!({
+        "threadId": "t-fanout", "terminalId": "pane-1", "cwd": state.cwd, "cols": 80, "rows": 24,
+    });
+
+    // Precondition: with a healthy broker these RPCs really do succeed, so the
+    // failures below are caused by the fault and not by the fixture.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "terminal.open", open.clone()).await;
+    let f = drain(&mut rx);
+    assert_eq!(f[0]["exit"]["_tag"], "Success", "precondition: pane opens: {f:?}");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "terminal.clear", json!({"threadId": "t-fanout", "terminalId": "pane-1"}))
+        .await;
+    let f = drain(&mut rx);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "precondition: clear succeeds over a healthy broker: {f:?}"
+    );
+
+    drop_broker_subs_table(&dir).await;
+
+    for (method, effect) in [
+        ("terminal.clear", "the pane was cleared"),
+        ("terminal.close", "the pane was closed"),
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, json!({"threadId": "t-fanout", "terminalId": "pane-1"})).await;
+        let frames = drain(&mut rx);
+        let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+        assert_eq!(
+            exits.len(),
+            1,
+            "{method}: exactly one terminal frame: {frames:?}"
+        );
+        assert_eq!(
+            exits[0]["exit"]["_tag"], "Failure",
+            "{method}: a failed fan-out must not ack success — other clients still \
+             have this pane on screen: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(exit_is_success),
+            "{method}: sent a success ack as well as a failure: {frames:?}"
+        );
+        let defect = exit_defect(exits[0]);
+        assert!(
+            defect.contains(effect),
+            "{method}: the failure must admit the local effect ALREADY HAPPENED \
+             (expected {effect:?}), or the client will retry an irreversible \
+             operation: {defect}"
+        );
+        assert!(
+            defect.contains("not published"),
+            "{method}: the failure must name the fan-out as what went wrong: {defect}"
+        );
+    }
 }
 
 fn exit_is_success(frame: &Value) -> bool {
@@ -6838,17 +6961,60 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
-            carries(v, last)
-        })
-        .await;
-        // The mark the client was told it holds through. The resume path
-        // sends no snapshot, so it is the `afterSequence` the client asked
-        // from — 0 here, i.e. every event is owed.
-        let mark = seen
-            .iter()
-            .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
-            .unwrap_or(0);
+        // THE WATERMARK IS ADVERTISED ONLY BY THE SNAPSHOT PATH. The resume
+        // path replays from the `afterSequence` the client asked from (0 here),
+        // so its mark really is 0 and every event is owed.
+        let advertises_mark = label == "snapshot";
+        let snapshot_mark = |frames: &[Value]| -> Option<i64> {
+            frames
+                .iter()
+                .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
+        };
+
+        // DRAIN UNTIL EVERYTHING THIS ASSERTION READS HAS ARRIVED (#315).
+        // Stopping at the frame carrying `last` was sampling: in the snapshot
+        // iteration the snapshot frame can legitimately arrive AFTER some
+        // deltas, so a reordering ended the drain with the snapshot frame still
+        // in flight — and the mark it carries is what every sequence is judged
+        // against.
+        let (seen, satisfied) =
+            drain_until_all(&mut rx, std::time::Duration::from_secs(15), |frames| {
+                frames.iter().any(|v| carries(v, last))
+                    && (!advertises_mark || snapshot_mark(frames).is_some())
+            })
+            .await;
+
+        // THREE OUTCOMES, THREE SENTENCES. Collapsing them is the defect this
+        // rework is for: a missing snapshot frame used to default the mark to 0
+        // via `unwrap_or(0)`, after which every sequence was "above the mark"
+        // and the report read as total delivery loss of 120 deltas — an
+        // all-or-nothing `[1..120]` that never happened. A guard that
+        // misdescribes its own failure is worse than no guard, because it
+        // teaches everyone to read this suite's reds as noise.
+        if !satisfied {
+            let saw_last = seen.iter().any(|v| carries(v, last));
+            let saw_mark = snapshot_mark(&seen).is_some();
+            panic!(
+                "[{label}] drained to the 15s timeout without the capture completing \
+                 (saw sequence {last}: {saw_last}; saw the advertised snapshotSequence: \
+                 {saw_mark}; {} frame(s) captured). This is a TIMEOUT, not a report about \
+                 which events were delivered — do not read it as one.",
+                seen.len()
+            );
+        }
+
+        let mark = match snapshot_mark(&seen) {
+            Some(m) => m,
+            None if advertises_mark => panic!(
+                "[{label}] the snapshot path must advertise snapshotSequence, and no frame \
+                 carried one across {} captured frame(s). Defaulting this to 0 is what made \
+                 a missing snapshot frame impersonate {} lost deltas.",
+                seen.len(),
+                seqs.len()
+            ),
+            // resume: no snapshot is sent, and 0 is the real mark.
+            None => 0,
+        };
         let missing: Vec<i64> = seqs
             .iter()
             .copied()
