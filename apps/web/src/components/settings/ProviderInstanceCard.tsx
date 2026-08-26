@@ -41,6 +41,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { DriverOption } from "./providerDriverMeta";
 import {
   isDeclaredCredentialName,
+  isPreviouslyExposedCredentialRow,
   missingDeclaredCredentials,
   resolveEnvironmentRowSensitive,
   type ProviderCredentialDeclaration,
@@ -69,11 +70,24 @@ type EnvironmentDraftRow = {
   readonly value: string;
   readonly sensitive: boolean;
   readonly valueRedacted?: boolean;
+  /**
+   * Set once, at the moment this row entered local state: it is a declared
+   * credential that was persisted `sensitive: false`, so `value` already
+   * reached this browser unprotected (see `isPreviouslyExposedCredentialRow`
+   * in `ProviderInstanceCard.logic.ts`). Cleared the moment the user commits
+   * a replacement value — a value they just typed cannot itself be the
+   * historically-leaked one — mirroring how `valueRedacted` clears on edit.
+   * Never set from anywhere else: this is a fact about what shipped to the
+   * browser on load, not a live derivation, so it must survive edits to
+   * *other* rows and other fields on the card.
+   */
+  readonly wasStoredInsecure?: boolean;
 };
 
 function makeEnvironmentDraftRow(
   variable: ProviderInstanceEnvironmentVariable,
   index: number,
+  credentials: ReadonlyArray<ProviderCredentialDeclaration> | undefined,
 ): EnvironmentDraftRow {
   return {
     id: `${index}:${variable.name}`,
@@ -81,6 +95,9 @@ function makeEnvironmentDraftRow(
     value: variable.value,
     sensitive: variable.sensitive,
     ...(variable.valueRedacted !== undefined ? { valueRedacted: variable.valueRedacted } : {}),
+    ...(isPreviouslyExposedCredentialRow(credentials, variable.name, variable.sensitive)
+      ? { wasStoredInsecure: true }
+      : {}),
   };
 }
 
@@ -160,7 +177,7 @@ function ProviderAuthEmail(props: {
   );
 }
 
-function ProviderEnvironmentSection(props: {
+export function ProviderEnvironmentSection(props: {
   readonly environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>;
   readonly onChange: (environment: ReadonlyArray<ProviderInstanceEnvironmentVariable>) => void;
   /**
@@ -172,7 +189,9 @@ function ProviderEnvironmentSection(props: {
   readonly credentials?: ReadonlyArray<ProviderCredentialDeclaration> | undefined;
 }) {
   const [rows, setRows] = useState<ReadonlyArray<EnvironmentDraftRow>>(() =>
-    props.environment.map(makeEnvironmentDraftRow),
+    props.environment.map((variable, index) =>
+      makeEnvironmentDraftRow(variable, index, props.credentials),
+    ),
   );
 
   const publishRows = (nextRows: ReadonlyArray<EnvironmentDraftRow>) => {
@@ -190,11 +209,18 @@ function ProviderEnvironmentSection(props: {
         }
         continue;
       }
-      const { id: _id, ...rest } = row;
+      // `wasStoredInsecure` is a local-only draft flag (see `EnvironmentDraftRow`)
+      // with no place in `ProviderInstanceEnvironmentVariable` — drop it here so
+      // it never leaks into the payload sent to `onChange` / the server.
+      const { id: _id, wasStoredInsecure: _wasStoredInsecure, ...rest } = row;
       // A declared credential (e.g. Atlas's `ATLAS_ACCESS_TOKEN`) is always
       // saved sensitive, regardless of what the row's own toggle says: the
       // driver that reads it refuses a matching non-sensitive entry outright,
       // so publishing anything else would silently produce a dead credential.
+      // This is a strictly forward-safe correction — it stops *future*
+      // exposure of whatever value ends up in this row — and is NOT a claim
+      // that a value already rendered to this browser was never exposed.
+      // That honesty lives in the render below (`wasStoredInsecure`), not here.
       published.push({
         ...rest,
         name,
@@ -229,7 +255,12 @@ function ProviderEnvironmentSection(props: {
         ? {
             ...row,
             ...patch,
-            ...(patch.value !== undefined ? { valueRedacted: false } : {}),
+            // A freshly-typed value can't be the historically-leaked one —
+            // clear the exposure flag the same moment a stored secret's
+            // redaction placeholder clears, for the same reason.
+            ...(patch.value !== undefined
+              ? { valueRedacted: false, wasStoredInsecure: false }
+              : {}),
           }
         : row,
     );
@@ -242,6 +273,12 @@ function ProviderEnvironmentSection(props: {
     setRows(nextRows);
     publishRows(nextRows);
   };
+
+  // Rows whose value already reached this browser unprotected (see
+  // `wasStoredInsecure`). Surfaced as a standing, always-visible notice —
+  // not only a hover tooltip — because a past secret leak isn't something a
+  // user should have to discover by hovering the right checkbox.
+  const exposedRows = rows.filter((row) => row.wasStoredInsecure === true);
 
   return (
     <div className="grid gap-2">
@@ -291,6 +328,18 @@ function ProviderEnvironmentSection(props: {
           ))}
         </div>
       ) : null}
+      {exposedRows.length > 0 ? (
+        <p
+          className="rounded-md border border-warning/40 bg-warning/10 px-2.5 py-2 text-xs text-warning"
+          role="alert"
+        >
+          {exposedRows.map((row) => row.name).join(", ")}{" "}
+          {exposedRows.length === 1 ? "was" : "were"} previously stored without the Sensitive flag
+          and {exposedRows.length === 1 ? "has" : "have"} already been sent to this browser
+          unprotected — treat the current value as compromised. Enter a new value below to rotate
+          it; marking the row sensitive alone does not undo the earlier exposure.
+        </p>
+      ) : null}
       {rows.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           Add variables to pass API keys, base URLs, or other per-instance CLI settings.
@@ -309,87 +358,104 @@ function ProviderEnvironmentSection(props: {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map((variable, index) => (
-                <TableRow
-                  key={variable.id}
-                  className="border-border/60 odd:bg-muted/20 even:bg-background/20"
-                >
-                  <TableCell>
-                    <DraftInput
-                      value={variable.name}
-                      onCommit={(name) => updateVariable(variable.id, { name: name.trim() })}
-                      placeholder="VARIABLE_NAME"
-                      spellCheck={false}
-                      aria-label={`Environment variable name ${index + 1}`}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <DraftInput
-                      value={variable.valueRedacted ? "" : variable.value}
-                      onCommit={(value) => updateVariable(variable.id, { value })}
-                      type={variable.sensitive ? "password" : undefined}
-                      autoComplete="off"
-                      placeholder={
-                        variable.valueRedacted
-                          ? "Stored secret - enter a new value to replace"
-                          : "Value"
-                      }
-                      spellCheck={false}
-                      aria-label={`Environment variable value ${index + 1}`}
-                    />
-                  </TableCell>
-                  <TableCell className="w-20">
-                    <div className="flex h-8 items-center justify-center">
-                      {isDeclaredCredentialName(props.credentials, variable.name) ? (
-                        <Tooltip>
-                          <TooltipTrigger
-                            render={
-                              <span className="inline-flex">
-                                <Checkbox
-                                  checked
-                                  disabled
-                                  aria-label={`Environment variable ${variable.name || index + 1} is always sensitive`}
-                                />
-                              </span>
-                            }
+              {rows.map((variable, index) => {
+                // Single source of truth for "is this row sensitive" —
+                // every consumer below (input type, checkbox, redaction)
+                // reads this, never `variable.sensitive` directly, so the
+                // checkbox and the value field can never again disagree.
+                const isCredential = isDeclaredCredentialName(props.credentials, variable.name);
+                const effectiveSensitive = resolveEnvironmentRowSensitive(
+                  props.credentials,
+                  variable.name,
+                  variable.sensitive,
+                );
+                const previouslyExposed = variable.wasStoredInsecure === true;
+                return (
+                  <TableRow
+                    key={variable.id}
+                    className="border-border/60 odd:bg-muted/20 even:bg-background/20"
+                  >
+                    <TableCell>
+                      <DraftInput
+                        value={variable.name}
+                        onCommit={(name) => updateVariable(variable.id, { name: name.trim() })}
+                        placeholder="VARIABLE_NAME"
+                        spellCheck={false}
+                        aria-label={`Environment variable name ${index + 1}`}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <DraftInput
+                        value={variable.valueRedacted || previouslyExposed ? "" : variable.value}
+                        onCommit={(value) => updateVariable(variable.id, { value })}
+                        type={effectiveSensitive ? "password" : undefined}
+                        autoComplete="off"
+                        placeholder={
+                          previouslyExposed
+                            ? "Previously exposed - enter a new value to rotate it"
+                            : variable.valueRedacted
+                              ? "Stored secret - enter a new value to replace"
+                              : "Value"
+                        }
+                        spellCheck={false}
+                        aria-label={`Environment variable value ${index + 1}`}
+                      />
+                    </TableCell>
+                    <TableCell className="w-20">
+                      <div className="flex h-8 items-center justify-center">
+                        {isCredential ? (
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <span className="inline-flex">
+                                  <Checkbox
+                                    checked={effectiveSensitive}
+                                    disabled
+                                    aria-label={`Environment variable ${variable.name || index + 1} is always sensitive`}
+                                  />
+                                </span>
+                              }
+                            />
+                            <TooltipPopup side="top">
+                              {previouslyExposed
+                                ? "Previously stored without protection and already sent to this browser unredacted - enter a new value to rotate it."
+                                : "Always sensitive - the driver refuses this credential otherwise."}
+                            </TooltipPopup>
+                          </Tooltip>
+                        ) : (
+                          <Checkbox
+                            checked={effectiveSensitive}
+                            onCheckedChange={(checked) => {
+                              const sensitive = Boolean(checked);
+                              updateVariable(variable.id, {
+                                sensitive,
+                                ...(sensitive && variable.valueRedacted === undefined
+                                  ? {}
+                                  : { valueRedacted: sensitive ? variable.valueRedacted : false }),
+                              });
+                            }}
+                            aria-label={`Mark environment variable ${variable.name || index + 1} as sensitive`}
                           />
-                          <TooltipPopup side="top">
-                            Always sensitive - the driver refuses this credential otherwise.
-                          </TooltipPopup>
-                        </Tooltip>
-                      ) : (
-                        <Checkbox
-                          checked={variable.sensitive}
-                          onCheckedChange={(checked) => {
-                            const sensitive = Boolean(checked);
-                            updateVariable(variable.id, {
-                              sensitive,
-                              ...(sensitive && variable.valueRedacted === undefined
-                                ? {}
-                                : { valueRedacted: sensitive ? variable.valueRedacted : false }),
-                            });
-                          }}
-                          aria-label={`Mark environment variable ${variable.name || index + 1} as sensitive`}
-                        />
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell className="w-12">
-                    <div className="flex justify-end">
-                      <Button
-                        type="button"
-                        size="icon-sm"
-                        variant="ghost"
-                        className="size-8 text-muted-foreground hover:text-destructive"
-                        onClick={() => removeVariable(variable.id)}
-                        aria-label={`Remove environment variable ${variable.name || index + 1}`}
-                      >
-                        <XIcon className="size-3.5" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className="w-12">
+                      <div className="flex justify-end">
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="ghost"
+                          className="size-8 text-muted-foreground hover:text-destructive"
+                          onClick={() => removeVariable(variable.id)}
+                          aria-label={`Remove environment variable ${variable.name || index + 1}`}
+                        >
+                          <XIcon className="size-3.5" />
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </div>

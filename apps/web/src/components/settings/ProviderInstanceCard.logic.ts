@@ -38,6 +38,24 @@ export function resolveEnvironmentRowSensitive(
 }
 
 /**
+ * True when a row is exactly the state this module exists to prevent: a
+ * declared credential persisted `sensitive: false`. Provider settings only
+ * redact SENSITIVE environment entries before returning them to a client
+ * (see `redactServerSettingsForClient`), so a matching non-sensitive row's
+ * `value` has already reached this browser in clear text — forcing
+ * `sensitive: true` on the next save stops further exposure but does not
+ * undo that. Callers use this to withhold the value from display and
+ * prompt for rotation instead of silently presenting it as already safe.
+ */
+export function isPreviouslyExposedCredentialRow(
+  credentials: ReadonlyArray<ProviderCredentialDeclaration> | undefined,
+  name: string,
+  sensitive: boolean,
+): boolean {
+  return isDeclaredCredentialName(credentials, name) && !sensitive;
+}
+
+/**
  * Declared credentials with no matching row yet (by exact, trimmed name),
  * in declaration order. Drives the "add this for me" affordance so a user
  * never has to type the exact environment variable name by hand.

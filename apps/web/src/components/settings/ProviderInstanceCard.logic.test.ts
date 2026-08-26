@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   isDeclaredCredentialName,
+  isPreviouslyExposedCredentialRow,
   missingDeclaredCredentials,
   resolveEnvironmentRowSensitive,
   type ProviderCredentialDeclaration,
@@ -51,6 +52,26 @@ describe("resolveEnvironmentRowSensitive", () => {
       false,
     );
     expect(resolveEnvironmentRowSensitive(FIXTURE_CREDENTIALS, "SOME_OTHER_VAR", true)).toBe(true);
+  });
+});
+
+describe("isPreviouslyExposedCredentialRow", () => {
+  it("flags a declared credential persisted non-sensitive as previously exposed", () => {
+    expect(
+      isPreviouslyExposedCredentialRow(FIXTURE_CREDENTIALS, "FIXTURE_BEARER_TOKEN", false),
+    ).toBe(true);
+  });
+
+  it("does not flag a declared credential that is already sensitive", () => {
+    expect(
+      isPreviouslyExposedCredentialRow(FIXTURE_CREDENTIALS, "FIXTURE_BEARER_TOKEN", true),
+    ).toBe(false);
+  });
+
+  it("does not flag a non-sensitive ordinary variable, which was never asserted safe", () => {
+    expect(isPreviouslyExposedCredentialRow(FIXTURE_CREDENTIALS, "SOME_OTHER_VAR", false)).toBe(
+      false,
+    );
   });
 });
 
