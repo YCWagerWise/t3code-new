@@ -628,25 +628,27 @@ export const AtlasSettings = makeProviderSettingsSchema(
         },
       }),
     ),
-    accessToken: TrimmedString.pipe(
-      Schema.withDecodingDefault(Effect.succeed("")),
-      Schema.annotateKey({
-        title: "Access token",
-        description:
-          "Machine token or user JWT for the node, sent as a Bearer header. A node that " +
-          "answers 401 is reachable but unauthorised — it reports unavailable rather than ready.",
-        providerSettingsForm: {
-          placeholder: "atlas fleet token",
-          clearWhenEmpty: "omit",
-        },
-      }),
-    ),
   },
   {
-    order: ["baseUrl", "accessToken"],
+    order: ["baseUrl"],
   },
 );
 export type AtlasSettings = typeof AtlasSettings.Type;
+
+/**
+ * The environment variable an Atlas instance reads its bearer credential from.
+ *
+ * Deliberately NOT a field on `AtlasSettings`. Provider config is opaque and is returned to
+ * every settings-reading client verbatim — `redactServerSettingsForClient` only blanks
+ * SENSITIVE entries of `providerInstances.<id>.environment`. A token in `config` would sit in
+ * the settings JSON and in every client snapshot in clear text, which is the existing
+ * OpenAI-compatible `apiKey` defect; copying it here would spread it.
+ *
+ * As a sensitive environment variable it is redacted on the way out and backed by
+ * `ServerSecretStore` through `provider-env-<instance>-<name>`, and the driver reads it from
+ * the environment the registry already hands to `create`.
+ */
+export const ATLAS_ACCESS_TOKEN_ENV = "ATLAS_ACCESS_TOKEN";
 
 export const ObservabilitySettings = Schema.Struct({
   otlpTracesUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),

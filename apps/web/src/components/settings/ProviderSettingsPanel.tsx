@@ -577,6 +577,35 @@ export function EnvironmentProviderSettings({
     }
   }
 
+  // Instances the SERVER reports that settings has never heard of.
+  //
+  // Everything above is built from persisted state: an explicit `providerInstances` entry or
+  // a legacy `settings.providers` mirror. A driver the runtime bootstraps for itself — one
+  // that spawns nothing and whose default config is already usable — has neither, so it was
+  // registered, probeable and completely invisible here, and the composer reported "No
+  // provider available" while the server held a live instance of it.
+  //
+  // These rows are read-only projections of runtime state until the user edits one; editing
+  // goes through `updateProviderInstance`, which writes a real `providerInstances` entry and
+  // from then on the row comes from the branches above. Nothing is persisted just by looking
+  // at the page.
+  const renderedInstanceIds = new Set(rows.map((row) => String(row.instanceId)));
+  for (const serverProvider of serverProviders) {
+    const id = String(serverProvider.instanceId);
+    if (renderedInstanceIds.has(id)) continue;
+    const driver = serverProvider.driver;
+    if (driver === undefined) continue;
+    rows.push({
+      instanceId: serverProvider.instanceId,
+      // Synthesized, not persisted: the envelope a write would start from.
+      instance: { driver, config: {} } as ProviderInstanceConfig,
+      driver,
+      isDefault:
+        defaultSlotIdsBySource.has(id) || id === String(defaultInstanceIdForDriver(driver)),
+    });
+    renderedInstanceIds.add(id);
+  }
+
   const updateProviderInstance = (
     row: InstanceRow,
     next: ProviderInstanceConfig,

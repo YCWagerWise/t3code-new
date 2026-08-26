@@ -6,6 +6,9 @@ import { ThreadId } from "@t3tools/contracts";
 
 import * as Scope from "effect/Scope";
 
+import { ATLAS_ACCESS_TOKEN_ENV } from "@t3tools/contracts";
+
+import { redactServerSettingsForClient } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
@@ -21,6 +24,7 @@ import {
   makeAtlasAdapter,
   makeAtlasDriver,
   probeAtlasHost,
+  readAtlasAccessTokenForTest,
 } from "./AtlasDriver.ts";
 
 /**
@@ -80,7 +84,10 @@ describe("probeAtlasHost", () => {
       expect(probe.installed).toBe(true);
       expect(probe.status).toBe("error");
       expect(probe.auth.status).toBe("unauthenticated");
-      expect(probe.message).toContain("accessToken");
+      // The remedy names the ENVIRONMENT variable, not a config field: the credential is a
+      // sensitive instance environment value so it is redacted on the way to clients, and
+      // telling a user to set a config key would point them at the leak this avoided.
+      expect(probe.message).toContain("ATLAS_ACCESS_TOKEN");
     }),
   );
 
@@ -1137,5 +1144,69 @@ describe("cursor persistence", () => {
 
     // A stale page must never rewind the cursor and re-show content the user has seen.
     expect(stored.every((entry) => entry.after >= 5)).toBe(true);
+  });
+});
+
+describe("the Atlas credential never reaches a client", () => {
+  /**
+   * The defect this design avoids.
+   *
+   * `redactServerSettingsForClient` blanks SENSITIVE entries of
+   * `providerInstances.<id>.environment` and returns `instance.config` verbatim. So a bearer
+   * token stored in provider config is written to settings JSON and broadcast to every
+   * settings-reading client in clear text — the existing OpenAI-compatible `apiKey` defect.
+   * Keeping Atlas auth in the environment is what makes redaction apply to it.
+   */
+  it("redacts the token when it is an environment value, and config carries none", () => {
+    const settings = {
+      providerInstances: {
+        atlas: {
+          driver: "atlas",
+          enabled: true,
+          config: { baseUrl: "http://127.0.0.1:3019" },
+          environment: [
+            { name: ATLAS_ACCESS_TOKEN_ENV, value: "super-secret-value", sensitive: true },
+            { name: "ATLAS_LABEL", value: "not-a-secret", sensitive: false },
+          ],
+        },
+      },
+    } as never;
+
+    const redacted = redactServerSettingsForClient(settings);
+    const wire = JSON.stringify(redacted);
+
+    // The secret is gone from everything a client can see.
+    expect(wire).not.toContain("super-secret-value");
+    const instance = (redacted as unknown as Record<string, Record<string, never>>)
+      .providerInstances["atlas"] as unknown as {
+      config: Record<string, unknown>;
+      environment: ReadonlyArray<Record<string, unknown>>;
+    };
+    const token = instance.environment.find((v) => v["name"] === ATLAS_ACCESS_TOKEN_ENV);
+    expect(token?.["value"]).toEqual("");
+    expect(token?.["valueRedacted"]).toBe(true);
+    // Non-sensitive values still travel, so redaction is targeted rather than blanket.
+    expect(instance.environment.find((v) => v["name"] === "ATLAS_LABEL")?.["value"]).toEqual(
+      "not-a-secret",
+    );
+    // And nothing token-shaped was ever put in config, which redaction does NOT cover.
+    expect(Object.keys(instance.config)).not.toContain("accessToken");
+  });
+
+  it("reads the token from the environment the registry hands the driver", () => {
+    const environment = [
+      { name: "UNRELATED", value: "x", sensitive: false },
+      { name: ATLAS_ACCESS_TOKEN_ENV, value: "  tok-123  ", sensitive: true },
+    ];
+    // Trimmed, because a value pasted with whitespace must not become a different bearer.
+    expect(readAtlasAccessTokenForTest(environment as never)).toEqual("tok-123");
+    // Absent and blank are both "no credential" — a node with no auth is a valid setup, and
+    // an empty string must not be sent as a Bearer header.
+    expect(readAtlasAccessTokenForTest([] as never)).toBeUndefined();
+    expect(
+      readAtlasAccessTokenForTest([
+        { name: ATLAS_ACCESS_TOKEN_ENV, value: "   ", sensitive: true },
+      ] as never),
+    ).toBeUndefined();
   });
 });

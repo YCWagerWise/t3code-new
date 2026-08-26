@@ -82,6 +82,11 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     value: ProviderDriverKind.make("atlas"),
     label: "Atlas",
     icon: OpenAI,
+    // `AtlasSettings` carries the node URL only. The bearer credential is an instance
+    // ENVIRONMENT variable (`ATLAS_ACCESS_TOKEN`, marked sensitive), because provider config
+    // is returned to clients verbatim while sensitive environment values are redacted and
+    // secret-store backed. Putting it in this form would have shipped the credential in
+    // settings JSON and in every client snapshot.
     settingsSchema: AtlasSettings,
   },
   // Cursor and Grok were removed from this build (#150). Their entries stayed

@@ -31,7 +31,13 @@
  *
  * @module provider/Drivers/AtlasDriver
  */
-import { type ServerProvider, type ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  ATLAS_ACCESS_TOKEN_ENV,
+  type ProviderInstanceEnvironment,
+  type ServerProvider,
+  type ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -94,14 +100,31 @@ export const AtlasSettings = Schema.Struct({
   enabled: Schema.optional(Schema.Boolean),
   /** Base URL of the atlas-host node, e.g. `http://127.0.0.1:3010`. */
   baseUrl: Schema.optional(Schema.String),
-  /** Machine token or user JWT. Sent as `Authorization: Bearer …`. */
-  accessToken: Schema.optional(Schema.String),
 });
 export type AtlasSettings = typeof AtlasSettings.Type;
 
 const decodeAtlasSettings = Schema.decodeSync(AtlasSettings);
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:3010";
+
+/**
+ * The bearer credential for this instance, taken from its sensitive environment.
+ *
+ * Absent is a legitimate configuration: a node with no auth configured answers the handshake,
+ * and a node that requires one answers 401 — which the probe reports as reachable-but-
+ * unauthorised rather than ready. Either way nothing is invented here.
+ */
+export const readAtlasAccessTokenForTest = (
+  environment: ProviderInstanceEnvironment | undefined,
+): string | undefined => readAtlasAccessToken(environment);
+
+const readAtlasAccessToken = (
+  environment: ProviderInstanceEnvironment | undefined,
+): string | undefined => {
+  const found = environment?.find((variable) => variable.name === ATLAS_ACCESS_TOKEN_ENV);
+  const value = found?.value?.trim();
+  return value === undefined || value.length === 0 ? undefined : value;
+};
 
 /** Trailing slashes make `${base}/console/v1/...` produce a double slash, which some routers 404. */
 const normalizeBaseUrl = (raw: string | undefined): string =>
@@ -171,7 +194,7 @@ export const classifyHandshake = (input: {
       version: null,
       status: "error",
       auth: { status: "unauthenticated" },
-      message: `atlas-host at ${input.baseUrl} refused the access token (${input.status}); set the Atlas provider's accessToken`,
+      message: `atlas-host at ${input.baseUrl} refused the access token (${input.status}); set ${ATLAS_ACCESS_TOKEN_ENV} in the Atlas provider's environment`,
     };
   }
   if (input.status < 200 || input.status >= 300) {
@@ -835,24 +858,29 @@ export const makeAtlasDriver = (
   },
   configSchema: AtlasSettings,
   defaultConfig: (): AtlasSettings => decodeAtlasSettings({}),
-  create: ({ instanceId, displayName, accentColor, enabled, config }) =>
+  create: ({ instanceId, displayName, accentColor, enabled, config, environment }) =>
     Effect.gen(function* () {
       const baseUrl = normalizeBaseUrl(config.baseUrl);
+      // The credential comes from the instance ENVIRONMENT, never from `config`.
+      //
+      // Provider config is opaque and handed back to every settings-reading client verbatim;
+      // only sensitive environment entries are blanked by `redactServerSettingsForClient`. So
+      // a token in config would be written to settings JSON and broadcast in clear text. This
+      // is the seam that is already redacted on the way out and backed by `ServerSecretStore`.
+      const accessToken = readAtlasAccessToken(environment);
       const fetchImpl =
         deps?.fetch ??
         ((url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<FetchLike>);
       const probe = yield* probeAtlasHost({
         baseUrl,
-        accessToken: config.accessToken,
+        accessToken,
         fetch: fetchImpl,
       });
       // Only ask for models when the node answered. Listing models from a host that just
       // failed its probe would be exactly the display-only readiness this driver refuses.
       const catalogue =
         probe.status === "ready"
-          ? yield* Effect.promise(() =>
-              readCatalog({ baseUrl, accessToken: config.accessToken, fetch: fetchImpl }),
-            )
+          ? yield* Effect.promise(() => readCatalog({ baseUrl, accessToken, fetch: fetchImpl }))
           : [];
       const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
       const continuationIdentity = defaultProviderContinuationIdentity({
@@ -911,7 +939,7 @@ export const makeAtlasDriver = (
         enabled,
         snapshot,
         adapter: makeAtlasAdapter({
-          endpoint: { baseUrl, accessToken: config.accessToken, fetch: fetchImpl },
+          endpoint: { baseUrl, accessToken, fetch: fetchImpl },
           fleetId: "default",
           instanceId: String(instanceId),
           // Awaited by the reader before it advances, and a failure is propagated rather than
