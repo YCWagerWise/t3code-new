@@ -272,9 +272,11 @@ pub async fn write_file(
                 .map_err(|e| e.to_string())?;
         }
         cairn::Discovery::NotRepository => cairn::write_file_atomic(root, rel, contents)?,
-        cairn::Discovery::Unavailable(why) => return Err(format!(
+        cairn::Discovery::Unavailable(why) => {
+            return Err(format!(
             "cairn checkpoint substrate unavailable ({why}); refusing unversioned write to {rel}"
-        )),
+        ))
+        }
     }
     Ok(json!({ "relativePath": rel }))
 }
@@ -325,15 +327,13 @@ mod tests {
         let dir = workspace().await;
         let cwd = dir.to_str().unwrap();
 
-        let browse = search_entries(cwd, &json!({"query": "", "limit": 50}))
-            .await;
+        let browse = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
         assert!(
             !browse["entries"].as_array().unwrap().is_empty(),
             "an empty query browses rather than returning nothing"
         );
 
-        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10}))
-            .await;
+        let hit = search_entries(cwd, &json!({"query": "srvmain", "limit": 10})).await;
         let paths: Vec<&str> = hit["entries"]
             .as_array()
             .unwrap()
@@ -346,19 +346,17 @@ mod tests {
             "fuzzy subsequence: {paths:?}"
         );
 
-        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10}))
-            .await;
+        let none = search_entries(cwd, &json!({"query": "zzzznope", "limit": 10})).await;
         assert!(none["entries"].as_array().unwrap().is_empty());
 
         // limit truncates AND says so
-        let capped = search_entries(cwd, &json!({"query": "", "limit": 1}))
-            .await;
+        let capped = search_entries(cwd, &json!({"query": "", "limit": 1})).await;
         assert_eq!(capped["entries"].as_array().unwrap().len(), 1);
         assert_eq!(capped["truncated"], json!(true), "truncation is reported");
 
         // kind filter
-        let dirs = search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"}))
-            .await;
+        let dirs =
+            search_entries(cwd, &json!({"query": "", "limit": 50, "kind": "directory"})).await;
         assert!(dirs["entries"]
             .as_array()
             .unwrap()
@@ -377,8 +375,7 @@ mod tests {
         std::fs::write(dir.join("assets/notes.txt"), "x").unwrap();
         let cwd = dir.to_str().unwrap();
 
-        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true}))
-            .await;
+        let out = search_entries(cwd, &json!({"query": "", "limit": 50, "imageOnly": true})).await;
         let paths: Vec<&str> = out["entries"]
             .as_array()
             .unwrap()
@@ -404,8 +401,7 @@ mod tests {
         }
 
         // without the flag the same search still returns everything
-        let all = search_entries(cwd, &json!({"query": "", "limit": 50}))
-            .await;
+        let all = search_entries(cwd, &json!({"query": "", "limit": 50})).await;
         let all_paths: Vec<&str> = all["entries"]
             .as_array()
             .unwrap()
@@ -428,9 +424,16 @@ mod tests {
         std::fs::write(dir.join(".git/index"), "not a git index\n").unwrap();
 
         let out = list_entries(dir.to_str().unwrap()).await;
-        assert_eq!(out["statusUnavailable"], json!(true), "repo list failure must be explicit: {out}");
+        assert_eq!(
+            out["statusUnavailable"],
+            json!(true),
+            "repo list failure must be explicit: {out}"
+        );
         assert!(
-            out["statusError"].as_str().unwrap_or("").contains("project file list unavailable"),
+            out["statusError"]
+                .as_str()
+                .unwrap_or("")
+                .contains("project file list unavailable"),
             "the error explains that cairn could not list the repo: {out}"
         );
         assert!(
@@ -438,9 +441,14 @@ mod tests {
             "manual walking would expose ignored/generated files after cairn failed: {out}"
         );
 
-        let search = search_entries(dir.to_str().unwrap(), &json!({"query": "ignored", "limit": 10})).await;
+        let search = search_entries(
+            dir.to_str().unwrap(),
+            &json!({"query": "ignored", "limit": 10}),
+        )
+        .await;
         assert_eq!(
-            search["statusUnavailable"], json!(true),
+            search["statusUnavailable"],
+            json!(true),
             "search must not downgrade a repo-list failure to manual walk either: {search}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -715,7 +723,11 @@ pub async fn open_in_editor(
     default_cwd: &str,
     runner: &hearth::Runner,
 ) -> Result<String, String> {
-    let cwd = input.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or(default_cwd);
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_cwd);
     let editor = input.get("editor").and_then(Value::as_str).unwrap_or("");
     let candidates = editor_commands(editor);
     if candidates.is_empty() {

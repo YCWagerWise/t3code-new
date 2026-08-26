@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "The Rust agent backend t3code spawns as a provider: serves the durable agent-sdk runtime over stdio ACP. Keeps agent-sdk-rs a pure library."
 
+[package.metadata.t3code.checks.rust-tests]
+command = "scripts/check-rust-tests.sh"
+description = "Runs every t3code-agent unit and integration test target with cargo --no-fail-fast so one flaky target cannot suppress the restart/reconnect and shell-session targets."
+expected_targets = 7
+
+[package.metadata.t3code.checks.stack-integration]
+command = "scripts/check-rust-stack.sh"
+description = "Verifies the pinned six-repo Rust stack revision set is assembled cleanly, then cargo-checks the backend against that exact stack."
+manifest = "t3-stack.lock"
+expected_repos = 7
+
 [lib]
 name = "t3code_agent"
 path = "src/lib.rs"
