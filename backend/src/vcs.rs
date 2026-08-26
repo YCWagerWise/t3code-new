@@ -952,8 +952,19 @@ pub async fn run_stacked_action_streaming_with(
             return Ok(Some((p, m))); }
         }
         // nothing staged is "skipped_no_changes", a real outcome the UI shows —
-        // not an error and not a fake commit.
-        let staged = repo.staged().await.ok().flatten();
+        // not an error and not a fake commit. But an UNREADABLE staged state
+        // (#147) is neither: `.ok().flatten()` used to collapse a genuine
+        // ExecError into the same None as "nothing staged", so an unreadable
+        // index reported a successful, empty commit phase instead of the
+        // failure it actually was. Propagate the error as an action_failed
+        // frame — cairn is the workspace authority here, not this function.
+        let staged = match repo.staged().await {
+            Ok(s) => s,
+            Err(e) => {
+                { let (p, m): (Value, String) = (json!("commit"), e.to_string()); for f in failed(p.clone(), m.clone()) { sink(f); }
+                return Ok(Some((p, m))); }
+            }
+        };
         if staged.is_none() {
             commit_step = json!({"status": "skipped_no_changes"});
         } else {

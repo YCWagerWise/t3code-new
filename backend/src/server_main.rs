@@ -126,7 +126,6 @@ struct AppState {
     /// reconcile new provider instances into this exact catalog, so the picker
     /// and the router both see the change without a restart (#47/#60).
     catalog: Arc<RwLock<Catalog>>,
-    store: Arc<Mutex<Store>>,
     #[cfg(test)]
     _contract_test_fd_slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     /// The ONE workspace Hearth PTY, shared by the agent's `run_bash` tools and
@@ -202,41 +201,41 @@ struct AppState {
     project_name: String,
 }
 
-/// Live socket wiring only — NOT durable authority. Threads, messages, the
-/// (thread,model)→session binding, and stream cursors all live in the SDK's
-/// do-rs `OrchStore`/`Shell`; this struct holds just the ephemeral fan-out
-/// senders. It holds NO sequence of its own: every wire sequence — shell stream,
-/// thread stream, dispatch ack, snapshot mark — comes from
-/// `ThreadRuntime::next_sequence`, which is durable and continues across a
-/// restart. A per-process counter rewinds to 1 when the process dies, and a
-/// client reducer then sees an old number attached to a new event (#299).
-#[derive(Default)]
-struct Store {
-    // Every field that used to live here has moved out:
-    // - projects (#370): durable in `OrchStore` via
-    //   `ThreadRuntime::save_project` / `projects`; a snapshot reads the
-    //   same list threads read from, and two backends on the same isolate
-    //   see the same rows.
-    // Shell list/watch fanout is NOT here (#320). It runs through the SDK's
-    // durable shell topic (`ThreadRuntime::shell_publish` /
-    // `shell_tail_after`), so a second backend process attached to the same
-    // isolate sees the same frames. And the "already announced?" set is
-    // authoritative in the durable store — `state.rt.threads()` tells us —
-    // so a process-local `known_threads` HashSet no longer exists either.
-    // subscribeVcsStatus fanout is NOT here (packet DM). It runs through the
-    // SDK's durable per-cwd broker topic (`ThreadRuntime::vcs_publish` /
-    // `vcs_tail_after`); the durable watch registry (`state.rt.watch_marks`)
-    // is what the supervisor polls; and release-on-last-watcher is a DURABLE
-    // claim (`watch_claim`/`watch_unclaim`), counted in the store rather than
-    // in this process, so two backends cannot disagree about whether a tree
-    // still has readers.
-    // `subscribeServerConfig` fanout is NOT here (packet DL). It runs through
-    // the SDK's durable config topic (`ThreadRuntime::config_publish` /
-    // `config_tail_after`), so a settings write made from a SECOND backend
-    // process attached to the same isolate reaches every subscriber — the
-    // process-local `config_subs` `Vec<Sender>` only reached this process,
-    // and left every passive surface stale on cross-process mutations.
-}
+// `Store` IS GONE, AND THAT IS THE POINT.
+//
+// It was the product-owned runtime authority this backend was rejected for:
+// threads, messages, the (thread,model)→session binding, stream cursors,
+// projects, the shell/VCS/config fan-out `Vec<Sender>`s, a `known_threads`
+// set, and a per-process wire sequence that rewound to 1 on restart so a
+// client reducer saw an old number on a new event.
+//
+// Every one of them moved down, and the last commit to touch this struct left
+// it EMPTY — a zero-field type behind an `Arc<Mutex<_>>` in `AppState` that no
+// handler ever locked (`grep 'store.lock()'` found nothing). Keeping it was
+// keeping a shape for something that no longer exists, and the next reader
+// would reasonably assume it was load-bearing and put a field back in it.
+//
+// Where each part lives now, so nothing here is lost by deleting the struct:
+//   - threads / messages / bindings / cursors → the SDK's do-rs `OrchStore`
+//     and `Shell`, reached through `AppState::rt`.
+//   - projects (#370) → `ThreadRuntime::save_project` / `projects`, so a
+//     snapshot reads the same rows threads read from.
+//   - shell list/watch fanout (#320) → the durable shell topic
+//     (`shell_publish` / `shell_tail_after`); "already announced?" is
+//     answered by `rt.threads()`, not a process-local set.
+//   - subscribeVcsStatus fanout → the durable per-cwd broker topic
+//     (`vcs_publish` / `vcs_tail_after`), with release-on-last-watcher a
+//     durable claim (`watch_claim` / `watch_unclaim`) rather than a count in
+//     this process, so two backends cannot disagree about whether a tree
+//     still has readers.
+//   - subscribeServerConfig fanout → the durable config topic
+//     (`config_publish` / `config_tail_after`), so a settings write from a
+//     SECOND backend on the same isolate reaches every subscriber.
+//   - wire sequence (#299) → `ThreadRuntime::next_sequence`, durable across
+//     restart.
+//
+// The rule that produced all of it: if a second backend process attached to
+// the same isolate would not see it, it does not belong in this process.
 
 /// Map the UI's model selection (provider instance + model slug) to a ModelRef
 /// by asking the SDK provider registry — the SAME registry the picker was
@@ -288,8 +287,16 @@ fn model_from_selection(
         let snapshot = catalog
             .snapshot(instance)
             .ok_or_else(|| format!("unknown provider instance \"{instance}\""))?;
-        for selection in decode_option_selections(raw_options) {
-            validate_selection(&snapshot.options, &selection)
+        // PROPAGATE THE DECODE (#264). `decode_option_selections` returns
+        // `Result` now, and `for x in some_result` is legal Rust that iterates
+        // ONCE over the Ok value and silently zero times over an Err — so a
+        // malformed options payload would skip every validate_selection below
+        // and be accepted, which is the exact failure this block exists to
+        // stop. Bind it first so the compiler has to see the error path.
+        let selections = decode_option_selections(raw_options)
+            .map_err(|e| format!("invalid model options: {e}"))?;
+        for selection in &selections {
+            validate_selection(&snapshot.options, selection)
                 .map_err(|e| format!("invalid model option: {e}"))?;
         }
     }
@@ -469,7 +476,6 @@ async fn main() {
         Ok(_) => {}
         Err(e) => panic!("project store unreadable at boot: {e}"),
     }
-    let store = Store::default();
     // ONE catalog, built at boot from the DURABLE instance set (the user's saved
     // providers merged over the env defaults) so a custom/Ollama model added in
     // settings survives restart instead of falling back to the skinny boot env
@@ -509,7 +515,6 @@ async fn main() {
         checkpoints,
         checkpoints_dir,
         diag_history: Arc::new(diag_history),
-        store: Arc::new(Mutex::new(store)),
         #[cfg(test)]
         _contract_test_fd_slot: None,
         vcs_watch_changed: Arc::new(tokio::sync::watch::channel(0u64).0),
@@ -4933,18 +4938,30 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
         // to the stored thread's selection matters because a follow-up turn
         // often repeats only the text — dropping the options there would make
         // the knob apply to the first message of a thread and nothing after.
+        // DECODE FAILURE IS NOT "NO OPTIONS" (#264). `decode_option_selections`
+        // is fallible now, and `.map(..).unwrap_or_default()` folded an Err
+        // into an empty Vec — indistinguishable from a thread that never set
+        // any option. The turn would then run at the provider's defaults while
+        // the UI still showed the user's chosen reasoning effort, and the next
+        // write would persist that silent reversion as though it were chosen.
+        // Absent stays empty; unreadable stops the turn and says so.
         let options = {
             use agent_sdk_provider::instance::decode_option_selections;
-            command
+            let raw = command
                 .pointer("/modelSelection/options")
                 .or_else(|| {
                     stored
                         .as_ref()
                         .and_then(|t| t.pointer("/modelSelection/options"))
                 })
-                .filter(|v| !v.is_null())
-                .map(decode_option_selections)
-                .unwrap_or_default()
+                .filter(|v| !v.is_null());
+            match raw.map(decode_option_selections).transpose() {
+                Ok(v) => v.unwrap_or_default(),
+                Err(e) => {
+                    tracing::error!(%thread_id, %e, "model options unreadable; refusing the turn");
+                    return;
+                }
+            }
         };
         let def = AgentDefinition {
             name: "t3code".into(),

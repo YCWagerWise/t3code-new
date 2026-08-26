@@ -1746,7 +1746,8 @@ async fn a_validated_model_option_reaches_the_provider_invocation() {
     // The wire shape the frontend sends, decoded the way the dispatch path
     // decodes it.
     let wire = json!([{ "id": "reasoning_effort", "value": "high" }]);
-    let decoded: Vec<ProviderOptionSelection> = decode_option_selections(&wire);
+    let decoded: Vec<ProviderOptionSelection> =
+        decode_option_selections(&wire).expect("the wire shape the frontend sends must decode");
     assert_eq!(decoded.len(), 1, "the wire options decode: {decoded:?}");
 
     // And the adapter that runs the turn applies it.

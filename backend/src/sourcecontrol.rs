@@ -38,6 +38,71 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `--version` and auth-status banners, so this widens the command allow-list
 /// to exactly those four. Env prefixes stay at cairn's default (`GIT_AUTHOR_`,
 /// `GIT_COMMITTER_`) — no widening. Timeouts and sandbox come from cairn.
+/// #172/#189/#225: `publish_repository` builds `gh repo create` argv straight
+/// from request JSON. Cairn's `Repo::exec` screens the EXECUTABLE and the
+/// broad argv shape, but it cannot know that THIS product's positional/flag
+/// slots are supposed to hold a repo identifier, a visibility enum, and a
+/// remote name — that is product-owned command policy, and it has to be
+/// enforced here, before argv exists, not inferred by cairn or by `gh`.
+///
+/// A flag-shaped value in any of these three fields (`"--template"`,
+/// `"--add-readme"`, a leading `-`) would otherwise select an unintended
+/// `gh repo create` mode, or — for `repository`, the first positional slot —
+/// get consumed as an option and shift every argument after it.
+fn validate_repository_name(repository: &str) -> Result<(), String> {
+    if repository.starts_with('-') {
+        return Err(format!("repository {repository:?} looks like a flag, not a repository name"));
+    }
+    // GitHub's own grammar: owner/name or bare name, each component
+    // alphanumeric plus `-`, `_`, `.`, non-empty, no leading/trailing `.`.
+    let valid_component = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && !s.ends_with('.')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let ok = match repository.split_once('/') {
+        Some((owner, name)) => valid_component(owner) && valid_component(name) && !name.contains('/'),
+        None => valid_component(repository),
+    };
+    if !ok {
+        return Err(format!("repository {repository:?} is not a valid owner/name or name"));
+    }
+    Ok(())
+}
+
+fn validate_visibility(visibility: &str) -> Result<(), String> {
+    match visibility {
+        "public" | "private" | "internal" => Ok(()),
+        other => Err(format!("visibility must be public, private, or internal, got {other:?}")),
+    }
+}
+
+fn validate_remote_name(remote_name: &str) -> Result<(), String> {
+    let trimmed = remote_name.trim();
+    if trimmed.is_empty() {
+        return Err("remoteName must not be empty".to_string());
+    }
+    if trimmed != remote_name {
+        return Err(format!("remoteName {remote_name:?} has leading/trailing whitespace"));
+    }
+    if remote_name.starts_with('-') {
+        return Err(format!("remoteName {remote_name:?} looks like a flag, not a remote name"));
+    }
+    // git's own remote-name grammar: refname-safe, no whitespace/control
+    // chars, no `..`, doesn't end in `.lock` or `/`.
+    let valid = !remote_name.contains("..")
+        && !remote_name.ends_with(".lock")
+        && !remote_name.ends_with('/')
+        && remote_name
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'));
+    if !valid {
+        return Err(format!("remoteName {remote_name:?} is not a valid git remote name"));
+    }
+    Ok(())
+}
+
 fn discovery_cfg() -> cairn::Config {
     let mut policy = cairn::ExecPolicy::default();
     for cmd in ["glab", "jj", "az"] {
