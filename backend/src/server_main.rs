@@ -2846,13 +2846,29 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         // shows a spinner with no way out. The durable in-flight
                         // marker carries the SAME turn id the live session-set event
                         // used, so the running/stop affordance is fully restored (#92).
+                        // #210: `active_turn_id` is fallible now. A durable read
+                        // FAILURE must not be rendered as "no turn running" —
+                        // that is the state that settles the spinner and drops
+                        // the stop affordance, which is the exact bug this
+                        // marker exists to prevent. Propagate instead.
                         let active_turn = if live {
-                            state
-                                .rt
-                                .active_turn_id(thread_id)
-                                .await
-                                .map(Value::String)
-                                .unwrap_or(Value::Null)
+                            match state.rt.active_turn_id(thread_id).await {
+                                Ok(Some(id)) => Value::String(id),
+                                Ok(None) => Value::Null,
+                                Err(e) => {
+                                    tracing::error!(%e, %thread_id, "active turn unreadable");
+                                    // Same shape as the `session status
+                                    // unreadable` arm below: the tail is
+                                    // already attached, so detach it before
+                                    // returning or the subscriber row is left
+                                    // with nothing draining it.
+                                    snapshot_tail.close().await;
+                                    chunk(tx, &id, json!({ "kind": "error",
+                                        "error": { "message":
+                                            format!("active turn unreadable: {e}") } }));
+                                    return;
+                                }
+                            }
                         } else {
                             Value::Null
                         };
