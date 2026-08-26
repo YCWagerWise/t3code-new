@@ -75,15 +75,19 @@ struct Probe {
     stderr: String,
 }
 
+enum ProbeResult {
+    Ran(Probe),
+    Missing,
+    Refused(String),
+}
+
 /// Run a fixed argv through cairn's screened exec surface (#375).
 ///
 /// Product-side source-control EXECUTION lives in cairn — the same screen,
 /// spawner, sandbox, and env-prefix policy the rest of the app uses for
-/// `git`/`gh`. `None` means either cairn REFUSED the command (a program not on
-/// the discovery policy — which is a bug in this file, not a real probe result)
-/// or the binary could not be spawned at all (not installed / not on PATH).
-/// The refusal case logs so it does not silently look like a missing binary.
-async fn run(program: &str, args: &[&str]) -> Option<Probe> {
+/// `git`/`gh`. A refused command is backend policy drift, not proof the user's
+/// machine is missing a binary, so it stays typed all the way to the wire.
+async fn run(program: &str, args: &[&str]) -> ProbeResult {
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let cfg = discovery_cfg();
     let req = cairn::Exec {
@@ -95,16 +99,16 @@ async fn run(program: &str, args: &[&str]) -> Option<Probe> {
         max_output_bytes: 256 * 1024,
     };
     match cairn::exec_at(&std::env::temp_dir(), &req, &cfg).await {
-        Ok(out) => Some(Probe {
+        Ok(out) => ProbeResult::Ran(Probe {
             exit_ok: out.exit_code == 0,
             stdout: out.stdout,
             stderr: out.stderr,
         }),
         Err(cairn::ExecError::Refused(why)) => {
             tracing::error!(%program, %why, "discovery probe refused by cairn policy — widen discovery_cfg or drop the probe");
-            None
+            ProbeResult::Refused(why)
         }
-        Err(cairn::ExecError::Failed(_)) => None,
+        Err(cairn::ExecError::Failed(_)) => ProbeResult::Missing,
     }
 }
 
@@ -136,29 +140,38 @@ const VCS_PROBES: &[VcsProbe] = &[
         label: "Git",
         executable: "git",
         implemented: true,
-        install_hint: "Install Git from https://git-scm.com/downloads or with your package manager.",
+        install_hint:
+            "Install Git from https://git-scm.com/downloads or with your package manager.",
     },
     VcsProbe {
         kind: "jj",
         label: "Jujutsu",
         executable: "jj",
         implemented: false,
-        install_hint: "Install Jujutsu with `brew install jj` or from https://github.com/jj-vcs/jj.",
+        install_hint:
+            "Install Jujutsu with `brew install jj` or from https://github.com/jj-vcs/jj.",
     },
 ];
 
-async fn discover_vcs(p: &VcsProbe) -> Value {
-    let probe = run(p.executable, &["--version"]).await;
+fn vcs_from_probe(p: &VcsProbe, probe: ProbeResult) -> Value {
     let (status, version, detail) = match probe {
-        Some(pr) if pr.exit_ok => ("available", maybe(first_line(&pr)), none()),
+        ProbeResult::Ran(pr) if pr.exit_ok => ("available", maybe(first_line(&pr)), none()),
         // it exists but would not answer — name that, rather than reporting it
         // as missing and telling the user to install what they already have
-        Some(pr) => (
+        ProbeResult::Ran(pr) => (
             "missing",
             none(),
             some(first_line(&pr).unwrap_or_else(|| format!("`{} --version` failed", p.executable))),
         ),
-        None => ("missing", none(), some(p.install_hint)),
+        ProbeResult::Missing => ("missing", none(), some(p.install_hint)),
+        ProbeResult::Refused(why) => (
+            "unavailable",
+            none(),
+            some(format!(
+                "backend policy refused `{}` probe: {why}",
+                p.executable
+            )),
+        ),
     };
     json!({
         "kind": p.kind,
@@ -170,6 +183,10 @@ async fn discover_vcs(p: &VcsProbe) -> Value {
         "installHint": p.install_hint,
         "detail": detail,
     })
+}
+
+async fn discover_vcs(p: &VcsProbe) -> Value {
+    vcs_from_probe(p, run(p.executable, &["--version"]).await)
 }
 
 struct ProviderProbe {
@@ -232,7 +249,12 @@ fn parse_account(text: &str) -> (Option<String>, Option<String>) {
             let mut words = rest.split_whitespace().peekable();
             while let Some(w) = words.next() {
                 if (w == "account" || w == "as") && account.is_none() {
-                    account = words.peek().map(|n| n.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '@' && c != '.').to_string());
+                    account = words.peek().map(|n| {
+                        n.trim_matches(|c: char| {
+                            !c.is_alphanumeric() && c != '-' && c != '_' && c != '@' && c != '.'
+                        })
+                        .to_string()
+                    });
                 }
             }
         }
@@ -240,17 +262,33 @@ fn parse_account(text: &str) -> (Option<String>, Option<String>) {
     (account.filter(|a| !a.is_empty()), host)
 }
 
+fn provider_missing(p: &ProviderProbe) -> Value {
+    json!({
+        "kind": p.kind, "label": p.label, "executable": p.executable,
+        "status": "missing", "version": none(), "installHint": p.install_hint,
+        "detail": some(p.install_hint),
+        "auth": auth("unknown", none(), none(), some(format!("`{}` is not installed", p.executable))),
+    })
+}
+
+fn provider_refused(p: &ProviderProbe, why: String) -> Value {
+    json!({
+        "kind": p.kind, "label": p.label, "executable": p.executable,
+        "status": "unavailable", "version": none(), "installHint": p.install_hint,
+        "detail": some(format!("backend policy refused `{}` probe: {why}", p.executable)),
+        "auth": auth("unknown", none(), none(), some("the auth check was refused by backend policy")),
+    })
+}
+
 async fn discover_provider(p: &ProviderProbe) -> Value {
-    let version_probe = run(p.executable, &["--version"]).await;
-    let Some(vp) = version_probe else {
-        // not installed: we cannot know anything about the user's account, and
-        // `unauthenticated` would tell them to log into a tool they lack.
-        return json!({
-            "kind": p.kind, "label": p.label, "executable": p.executable,
-            "status": "missing", "version": none(), "installHint": p.install_hint,
-            "detail": some(p.install_hint),
-            "auth": auth("unknown", none(), none(), some(format!("`{}` is not installed", p.executable))),
-        });
+    let vp = match run(p.executable, &["--version"]).await {
+        ProbeResult::Ran(vp) => vp,
+        ProbeResult::Missing => {
+            // not installed: we cannot know anything about the user's account, and
+            // `unauthenticated` would tell them to log into a tool they lack.
+            return provider_missing(p);
+        }
+        ProbeResult::Refused(why) => return provider_refused(p, why),
     };
     if !vp.exit_ok {
         return json!({
@@ -262,18 +300,26 @@ async fn discover_provider(p: &ProviderProbe) -> Value {
     }
 
     let auth_value = match run(p.executable, p.auth_args).await {
-        None => auth("unknown", none(), none(), some("the auth check could not be run")),
-        Some(ap) if ap.exit_ok => {
+        ProbeResult::Missing => auth(
+            "unknown",
+            none(),
+            none(),
+            some("the auth check could not be run"),
+        ),
+        ProbeResult::Refused(why) => auth(
+            "unknown",
+            none(),
+            none(),
+            some(format!(
+                "the auth check was refused by backend policy: {why}"
+            )),
+        ),
+        ProbeResult::Ran(ap) if ap.exit_ok => {
             let combined = format!("{}\n{}", ap.stdout, ap.stderr);
             let (account, host) = parse_account(&combined);
             auth("authenticated", maybe(account), maybe(host), none())
         }
-        Some(ap) => auth(
-            "unauthenticated",
-            none(),
-            none(),
-            maybe(first_line(&ap)),
-        ),
+        ProbeResult::Ran(ap) => auth("unauthenticated", none(), none(), maybe(first_line(&ap))),
     };
     json!({
         "kind": p.kind, "label": p.label, "executable": p.executable,
@@ -287,7 +333,11 @@ fn discover_bitbucket() -> Value {
     let missing: Vec<&str> = BITBUCKET_ENV
         .iter()
         .copied()
-        .filter(|k| std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true))
+        .filter(|k| {
+            std::env::var(k)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
         .collect();
     let configured = missing.is_empty();
     json!({
@@ -333,7 +383,10 @@ pub async fn discover() -> Value {
 /// carries. GitHub is the only provider with a CLI we can drive here; the others
 /// report honestly that this environment cannot look them up.
 pub async fn lookup_repository(input: &Value) -> Result<Value, String> {
-    let provider = input.get("provider").and_then(Value::as_str).unwrap_or("unknown");
+    let provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let repository = input
         .get("repository")
         .and_then(Value::as_str)
@@ -377,9 +430,14 @@ pub async fn clone_repository(input: &Value, workspace_root: &str) -> Result<Val
     let destination_owned = crate::vcs::admit_new_directory(requested, workspace_root)?;
     let destination = destination_owned.as_str();
     if std::path::Path::new(destination).exists() {
-        return Err(format!("{destination} already exists — refusing to clone over it"));
+        return Err(format!(
+            "{destination} already exists — refusing to clone over it"
+        ));
     }
-    let protocol = input.get("protocol").and_then(Value::as_str).unwrap_or("auto");
+    let protocol = input
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
 
     // Either an explicit remote, or one resolved through the provider.
     let (remote_url, repository) = match input.get("remoteUrl").and_then(Value::as_str) {
@@ -410,6 +468,21 @@ pub async fn clone_repository(input: &Value, workspace_root: &str) -> Result<Val
     Ok(json!({ "cwd": destination, "remoteUrl": remote_url, "repository": repository }))
 }
 
+fn publish_visibility_flag(input: &Value) -> Result<&'static str, String> {
+    match input
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("private")
+    {
+        "public" => Ok("--public"),
+        "private" => Ok("--private"),
+        "internal" => Ok("--internal"),
+        other => Err(format!(
+            "visibility must be one of public, private, or internal (got {other})"
+        )),
+    }
+}
+
 /// Create the remote repository for a local checkout and push to it.
 ///
 /// Reports which of the two states it reached: `pushed` when the branch is
@@ -432,16 +505,24 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .ok_or("repository is required")?;
-    let provider = input.get("provider").and_then(Value::as_str).unwrap_or("github");
+    let provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("github");
     if provider != "github" {
         return Err(format!(
             "this environment can only publish to github (asked for {provider})"
         ));
     }
-    let visibility = input.get("visibility").and_then(Value::as_str).unwrap_or("private");
-    let remote_name = input.get("remoteName").and_then(Value::as_str).unwrap_or("origin");
+    let visibility_flag = publish_visibility_flag(input)?;
+    let remote_name = input
+        .get("remoteName")
+        .and_then(Value::as_str)
+        .unwrap_or("origin");
 
-    let repo = crate::vcs::open(cwd).await.ok_or("cwd is not a git repository")?;
+    let repo = crate::vcs::open(cwd)
+        .await
+        .ok_or("cwd is not a git repository")?;
     let branch = repo
         .branch()
         .await
@@ -457,7 +538,7 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         "repo",
         "create",
         repository,
-        &format!("--{visibility}"),
+        visibility_flag,
         "--source",
         ".",
         "--remote",
@@ -487,7 +568,8 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
             return Err(format!("gh repo create: {}", stderr.trim()));
         }
     }
-    let info = lookup_repository(&json!({ "provider": "github", "repository": repository })).await?;
+    let info =
+        lookup_repository(&json!({ "provider": "github", "repository": repository })).await?;
     let remote_url = info["url"].as_str().unwrap_or_default().to_string();
     Ok(json!({
         "repository": info,
@@ -517,11 +599,20 @@ mod tests {
         assert_eq!(provs.len(), 4, "github, gitlab, azure-devops, bitbucket");
 
         for item in vcs.iter().chain(provs.iter()) {
-            for field in ["kind", "label", "status", "version", "installHint", "detail"] {
+            for field in [
+                "kind",
+                "label",
+                "status",
+                "version",
+                "installHint",
+                "detail",
+            ] {
                 assert!(!item[field].is_null(), "{field} missing from {item}");
             }
             assert!(
-                item["status"] == "available" || item["status"] == "missing",
+                item["status"] == "available"
+                    || item["status"] == "missing"
+                    || item["status"] == "unavailable",
                 "status is a literal: {item}"
             );
             // Options are the tagged Effect encoding, never a bare string/null
@@ -531,7 +622,10 @@ mod tests {
                     "{field} must be an encoded Option: {item}"
                 );
             }
-            assert!(!item["installHint"].as_str().unwrap().is_empty(), "a hint a user can act on");
+            assert!(
+                !item["installHint"].as_str().unwrap().is_empty(),
+                "a hint a user can act on"
+            );
         }
         for p in provs {
             let status = p["auth"]["status"].as_str().unwrap();
@@ -557,7 +651,10 @@ mod tests {
         assert_eq!(git["status"], "available");
         assert_eq!(git["implemented"], true);
         let version = opt(&git["version"]).expect("a version banner");
-        assert!(version.to_lowercase().contains("git"), "real banner: {version}");
+        assert!(
+            version.to_lowercase().contains("git"),
+            "real banner: {version}"
+        );
     }
 
     /// jj is reported even when installed, and never as implemented — the
@@ -579,8 +676,8 @@ mod tests {
 
     /// A tool that is not installed cannot tell us anything about the user's
     /// account. `unauthenticated` there would prompt a login for a missing CLI.
-    #[tokio::test]
-    async fn a_missing_provider_cli_reports_unknown_auth_not_unauthenticated() {
+    #[test]
+    fn a_missing_provider_cli_reports_unknown_auth_not_unauthenticated() {
         let missing = ProviderProbe {
             kind: "github",
             label: "Nope",
@@ -588,11 +685,67 @@ mod tests {
             auth_args: &["auth", "status"],
             install_hint: "install the thing",
         };
-        let v = discover_provider(&missing).await;
+        let v = provider_missing(&missing);
         assert_eq!(v["status"], "missing");
         assert_eq!(v["auth"]["status"], "unknown", "not unauthenticated");
         assert_eq!(opt(&v["detail"]), Some("install the thing"));
         assert_eq!(v["version"]["_tag"], "None");
+    }
+
+    #[test]
+    fn a_refused_vcs_probe_is_unavailable_not_missing() {
+        let git = VcsProbe {
+            kind: "git",
+            label: "Git",
+            executable: "git",
+            implemented: true,
+            install_hint: "install git",
+        };
+        let v = vcs_from_probe(&git, ProbeResult::Refused("command not allowed".into()));
+        assert_eq!(v["status"], "unavailable");
+        assert_ne!(v["status"], "missing");
+        assert!(opt(&v["detail"])
+            .unwrap()
+            .contains("backend policy refused"));
+        assert!(!opt(&v["detail"]).unwrap().contains("install git"));
+    }
+
+    #[test]
+    fn a_refused_provider_probe_is_unavailable_not_not_installed() {
+        let github = ProviderProbe {
+            kind: "github",
+            label: "GitHub",
+            executable: "gh",
+            auth_args: &["auth", "status"],
+            install_hint: "install gh",
+        };
+        let v = provider_refused(&github, "argv refused".into());
+        assert_eq!(v["status"], "unavailable");
+        assert_ne!(v["status"], "missing");
+        assert_eq!(v["auth"]["status"], "unknown");
+        assert!(opt(&v["detail"])
+            .unwrap()
+            .contains("backend policy refused"));
+        assert!(!opt(&v["auth"]["detail"]).unwrap().contains("not installed"));
+    }
+
+    #[test]
+    fn publish_visibility_is_a_closed_enum() {
+        assert_eq!(publish_visibility_flag(&json!({})).unwrap(), "--private");
+        assert_eq!(
+            publish_visibility_flag(&json!({ "visibility": "public" })).unwrap(),
+            "--public"
+        );
+        assert_eq!(
+            publish_visibility_flag(&json!({ "visibility": "private" })).unwrap(),
+            "--private"
+        );
+        assert_eq!(
+            publish_visibility_flag(&json!({ "visibility": "internal" })).unwrap(),
+            "--internal"
+        );
+        let err = publish_visibility_flag(&json!({ "visibility": "disable-issues" })).unwrap_err();
+        assert!(err.contains("visibility must be one of"));
     }
 
     /// Configured-but-unverified credentials are `unknown`, not authenticated —

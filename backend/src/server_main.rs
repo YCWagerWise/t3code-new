@@ -1289,7 +1289,8 @@ async fn watch_one_tree(
             return;
         }
         Err(e) => {
-            tracing::warn!(%cwd, %e, "could not place status watch; vcs panel will update on commands only");
+            tracing::warn!(%cwd, %e, "could not place status watch; publishing unavailable status");
+            publish_vcs_status(&state, &cwd).await;
             return;
         }
     };
@@ -3521,15 +3522,31 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 .await
             {
                 Ok(None) => {
-                    let _ = action_control.clear(&action_id).await;
+                    if let Err(e) = action_control.clear(&action_id).await {
+                        exit_failure(tx, &id, &format!("action control cleanup unavailable: {e}"));
+                        return;
+                    }
                     exit_success(tx, &id, Value::Null);
                     publish_vcs_status(&state, &cwd).await;
                 }
                 Ok(Some((phase, message))) => {
                     if message.contains("cancelled") {
-                        let _ = action_control.finish(&action_id, agent_sdk_do::Checkpoint::Cancel).await;
+                        if let Err(e) = action_control
+                            .finish(&action_id, agent_sdk_do::Checkpoint::Cancel)
+                            .await
+                        {
+                            exit_failure(
+                                tx,
+                                &id,
+                                &format!("action control finish unavailable: {e}"),
+                            );
+                            return;
+                        }
                     }
-                    let _ = action_control.clear(&action_id).await;
+                    if let Err(e) = action_control.clear(&action_id).await {
+                        exit_failure(tx, &id, &format!("action control cleanup unavailable: {e}"));
+                        return;
+                    }
                     // A refused phase can still have mutated the repository —
                     // `commit` may have landed before `push` was refused — so
                     // the status is republished on this path too. Leaving it
@@ -3539,7 +3556,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     exit_failure(tx, &id, &format!("{phase}: {message}"));
                 }
                 Err(e) => {
-                    let _ = action_control.clear(&action_id).await;
+                    if let Err(cleanup) = action_control.clear(&action_id).await {
+                        exit_failure(
+                            tx,
+                            &id,
+                            &format!("action failed ({e}); action control cleanup unavailable: {cleanup}"),
+                        );
+                        return;
+                    }
                     exit_failure(tx, &id, &e);
                 }
             }
