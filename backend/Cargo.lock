@@ -66,6 +66,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "ulid",
 ]
 
@@ -126,6 +127,7 @@ version = "0.0.1"
 dependencies = [
  "agent-sdk-do",
  "do-core",
+ "do-storage",
  "hearth",
  "serde",
  "serde_json",
@@ -217,10 +219,12 @@ dependencies = [
  "agent-sdk-do",
  "agent-sdk-runtime",
  "async-trait",
+ "do-core",
  "schemars",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
