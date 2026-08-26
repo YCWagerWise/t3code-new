@@ -35,6 +35,7 @@ import { type ServerProvider, type ThreadId, TurnId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
 import { makeAgentSdkTextGeneration } from "../../textGeneration/AgentSdkTextGeneration.ts";
@@ -46,11 +47,16 @@ import {
   cancelTurn,
   type AtlasCursor,
   type AtlasEndpoint,
+  type AtlasLifecycleEvent,
   type FetchLike,
+  fingerprint,
+  parseAtlasCursor,
   projectLifecycleEvent,
   readCatalog,
   readEvents,
+  resolveInput,
   startTurn,
+  turnRequestId,
 } from "./AtlasConsole.ts";
 import {
   ProviderAdapterRequestError,
@@ -237,22 +243,100 @@ const nowIso = () => new Date().toISOString();
 interface LiveThread {
   cursor: AtlasCursor;
   activeTurnId: string | undefined;
+  /**
+   * The id the in-flight send was committed under, kept so a retry of the SAME logical send
+   * reuses it. Cleared when the turn settles, so the next turn gets its own identity.
+   */
+  pendingRequestId: string | undefined;
+  /** The last `request_ref` Atlas asked about, so a decision can name what it answers. */
+  awaitingRef: string | undefined;
 }
 
-const makeAtlasAdapter = (input: {
+/** How long a reader waits after an empty page before asking again. */
+const IDLE_POLL_MS = 400;
+/** First retry delay after a failed read, doubled per consecutive failure. */
+const RETRY_FLOOR_MS = 250;
+/** Ceiling on that doubling: a node that is down must not be hammered, nor abandoned. */
+const RETRY_CEILING_MS = 10_000;
+
+/**
+ * A sleep that a wake-up can cut short.
+ *
+ * The reader spends nearly all its life parked here. Without `wake` a send would have to wait
+ * out a full idle interval before its own events were read, which is the "single delayed poll"
+ * shape this design is required not to have; with it, a send returns as soon as Atlas has
+ * something to say.
+ */
+const makeGate = (sleep: (ms: number) => Promise<void>) => {
+  let release: (() => void) | undefined;
+  let pending = false;
+  return {
+    wake: () => {
+      pending = true;
+      release?.();
+      release = undefined;
+    },
+    wait: async (ms: number): Promise<void> => {
+      if (pending) {
+        pending = false;
+        return;
+      }
+      await Promise.race([
+        sleep(ms),
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      ]);
+      pending = false;
+      release = undefined;
+    },
+  };
+};
+
+export interface AtlasAdapterInput {
   readonly endpoint: AtlasEndpoint;
   readonly fleetId: string;
   readonly instanceId: string;
-}): ProviderAdapterShape<ProviderUnsupportedError | ProviderAdapterRequestError> => {
+  /** Injectable so a test drives the reader deterministically instead of waiting on wall time. */
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly idlePollMs?: number;
+}
+
+export const makeAtlasAdapter = (
+  input: AtlasAdapterInput,
+): ProviderAdapterShape<ProviderUnsupportedError | ProviderAdapterRequestError> => {
   // One cursor per thread, held by the READER. Atlas's log is the durable copy; this is only
   // the bookmark, so losing it costs a replay and never an event.
   const threads = new Map<string, LiveThread>();
   const emit = new Map<string, (events: ReadonlyArray<ProviderRuntimeEvent>) => void>();
+  // Events the reader projected before anything was listening. The cursor has already advanced
+  // past them, so dropping them would be a real loss rather than a replay — `ProviderService`
+  // subscribes once for the adapter's lifetime, but a reader started before that subscription
+  // must not have its first events fall on the floor. Bounded, because an adapter nobody ever
+  // subscribes to must not grow without limit.
+  let pending: Array<ProviderRuntimeEvent> = [];
+  const PENDING_LIMIT = 1_000;
+
+  const publish = (events: ReadonlyArray<ProviderRuntimeEvent>): void => {
+    const sink = emit.get("*");
+    if (sink === undefined) {
+      pending = [...pending, ...events].slice(-PENDING_LIMIT);
+      return;
+    }
+    sink(events);
+  };
+  const readers = new Map<string, { stop: () => void; wake: () => void }>();
+  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const idlePollMs = input.idlePollMs ?? IDLE_POLL_MS;
 
   const refuse = (operation: string, cause: unknown) =>
     new ProviderAdapterRequestError({
       provider: ATLAS_DRIVER_KIND,
-      operation,
+      // The schema's field is `method`, and it is REQUIRED. This passed `operation`, so
+      // constructing the error threw `Missing key at ["method"]` and the refusal never
+      // reached the user at all — every failure path in this adapter raised a schema defect
+      // instead of Atlas's sentence.
+      method: operation,
       detail:
         cause instanceof AtlasRefusal
           ? // Atlas's own words. The refusal is the product — "openai does not serve model X
@@ -261,6 +345,104 @@ const makeAtlasAdapter = (input: {
             cause.message
           : String((cause as { message?: unknown })?.message ?? cause),
     });
+
+  /**
+   * Drive one thread's feed until the session stops.
+   *
+   * This is a LOOP, not a poll: it drains greedily while Atlas has events, parks on the gate
+   * when it does not, and backs off on failure without moving the cursor — so a node that
+   * blips costs a delay rather than a hole in the transcript. Events that arrive long after
+   * the send that caused them (a tool call, a completion, an approval request) are delivered
+   * because something is still reading, which is exactly what a single fire-and-forget read
+   * after `sendTurn` could never do.
+   */
+  const startReader = (threadId: string): void => {
+    if (readers.has(threadId)) return;
+    let stopped = false;
+    const gate = makeGate(sleep);
+    readers.set(threadId, {
+      stop: () => {
+        stopped = true;
+        gate.wake();
+      },
+      wake: gate.wake,
+    });
+    void (async () => {
+      let backoff = 0;
+      while (!stopped) {
+        const live = threads.get(threadId);
+        if (live === undefined) break;
+        try {
+          const page = await readEvents(input.endpoint, threadId, live.cursor);
+          backoff = 0;
+          if (page.events.length > 0) {
+            const current = threads.get(threadId);
+            if (current === undefined) break;
+            threads.set(threadId, { ...current, cursor: page.cursor });
+            observe(threadId, page.events);
+            const projected = page.events.flatMap((event) =>
+              projectLifecycleEvent(event, {
+                threadId: threadId as unknown as ThreadId,
+                createdAt: nowIso(),
+              }),
+            );
+            if (projected.length > 0) publish(projected);
+            // More may already be waiting; ask again before parking.
+            continue;
+          }
+          await gate.wait(idlePollMs);
+        } catch {
+          // A feed read that fails must not kill the reader: Atlas's log is durable and the
+          // cursor is untouched, so the next attempt resumes at the same place. Backing off
+          // rather than spinning keeps a down node from being hammered.
+          backoff = backoff === 0 ? RETRY_FLOOR_MS : Math.min(backoff * 2, RETRY_CEILING_MS);
+          await gate.wait(backoff);
+        }
+      }
+      readers.delete(threadId);
+    })();
+  };
+
+  /**
+   * Track the facts the driver itself needs out of the log.
+   *
+   * `WaitingForInput` carries the `request_ref` a decision must name, and it is only ever
+   * stated by the authority — so it is read off the feed rather than invented here.
+   */
+  const observe = (threadId: string, events: ReadonlyArray<AtlasLifecycleEvent>): void => {
+    for (const event of events) {
+      const live = threads.get(threadId);
+      if (live === undefined) continue;
+      // `kind` IS the observation kind the host wrote (`observation_kind` in
+      // atlas-host/src/run_supervisor.rs), and the observation itself rides at
+      // `payload.observation` — the same nesting `projectLifecycleEvent` reads a stop out of.
+      const observation = event.payload["observation"] as Record<string, unknown> | undefined;
+      if (event.kind === "waiting_for_input") {
+        const requestRef = observation?.["request_ref"];
+        // Only the authority names the ref a decision must quote; inventing one here would
+        // produce a command Atlas cannot match to anything.
+        if (typeof requestRef === "string") {
+          threads.set(threadId, { ...live, awaitingRef: requestRef });
+        }
+      } else if (event.kind === "input.resolved") {
+        threads.set(threadId, { ...live, awaitingRef: undefined });
+      } else if (event.kind === "provider.stopped") {
+        // The turn is over, so the identity that named it is spent: the next send is a new
+        // turn and must not dedupe onto this one's receipt.
+        threads.set(threadId, {
+          ...live,
+          pendingRequestId: undefined,
+          activeTurnId: undefined,
+          awaitingRef: undefined,
+        });
+      }
+    }
+  };
+
+  const stopReader = (threadId: string): void => {
+    readers.get(threadId)?.stop();
+    readers.delete(threadId);
+  };
 
   return {
     provider: ATLAS_DRIVER_KIND,
@@ -272,13 +454,24 @@ const makeAtlasAdapter = (input: {
     startSession: (start) =>
       Effect.sync(() => {
         const threadId = String(start.threadId);
-        threads.set(threadId, { cursor: { epoch: 1, after: 0 }, activeTurnId: undefined });
+        // Resume where the last process stopped. Resetting to `{epoch:1, after:0}` here — as
+        // this driver used to — threw away the persisted position on every restart and
+        // re-rendered the whole thread; an unparseable blob is the only case that replays.
+        const resumed = parseAtlasCursor(start.resumeCursor) ?? { epoch: 1, after: 0 };
+        threads.set(threadId, {
+          cursor: resumed,
+          activeTurnId: undefined,
+          pendingRequestId: undefined,
+          awaitingRef: undefined,
+        });
+        startReader(threadId);
         return {
           provider: ATLAS_DRIVER_KIND,
           providerInstanceId: input.instanceId as never,
           status: "ready" as const,
           runtimeMode: start.runtimeMode,
           threadId: start.threadId,
+          resumeCursor: resumed,
           createdAt: nowIso(),
           updatedAt: nowIso(),
         };
@@ -291,7 +484,13 @@ const makeAtlasAdapter = (input: {
           const live = threads.get(threadId) ?? {
             cursor: { epoch: 1, after: 0 },
             activeTurnId: undefined,
+            pendingRequestId: undefined,
+            awaitingRef: undefined,
           };
+          // A session may not have been started through this adapter instance (a recovery
+          // path); the reader is what makes the feed live, so ensure one either way.
+          if (!threads.has(threadId)) threads.set(threadId, live);
+          startReader(threadId);
           // The picker's slug carries BOTH facts. A slug with no provider is refused rather
           // than guessed at — guessing is precisely what the host stopped doing.
           const slug = turn.modelSelection?.model;
@@ -303,9 +502,13 @@ const makeAtlasAdapter = (input: {
               message: `model selection ${JSON.stringify(slug)} does not name a provider; expected "provider/model_id"`,
             });
           }
-          // The request id IS the turn id: Atlas dedupes on it, so a redelivered send resolves
-          // to the same run rather than opening a second one.
-          const requestId = `t3:${threadId}:${Date.now()}`;
+          const text = turn.input ?? "";
+          // Stable identity, minted BEFORE the network attempt and reused if this same send is
+          // retried. Atlas dedupes on it and hands back the original receipt, so a lost 202
+          // costs a re-post and not a second run.
+          const requestId =
+            live.pendingRequestId ?? turnRequestId({ threadId, cursor: live.cursor, text });
+          threads.set(threadId, { ...live, pendingRequestId: requestId });
           const run = await startTurn(input.endpoint, {
             ...atlasStartCommand({
               fleetId: input.fleetId,
@@ -313,18 +516,24 @@ const makeAtlasAdapter = (input: {
               runId: requestId,
               requestId,
               actor: "t3",
-              text: turn.input ?? "",
+              text,
               binding: binding ?? undefined,
               workspaceId: undefined,
             }),
           });
           const runId = typeof run["run_id"] === "string" ? run["run_id"] : requestId;
-          threads.set(threadId, { ...live, activeTurnId: runId });
-          void pump(threadId);
+          const committed = threads.get(threadId) ?? live;
+          threads.set(threadId, { ...committed, activeTurnId: runId });
+          // Wake the reader rather than reading here: one owner of the cursor means a send and
+          // the loop can never advance it past each other.
+          readers.get(threadId)?.wake();
           return {
             threadId: turn.threadId,
             turnId: TurnId.make(runId),
-            resumeCursor: live.cursor,
+            // The cursor as it stands now. `ProviderService` persists exactly this value onto
+            // the session binding (`ProviderService.ts` `directory.upsert({ resumeCursor })`),
+            // which is what `startSession` reads back on the next process.
+            resumeCursor: (threads.get(threadId) ?? committed).cursor,
           };
         },
         catch: (cause) => refuse("sendTurn", cause),
@@ -332,27 +541,67 @@ const makeAtlasAdapter = (input: {
 
     interruptTurn: (threadId) =>
       Effect.tryPromise({
-        try: () =>
-          cancelTurn(input.endpoint, {
-            threadId: String(threadId),
+        try: () => {
+          const key = String(threadId);
+          const live = threads.get(key);
+          return cancelTurn(input.endpoint, {
+            threadId: key,
             fleetId: input.fleetId,
-            requestId: `t3:cancel:${String(threadId)}:${Date.now()}`,
-          }),
+            // Named after the turn it cancels, not the clock: a redelivered cancel resolves to
+            // the same receipt instead of committing a second one.
+            requestId: `t3:cancel:${key}:${live?.activeTurnId ?? live?.pendingRequestId ?? "current"}`,
+          });
+        },
         catch: (cause) => refuse("interruptTurn", cause),
       }),
 
-    // Approvals and structured questions ARE modelled by Atlas (`Kind::Approve`, `Kind::Answer`
-    // on the feed), but they are appended to the feed socket rather than issued as console
-    // commands, and this driver does not hold that socket yet. Refused rather than accepted
-    // and dropped: a user who approves a tool call and is silently ignored is worse off than
-    // one who is told the path does not exist.
-    respondToRequest: () => unsupported("respondToRequest"),
-    respondToUserInput: () => unsupported("respondToUserInput"),
+    /**
+     * Approve or decline a tool call.
+     *
+     * Atlas models this as `RunCommand::ResolveInput` on the console command endpoint, so the
+     * decision goes to the authority over the same seam as start and cancel. The `request_ref`
+     * is the one the feed stated in `WaitingForInput`; if the run is not waiting, Atlas
+     * refuses and the user is told why rather than having the click swallowed.
+     */
+    respondToRequest: (threadId, requestId, decision) =>
+      Effect.tryPromise({
+        try: () => {
+          const key = String(threadId);
+          const requestRef = threads.get(key)?.awaitingRef ?? String(requestId);
+          return resolveInput(input.endpoint, {
+            threadId: key,
+            fleetId: input.fleetId,
+            requestId: `t3:resolve:${key}:${requestRef}:${fingerprint(String(decision))}`,
+            requestRef,
+            // The decision travels whole. Collapsing `acceptForSession`/`acceptAlways` into a
+            // bare boolean here would throw away scope the authority is entitled to record.
+            answer: { kind: "approval", decision: String(decision) },
+          });
+        },
+        catch: (cause) => refuse("respondToRequest", cause),
+      }),
+
+    /** The same seam, carrying a structured answer instead of a decision. */
+    respondToUserInput: (threadId, requestId, answers) =>
+      Effect.tryPromise({
+        try: () => {
+          const key = String(threadId);
+          const requestRef = threads.get(key)?.awaitingRef ?? String(requestId);
+          return resolveInput(input.endpoint, {
+            threadId: key,
+            fleetId: input.fleetId,
+            requestId: `t3:answer:${key}:${requestRef}:${fingerprint(JSON.stringify(answers))}`,
+            requestRef,
+            answer: { kind: "answer", answers },
+          });
+        },
+        catch: (cause) => refuse("respondToUserInput", cause),
+      }),
 
     stopSession: (threadId) =>
       Effect.sync(() => {
+        stopReader(String(threadId));
         threads.delete(String(threadId));
-        emit.delete(String(threadId));
       }),
     listSessions: () => Effect.succeed([]),
     hasSession: (threadId) => Effect.succeed(threads.has(String(threadId))),
@@ -360,44 +609,33 @@ const makeAtlasAdapter = (input: {
     rollbackThread: () => unsupported("rollbackThread"),
     stopAll: () =>
       Effect.sync(() => {
+        for (const threadId of [...readers.keys()]) stopReader(threadId);
         threads.clear();
         emit.clear();
+        pending = [];
       }),
-    streamEvents: Stream.asyncPush<ProviderRuntimeEvent>((push) =>
+    // `Stream.asyncPush` does not exist in this Effect (4.0.0-beta) — the call threw
+    // `asyncPush is not a function` while BUILDING the adapter object, so every Atlas session
+    // died at construction. No test had ever stood the adapter up, so the whole driver was
+    // dead on a path that typechecked. `Stream.callback` is the constructor this version
+    // ships, and it is what `AgentSdkAdapter` reaches for the pub/sub equivalent of.
+    streamEvents: Stream.callback<ProviderRuntimeEvent>((queue) =>
       Effect.sync(() => {
-        emit.set("*", (events) => events.forEach((event) => push.single(event)));
+        emit.set("*", (events) => {
+          for (const event of events) Queue.offerUnsafe(queue, event);
+        });
+        // Anything the reader projected before this subscription existed is delivered now,
+        // in order, rather than lost behind an already-advanced cursor.
+        if (pending.length > 0) {
+          const buffered = pending;
+          pending = [];
+          for (const event of buffered) Queue.offerUnsafe(queue, event);
+        }
         return Effect.sync(() => emit.delete("*"));
       }),
     ),
   };
-
-  /**
-   * Drain everything after the thread's cursor and publish it.
-   *
-   * Cursor-driven rather than tailing, so a reconnect resumes where it stopped: re-reading
-   * from zero would re-render the thread, and reading from "now" would drop whatever landed
-   * while the reader was away.
-   */
-  async function pump(threadId: string): Promise<void> {
-    const live = threads.get(threadId);
-    if (live === undefined) return;
-    try {
-      const page = await readEvents(input.endpoint, threadId, live.cursor);
-      threads.set(threadId, { ...live, cursor: page.cursor });
-      const projected = page.events.flatMap((event) =>
-        projectLifecycleEvent(event, {
-          threadId: threadId as unknown as ThreadId,
-          createdAt: nowIso(),
-        }),
-      );
-      if (projected.length > 0) emit.get("*")?.(projected);
-    } catch {
-      // A feed read that fails must not kill the turn: Atlas's log is durable and the next
-      // pump resumes from the same cursor, so this degrades to a delay rather than a loss.
-    }
-  }
 };
-
 export interface AtlasDriverDeps {
   readonly fetch?: FetchLike;
 }

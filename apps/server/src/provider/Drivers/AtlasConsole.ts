@@ -449,3 +449,107 @@ export const readCatalog = async (
     });
   });
 };
+
+/**
+ * Read a persisted `resumeCursor` back into a cursor, or `null` if it is not one.
+ *
+ * T3 stores the cursor as an opaque `Schema.Unknown` blob on the session binding, so what
+ * comes back on a restart is genuinely untyped and may be a value some older build wrote.
+ * A shape that does not parse yields `null` and the caller starts from the beginning of the
+ * epoch — a replay, which the projection is idempotent under. Guessing a cursor from a
+ * partial shape would silently skip events, which is worse than replaying them.
+ */
+export const parseAtlasCursor = (raw: unknown): AtlasCursor | null => {
+  if (typeof raw !== "object" || raw === null) return null;
+  const epoch = (raw as Record<string, unknown>)["epoch"];
+  const after = (raw as Record<string, unknown>)["after"];
+  if (typeof epoch !== "number" || !Number.isFinite(epoch) || epoch < 1) return null;
+  if (typeof after !== "number" || !Number.isFinite(after) || after < 0) return null;
+  return { epoch, after };
+};
+
+/**
+ * FNV-1a over a string, as 8 lowercase hex digits.
+ *
+ * Used only to give a command a STABLE name derived from its own content. It is not a
+ * security primitive and does not need to be one: the property that matters is that the same
+ * logical send computes the same id on a retry, and the wall clock does not have that
+ * property.
+ */
+export const fingerprint = (value: string): string => {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+};
+
+/**
+ * The idempotency key for a turn, derived from durable state instead of the clock.
+ *
+ * Atlas dedupes commands on `request_id` against a durable receipt table
+ * (`atlas-host/src/run_supervisor.rs`: `load_receipt(ctx.db(), &command.request_id)` marks a
+ * repeat `duplicate` and returns the ORIGINAL receipt). That mechanism only works if the
+ * caller sends the same id twice, and `Date.now()` guarantees it never does — a retry after a
+ * lost 202 opened a second run.
+ *
+ * The cursor is the durable position in the thread's log, so `(epoch, after)` plus a
+ * fingerprint of the turn's own content names this send and no other: a retry before any new
+ * event computes an identical id and Atlas returns the first receipt, while the next real
+ * turn is sent from a cursor the reader has since advanced and so gets its own id.
+ */
+export const turnRequestId = (input: {
+  readonly threadId: string;
+  readonly cursor: AtlasCursor;
+  readonly text: string;
+}): string =>
+  `t3:${input.threadId}:${input.cursor.epoch}:${input.cursor.after}:${fingerprint(input.text)}`;
+
+/**
+ * Answer an Atlas `WaitingForInput` — the approval/answer path.
+ *
+ * This is a console COMMAND (`RunCommand::ResolveInput { request_ref, answer }`), on the same
+ * `/commands` endpoint as start and cancel — not, as this driver previously claimed, something
+ * only reachable over a feed socket. The host requires the run to be in `WaitingForInput` and
+ * moves it back to `Running` (`atlas-host/src/run_supervisor.rs`), so a decision that arrives
+ * for a run that is not waiting is REFUSED with Atlas's own words rather than dropped.
+ */
+export const resolveInput = async (
+  endpoint: AtlasEndpoint,
+  input: {
+    readonly threadId: string;
+    readonly fleetId: string;
+    readonly requestId: string;
+    readonly requestRef: string;
+    readonly answer: unknown;
+  },
+): Promise<void> => {
+  const response = await endpoint.fetch(
+    `${endpoint.baseUrl}/console/v1/threads/${encodeURIComponent(input.threadId)}/commands`,
+    {
+      method: "POST",
+      headers: headers(endpoint),
+      body: JSON.stringify({
+        protocol_version: 1,
+        fleet_id: input.fleetId,
+        thread_id: input.threadId,
+        run_id: input.threadId,
+        request_id: input.requestId,
+        actor: "t3",
+        command: { kind: "resolve_input", request_ref: input.requestRef, answer: input.answer },
+      }),
+    },
+  );
+  if (response.status < 200 || response.status >= 300) {
+    const parsed = parse(await response.text());
+    throw new AtlasRefusal({
+      status: response.status,
+      code: typeof parsed?.["code"] === "string" ? (parsed["code"] as string) : "unknown",
+      message:
+        typeof parsed?.["message"] === "string"
+          ? (parsed["message"] as string)
+          : `resolve_input answered ${response.status}`,
+    });
+  }
+};

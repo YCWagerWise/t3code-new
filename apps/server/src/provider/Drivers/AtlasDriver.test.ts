@@ -1,5 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Stream from "effect/Stream";
+import { ThreadId } from "@t3tools/contracts";
 
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import {
@@ -9,7 +12,7 @@ import {
   bindingSlug,
   type FetchLike,
 } from "./AtlasConsole.ts";
-import { classifyHandshake, probeAtlasHost } from "./AtlasDriver.ts";
+import { classifyHandshake, makeAtlasAdapter, probeAtlasHost } from "./AtlasDriver.ts";
 
 /**
  * The Atlas provider exists because the ACP runtime the other two drivers spawn cannot be
@@ -246,5 +249,368 @@ describe("provider registration", () => {
     // A default config must be usable with no settings at all, or the driver cannot be
     // bootstrapped before a user has configured it.
     expect(() => atlas?.defaultConfig()).not.toThrow();
+  });
+});
+
+// ───────────────────── the adapter, driven against a node ─────────────────────
+
+/**
+ * A stand-in atlas-host that behaves like the real one on the things that matter here: it
+ * dedupes commands on `request_id` against a receipt table, serves `/events` as pages keyed by
+ * a cursor, and only reveals an event once it has actually been appended.
+ *
+ * The point of testing against this rather than a canned fetch is that the reviewer's finding
+ * was about BEHAVIOUR OVER TIME — events that arrive after the send, a cursor that survives a
+ * restart, a retry that must not open a second run. A one-shot `respondWith` cannot express any
+ * of those, which is why the earlier round shipped a driver whose feed was dead.
+ *
+ * The command semantics this fake asserts are pinned against the real supervisor separately, by
+ * `a_lens_resolves_a_waiting_run_with_the_json_it_actually_sends` in
+ * `atlas-host/src/run_supervisor.rs` — so this is not a fake agreeing with its own author.
+ */
+const makeFakeAtlas = () => {
+  const commands: Array<Record<string, unknown>> = [];
+  const receipts = new Map<string, unknown>();
+  const log: Array<Record<string, unknown>> = [];
+  let failReads = 0;
+  let reads = 0;
+  let consumedUpTo = 0;
+
+  const append = (kind: string, payload: Record<string, unknown>): void => {
+    log.push({
+      epoch: 1,
+      seq: log.length + 1,
+      event_id: `ev-${log.length + 1}`,
+      run_id: "run-1",
+      attempt_id: "att-1",
+      kind,
+      payload_json: JSON.stringify(payload),
+    });
+  };
+
+  const fetch: FetchLike = (url, init) => {
+    const href = String(url);
+    if (href.includes("/events")) {
+      reads += 1;
+      if (failReads > 0) {
+        failReads -= 1;
+        return Promise.resolve({ status: 503, text: () => Promise.resolve("node unavailable") });
+      }
+      const after = Number(new URL(href).searchParams.get("after") ?? 0);
+      // The reader asking from `after` is proof it has consumed everything up to it — which is
+      // how a test waits for the reader to catch up without reaching into its internals.
+      consumedUpTo = Math.max(consumedUpTo, after);
+      const events = log.filter((entry) => Number(entry["seq"]) > after);
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify({ events })),
+      });
+    }
+    const body = JSON.parse(
+      String((init as { body?: string } | undefined)?.body ?? "{}"),
+    ) as Record<string, unknown>;
+    const requestId = String(body["request_id"]);
+    // The real host's dedupe: a repeated request_id returns the ORIGINAL receipt and commits
+    // nothing new (`load_receipt` in atlas-host/src/run_supervisor.rs).
+    if (receipts.has(requestId)) {
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify(receipts.get(requestId))),
+      });
+    }
+    commands.push(body);
+    const receipt = { accepted: true, duplicate: false, run: { run_id: "run-1" } };
+    receipts.set(requestId, { ...receipt, duplicate: true });
+    return Promise.resolve({ status: 200, text: () => Promise.resolve(JSON.stringify(receipt)) });
+  };
+
+  return {
+    fetch,
+    commands,
+    append,
+    reads: () => reads,
+    consumedUpTo: () => consumedUpTo,
+    failNextReads: (count: number) => {
+      failReads = count;
+    },
+    resolveCommand: () =>
+      commands.find((c) => (c["command"] as Record<string, unknown>)?.["kind"] === "resolve_input"),
+    starts: () =>
+      commands.filter((c) => (c["command"] as Record<string, unknown>)?.["kind"] === "start"),
+  };
+};
+
+const stopObservation = () => ({
+  observation: { type: "provider_stopped", stop: { outcome: "completed" } },
+});
+
+/** A sleep the reader can be driven by without waiting on wall time. */
+const instantSleep = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Wait for a CONDITION, never for a fixed number of ticks.
+ *
+ * Counting event-loop turns passes on an idle machine and fails on a busy one — this test file
+ * had exactly that flake when the whole server suite ran in parallel. Polling the condition is
+ * deterministic under any load; the cap only exists so a genuine hang fails loudly instead of
+ * hanging the suite.
+ */
+const waitFor = async (condition: () => boolean, what: string): Promise<void> => {
+  for (let attempt = 0; attempt < 3_000; attempt += 1) {
+    if (condition()) return;
+    await instantSleep();
+  }
+  throw new Error(`timed out waiting for ${what}`);
+};
+
+/** Let pending work run when the assertion is that NOTHING happened. */
+const settle = async (): Promise<void> => {
+  for (let index = 0; index < 25; index += 1) await instantSleep();
+};
+
+const adapterFor = (node: ReturnType<typeof makeFakeAtlas>) =>
+  makeAtlasAdapter({
+    endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: undefined, fetch: node.fetch },
+    fleetId: "default",
+    instanceId: "atlas-1",
+    sleep: instantSleep,
+    idlePollMs: 0,
+  });
+
+const startSession = (adapter: ReturnType<typeof adapterFor>, resumeCursor?: unknown) =>
+  Effect.runPromise(
+    adapter.startSession({
+      threadId: ThreadId.make("thr-1"),
+      runtimeMode: "local",
+      ...(resumeCursor === undefined ? {} : { resumeCursor }),
+    } as never),
+  );
+
+const collect = (adapter: ReturnType<typeof adapterFor>, sink: Array<string>) =>
+  Effect.runFork(
+    Stream.runForEach(adapter.streamEvents, (event) => Effect.sync(() => sink.push(event.type))),
+  );
+
+const teardown = async (
+  adapter: ReturnType<typeof adapterFor>,
+  fiber: Fiber.Fiber<unknown, unknown>,
+) => {
+  await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+  await Effect.runPromise(Fiber.interrupt(fiber));
+};
+
+describe("the Atlas feed, once a session is open", () => {
+  it("delivers events that arrive long after the send, not just the ones already there", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    await Effect.runPromise(
+      adapter.sendTurn({ threadId: ThreadId.make("thr-1"), input: "hello" } as never),
+    );
+    await settle();
+    // The node has said nothing yet, so neither has the stream.
+    expect(seen).toEqual([]);
+
+    // Now it speaks — well after `sendTurn` returned. A fire-and-forget read taken at send time
+    // cannot see either of these; a live reader must.
+    node.append("command.accepted", { command: { kind: "start" } });
+    node.append("provider.stopped", stopObservation());
+    await waitFor(() => seen.length === 2, "the late events to be delivered");
+    await teardown(adapter, fiber);
+
+    expect(seen).toEqual(["turn.started", "turn.completed"]);
+  });
+
+  it("keeps reading after a failed read instead of dying with it", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    node.failNextReads(3);
+    node.append("command.accepted", { command: { kind: "start" } });
+    // The reads failed, the reader backed off, and the event still lands — the cursor was never
+    // advanced past something that was not delivered.
+    await waitFor(() => seen.length === 1, "the event to survive three failed reads");
+    await teardown(adapter, fiber);
+
+    expect(node.reads()).toBeGreaterThan(3);
+    expect(seen).toEqual(["turn.started"]);
+  });
+});
+
+describe("the cursor across a restart", () => {
+  it("resumes from the persisted cursor instead of replaying the thread from zero", async () => {
+    const node = makeFakeAtlas();
+    const adapterA = adapterFor(node);
+    const seenA: Array<string> = [];
+    const fiberA = collect(adapterA, seenA);
+    await startSession(adapterA);
+    node.append("command.accepted", { command: { kind: "start" } });
+    await waitFor(() => seenA.length === 1, "the first event to be consumed");
+    const turn = await Effect.runPromise(
+      adapterA.sendTurn({ threadId: ThreadId.make("thr-1"), input: "hi" } as never),
+    );
+    await teardown(adapterA, fiberA);
+
+    // This is the value ProviderService persists onto the session binding
+    // (`directory.upsert({ resumeCursor })` in ProviderService.ts).
+    expect(turn.resumeCursor).toEqual({ epoch: 1, after: 1 });
+
+    // A new process, same durable log, hydrated from what was persisted.
+    const adapterB = adapterFor(node);
+    const seenB: Array<string> = [];
+    const fiberB = collect(adapterB, seenB);
+    const session = await startSession(adapterB, turn.resumeCursor);
+    expect(session.resumeCursor).toEqual({ epoch: 1, after: 1 });
+    await settle();
+    // The already-consumed event is NOT re-delivered...
+    expect(seenB).toEqual([]);
+    // ...but anything after it still is.
+    node.append("provider.stopped", stopObservation());
+    await waitFor(() => seenB.length === 1, "the post-restart event");
+    await teardown(adapterB, fiberB);
+    expect(seenB).toEqual(["turn.completed"]);
+  });
+
+  it("replays rather than skips when the persisted cursor is unreadable", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const session = await startSession(adapter, { nonsense: true });
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    // Replaying costs a re-render; guessing a position would silently drop events.
+    expect(session.resumeCursor).toEqual({ epoch: 1, after: 0 });
+  });
+});
+
+describe("turn identity", () => {
+  it("commits one run when the same logical send is retried after a lost response", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    await startSession(adapter);
+    const send = () =>
+      Effect.runPromise(
+        adapter.sendTurn({ threadId: ThreadId.make("thr-1"), input: "same turn" } as never),
+      );
+    const first = await send();
+    // The caller never saw the receipt and sends the identical turn again.
+    const second = await send();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+
+    expect(node.starts()).toHaveLength(1);
+    expect(first.turnId).toEqual(second.turnId);
+    // No wall-clock millisecond anywhere in the identity.
+    expect(node.commands[0]?.["request_id"]).not.toMatch(/\d{13}/);
+  });
+
+  it("gives a genuinely new turn its own identity", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    await Effect.runPromise(
+      adapter.sendTurn({ threadId: ThreadId.make("thr-1"), input: "first" } as never),
+    );
+    node.append("command.accepted", { command: { kind: "start" } });
+    node.append("provider.stopped", stopObservation());
+    await waitFor(() => seen.length === 2, "the first turn to settle");
+    await Effect.runPromise(
+      adapter.sendTurn({ threadId: ThreadId.make("thr-1"), input: "second" } as never),
+    );
+    await teardown(adapter, fiber);
+
+    expect(node.starts()).toHaveLength(2);
+    expect(node.commands[0]?.["request_id"]).not.toEqual(node.commands[1]?.["request_id"]);
+  });
+});
+
+describe("approvals", () => {
+  it("answers the request_ref the host stated, over the console command path", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    // The authority says it is waiting, and names the ref.
+    node.append("waiting_for_input", {
+      observation: { type: "waiting_for_input", request_ref: "req-from-atlas" },
+    });
+    await waitFor(() => node.consumedUpTo() >= 1, "the reader to consume the waiting event");
+    await Effect.runPromise(
+      adapter.respondToRequest(
+        ThreadId.make("thr-1"),
+        "t3-local-id" as never,
+        "acceptForSession" as never,
+      ),
+    );
+    await teardown(adapter, fiber);
+
+    const command = node.resolveCommand()?.["command"] as Record<string, unknown>;
+    // The ref is Atlas's, not T3's local id — a ref invented here matches nothing.
+    expect(command["request_ref"]).toEqual("req-from-atlas");
+    // The decision travels whole rather than collapsing into a boolean.
+    expect(command["answer"]).toEqual({ kind: "approval", decision: "acceptForSession" });
+  });
+
+  it("carries a structured answer through the same seam", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    node.append("waiting_for_input", {
+      observation: { type: "waiting_for_input", request_ref: "ask-1" },
+    });
+    await waitFor(() => node.consumedUpTo() >= 1, "the reader to consume the waiting event");
+    await Effect.runPromise(
+      adapter.respondToUserInput(
+        ThreadId.make("thr-1"),
+        "ask-1" as never,
+        { branch: "main" } as never,
+      ),
+    );
+    await teardown(adapter, fiber);
+
+    expect((node.resolveCommand()?.["command"] as Record<string, unknown>)["answer"]).toEqual({
+      kind: "answer",
+      answers: { branch: "main" },
+    });
+  });
+
+  it("surfaces the host's refusal verbatim when the run is not waiting", async () => {
+    const node = makeFakeAtlas();
+    const refusing: FetchLike = (url, init) =>
+      String(url).includes("/events")
+        ? node.fetch(url, init)
+        : Promise.resolve({
+            status: 409,
+            text: () =>
+              Promise.resolve(
+                JSON.stringify({ code: "conflict", message: "run is not waiting for input" }),
+              ),
+          });
+    const adapter = makeAtlasAdapter({
+      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: undefined, fetch: refusing },
+      fleetId: "default",
+      instanceId: "atlas-1",
+      sleep: instantSleep,
+      idlePollMs: 0,
+    });
+    await startSession(adapter);
+    // `flip` turns the expected failure into the success channel: the refusal IS the result
+    // under test, so a passing turn here would be the bug.
+    const refusal = await Effect.runPromise(
+      Effect.flip(
+        adapter.respondToRequest(ThreadId.make("thr-1"), "req-1" as never, "accept" as never),
+      ),
+    );
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    // Atlas's own sentence, not "approval failed" — it is the only actionable part.
+    expect(String((refusal as { detail: string }).detail)).toContain(
+      "run is not waiting for input",
+    );
   });
 });
