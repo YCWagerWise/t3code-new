@@ -766,14 +766,30 @@ fn now_iso() -> String {
 
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
-async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
+/// FALLIBLE (#362). This used to return `()` and `return` on every failure
+/// with only a `tracing::error!`. The caller had already sent
+/// `Exit(Success){sequence}` for the turn by then, so a project store that
+/// could not be read, or a `save_thread` that failed, produced the exact
+/// reducer-visible lie this stack keeps reintroducing: the client folds the
+/// dispatch as ACCEPTED while no durable thread row exists and no shell/thread
+/// projection was ever recorded. Schema-valid ACK, lifecycle-invalid state.
+///
+/// Returning `Result` is only half of it — the ACK also has to move. The caller
+/// now awaits this BEFORE it acknowledges, so "accepted" means the durable
+/// launch state actually exists. The model run stays async; it is the
+/// ACCEPTANCE BOUNDARY that moved, not the work.
+async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(), String> {
     let thread_id = command
         .get("threadId")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
     if thread_id.is_empty() {
-        return;
+        // Not a failure: a command with no threadId is not a first-turn
+        // bootstrap and has nothing to announce. Distinguishing this from the
+        // error paths below is the whole reason this returns Result rather
+        // than Option.
+        return Ok(());
     }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
@@ -821,13 +837,14 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
-                    return;
+                    return Err(
+                        "no seed project in the store; refusing to invent a project id for this thread"
+                            .into(),
+                    );
                 }
             },
             Err(e) => {
-                tracing::error!(%e, "ensure_thread_on_shell: project store unreadable");
-                return;
+                return Err(format!("project store unreadable: {e}"));
             }
         },
     };
@@ -895,11 +912,13 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // Durable commit BEFORE the thread becomes observable: if the thread row
     // fails to persist, do not announce it (it would vanish on reload). No
     // process-local rollback to do — the store IS the state.
-    if let Err(e) = state.rt.save_thread(&thread).await {
-        tracing::error!(%e, %thread_id, "persist thread failed — not announcing on shell");
-        return;
-    }
+    state
+        .rt
+        .save_thread(&thread)
+        .await
+        .map_err(|e| format!("persisting thread {thread_id} failed: {e}"))?;
     upsert_thread_on_shell(state, thread).await;
+    Ok(())
 }
 
 /// Refresh the shell projection for one thread and announce it to every shell
@@ -2800,19 +2819,29 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // carrying the original timestamp so the row is identical.
                 match state.rt.pending_user_inputs(thread_id).await {
                     Ok(asks) => {
+                        // #293: the SDK hands these back TYPED now, so the
+                        // four `unwrap_or`s that used to live here are gone —
+                        // not tightened, gone, because there is no longer an
+                        // Option to default. The two that mattered:
+                        // `sessionId` defaulted to `""`, projecting a real
+                        // parked ask under an identity no answer could route
+                        // to; and `createdAt` defaulted to the SERVER'S CURRENT
+                        // CLOCK, so a question parked for an hour rendered as
+                        // brand new on every reconnect and no staleness or
+                        // timeout UI could ever fire against it. A durable
+                        // record's age is a fact about the record.
                         for ask in asks {
-                            let session_id = ask["sessionId"].as_str().unwrap_or("");
                             activities.push(json!({
-                                "id": format!("user-input:{session_id}"),
+                                "id": format!("user-input:{}", ask.session_id),
                                 "tone": "approval",
                                 "kind": "user-input.requested",
-                                "summary": ask["prompt"].as_str().unwrap_or("The agent has a question"),
+                                "summary": ask.prompt,
                                 "payload": {
-                                    "requestId": session_id,
-                                    "prompt": ask["prompt"].clone(),
-                                    "questions": ask["questions"].clone(),
+                                    "requestId": ask.session_id,
+                                    "prompt": ask.prompt,
+                                    "questions": ask.questions,
                                 },
-                                "createdAt": ask["requestedAt"].as_str().unwrap_or(now.as_str()),
+                                "createdAt": ask.requested_at,
                             }));
                         }
                     }
@@ -4386,13 +4415,34 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // So: accepted-ack for the async lane, applied-ack for the rest.
             let async_lane =
                 command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
+            // #362: ACCEPTED HAS TO MEAN SOMETHING.
+            //
+            // The accepted-ack above is right about the TURN — nobody should
+            // hold the request open for a model call. It was wrong about the
+            // BOOTSTRAP. `ensure_thread_on_shell` ran after the ack and
+            // swallowed its own failures, so an unreadable project store or a
+            // failed `save_thread` left the client folding the dispatch as
+            // accepted with no durable thread row and no shell projection
+            // behind it. The turn then ran against a thread that does not
+            // exist, or did not run at all, and nothing on the wire ever said
+            // so.
+            //
+            // The fix is not to make the turn synchronous. It is to commit the
+            // durable launch state BEFORE acknowledging, and let only the model
+            // run stay async. So the acceptance boundary moves; the work does
+            // not.
             if async_lane {
+                if model.is_some() {
+                    if let Err(e) = ensure_thread_on_shell(&state, &command).await {
+                        exit_failure(tx, &id, &format!("thread.turn.start bootstrap failed: {e}"));
+                        return;
+                    }
+                }
                 exit_success(tx, &id, json!({ "sequence": seq }));
             }
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
                     if let Some(model) = model {
-                        ensure_thread_on_shell(&state, &command).await;
                         run_turn(command, model, state.clone());
                     }
                 }

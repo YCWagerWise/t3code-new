@@ -67,6 +67,21 @@ async fn drop_runtime_kv(state: &AppState) {
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
 }
 
+/// #362: break the PROJECT store so first-turn bootstrap cannot resolve a
+/// project id.
+///
+/// Same discipline as `break_topic_publish` below — drop the real table the
+/// real query reads (`OrchStore::projects` runs
+/// `SELECT id, json FROM projects ORDER BY created_at ASC`), so the failure is
+/// deterministic and happens at the true seam. No test-only fault hook is
+/// bolted onto the product, which matters here because the whole finding is
+/// about a product-side path swallowing a real store failure.
+async fn break_project_store(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE projects", vec![]).await.unwrap();
+}
+
 /// #202: break the broker's subscriber table so every `topic_publish` fails.
 ///
 /// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
@@ -2625,6 +2640,96 @@ async fn dispatch_acks_with_sequence() {
     assert!(frames[0]["exit"]["value"]["sequence"].is_number());
 }
 
+/// #362: a first turn whose durable bootstrap FAILS must not be acknowledged
+/// as accepted.
+///
+/// The ack for `thread.turn.start` legitimately means ACCEPTED rather than
+/// DONE — nobody should hold the request open for a model call. But acceptance
+/// was being sent before the bootstrap ran, and the bootstrap swallowed its own
+/// failures into a `tracing::error!`. So an unreadable project store produced a
+/// dispatch the client folded as accepted with no durable thread row behind it
+/// and no shell projection ever recorded: schema-valid ACK, lifecycle-invalid
+/// state, and nothing on the wire saying so.
+#[tokio::test]
+async fn a_first_turn_whose_bootstrap_cannot_be_committed_fails_the_dispatch() {
+    let (state, _d) = test_state().await;
+    break_project_store(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.start",
+            "commandId": "c-boot",
+            "threadId": "t-boot",
+            // No bootstrap.createThread.projectId, so the bootstrap has to
+            // reach the project store — which is the store we just broke.
+            "message": { "messageId": "m-1", "role": "user", "text": "start", "attachments": [] },
+            "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    assert_eq!(
+        frames[0]["exit"]["_tag"], "Failure",
+        "an uncommittable bootstrap must not ack as accepted: {frames:#?}"
+    );
+
+    // ONE request, ONE terminal frame. If the ack had already gone out and we
+    // sent a failure afterwards, this would be 2 — and that is a protocol
+    // violation as well as a lie.
+    assert_eq!(frames.len(), 1, "exactly one terminal frame: {frames:#?}");
+
+    // And the lifecycle state matches what the client was told: no thread.
+    let stored = state.rt.threads().await;
+    assert!(
+        !stored.iter().any(|t| t.get("id").and_then(Value::as_str) == Some("t-boot")),
+        "a refused dispatch must leave no durable thread row: {stored:#?}"
+    );
+}
+
+/// The control for the test above, and the reason it is not just "make
+/// dispatch fail". With the store INTACT the identical command must still be
+/// accepted — otherwise the fix would read as correct while having broken every
+/// first turn in the product.
+#[tokio::test]
+async fn a_first_turn_with_a_healthy_store_is_still_accepted() {
+    let (state, _d) = test_state().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.start",
+            "commandId": "c-boot-ok",
+            "threadId": "t-boot-ok",
+            "message": { "messageId": "m-1", "role": "user", "text": "start", "attachments": [] },
+            "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    assert_eq!(
+        frames[0]["exit"]["_tag"], "Success",
+        "the healthy path must still accept: {frames:#?}"
+    );
+    assert!(frames[0]["exit"]["value"]["sequence"].is_number());
+
+    // Acceptance now MEANS the durable row exists — that is the whole point of
+    // moving the boundary, so assert it rather than trusting the tag.
+    let stored = state.rt.threads().await;
+    assert!(
+        stored.iter().any(|t| t.get("id").and_then(Value::as_str) == Some("t-boot-ok")),
+        "an accepted first turn must have committed its thread row: {stored:#?}"
+    );
+}
+
 /// #35: the advertised catalog is the reconciled registry, not two
 /// hard-coded literals — and an unusable provider stays VISIBLE with its
 /// reason so the user can fix it.
@@ -4656,7 +4761,7 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
     ensure_thread_on_shell(&state, &json!({
         "threadId": "t-meta", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
         "message": {"text": "hi", "messageId": "m1"},
-    })).await;
+    })).await.expect("bootstrap");
 
     // change the mode + title OUTSIDE a turn
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6113,10 +6218,10 @@ async fn model_switch_persists_in_thread_snapshot() {
         })
     };
     // First turn creates the thread on instance A.
-    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await;
+    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await.expect("bootstrap");
     seed_prompt(&state, tid, "m-a", "hi").await;
     // Second turn SWITCHES to instance B on the same thread.
-    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again")).await;
+    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again")).await.expect("bootstrap");
     seed_prompt(&state, tid, "m-b", "again").await;
 
     // The snapshot must reflect the switched selection, and keep both msgs.
@@ -6659,7 +6764,7 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
             "worktreePath": wt.to_string_lossy(),
         }},
     });
-    ensure_thread_on_shell(&state, &command).await;
+    ensure_thread_on_shell(&state, &command).await.expect("bootstrap");
 
     // the thread the shell announced carries what the user picked
     let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
