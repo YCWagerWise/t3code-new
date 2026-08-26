@@ -3,6 +3,12 @@
 //! over this; integration tests drive the same modules the product ships.
 
 pub mod assets;
+// Test-only scratch dirs that clean up in Drop. Not gated behind a feature: it
+// is referenced from `#[cfg(test)]` blocks across the crate, and a leaked temp
+// dir here is what filled the build box's tmpfs and turned into SIGBUS in
+// do-storage's mmap'd coordination segment.
+#[cfg(test)]
+pub mod testtmp;
 pub mod diagnostics;
 pub mod keybindings;
 pub mod paths;

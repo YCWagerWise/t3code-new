@@ -377,9 +377,11 @@ fn checkpoint_thread(id: &str) -> Value {
         "title": id,
         "runtimeMode": "full-access",
         // The thread decoder refuses to INVENT these two, so a fixture that
-        // omits them is not a valid durable thread row. `null` is a recorded
-        // "no selection", which is what this fixture means.
-        "modelSelection": Value::Null,
+        // omits them is not a valid durable thread row — and `null` is not a
+        // valid one either: `ThreadRecord::from_row` fails closed on it,
+        // because a row that cannot say which provider a thread is bound to is
+        // damage, not a recorded "no selection".
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
         "interactionMode": "default",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
