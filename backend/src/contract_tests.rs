@@ -518,6 +518,30 @@ where
     out
 }
 
+/// Drain while a stateful observer still needs more frames. This is for tests
+/// whose assertion depends on observing multiple independent frames before the
+/// final check can be meaningful.
+async fn drain_while<F>(
+    rx: &mut mpsc::UnboundedReceiver<OutFrame>,
+    deadline: std::time::Duration,
+    mut needs_more: F,
+) -> Vec<Value>
+where
+    F: FnMut(&[Value]) -> bool,
+{
+    let start = std::time::Instant::now();
+    let mut out: Vec<Value> = vec![];
+    while start.elapsed() < deadline {
+        out.extend(drain(rx));
+        if !needs_more(&out) {
+            return out;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    out.extend(drain(rx));
+    out
+}
+
 /// Write a user prompt the way `run_turn_with_prompt_id` does, for tests
 /// that exercise thread bootstrap without running a turn.
 async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: &str) {
@@ -7200,17 +7224,31 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
-            carries(v, last)
+        let needs_snapshot = label == "snapshot";
+        let seen = drain_while(&mut rx, std::time::Duration::from_secs(15), |frames| {
+            let saw_last = frames.iter().any(|v| carries(v, last));
+            let saw_snapshot = !needs_snapshot
+                || frames
+                    .iter()
+                    .any(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64().is_some());
+            !(saw_last && saw_snapshot)
         })
         .await;
+        assert!(
+            seen.iter().any(|v| carries(v, last)),
+            "[{label}] timed out before the final published event {last} reached the subscriber; frames={seen:?}"
+        );
         // The mark the client was told it holds through. The resume path
         // sends no snapshot, so it is the `afterSequence` the client asked
         // from — 0 here, i.e. every event is owed.
-        let mark = seen
-            .iter()
-            .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
-            .unwrap_or(0);
+        let mark = if needs_snapshot {
+            seen
+                .iter()
+                .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
+                .expect("[snapshot] the snapshot path must advertise snapshotSequence")
+        } else {
+            0
+        };
         let missing: Vec<i64> = seqs
             .iter()
             .copied()
