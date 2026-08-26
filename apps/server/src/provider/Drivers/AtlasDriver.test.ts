@@ -24,7 +24,7 @@ import {
   makeAtlasAdapter,
   makeAtlasDriver,
   probeAtlasHost,
-  readAtlasAccessTokenForTest,
+  readAtlasCredentialForTest,
 } from "./AtlasDriver.ts";
 
 /**
@@ -1199,14 +1199,78 @@ describe("the Atlas credential never reaches a client", () => {
       { name: ATLAS_ACCESS_TOKEN_ENV, value: "  tok-123  ", sensitive: true },
     ];
     // Trimmed, because a value pasted with whitespace must not become a different bearer.
-    expect(readAtlasAccessTokenForTest(environment as never)).toEqual("tok-123");
+    expect(readAtlasCredentialForTest(environment as never)).toEqual({
+      kind: "token",
+      value: "tok-123",
+    });
     // Absent and blank are both "no credential" — a node with no auth is a valid setup, and
     // an empty string must not be sent as a Bearer header.
-    expect(readAtlasAccessTokenForTest([] as never)).toBeUndefined();
+    expect(readAtlasCredentialForTest([] as never)).toEqual({ kind: "none" });
     expect(
-      readAtlasAccessTokenForTest([
+      readAtlasCredentialForTest([
         { name: ATLAS_ACCESS_TOKEN_ENV, value: "   ", sensitive: true },
       ] as never),
-    ).toBeUndefined();
+    ).toEqual({ kind: "none" });
+  });
+
+  /**
+   * `sensitive` is the flag redaction keys on, so honouring a non-sensitive entry would let a
+   * user leak their own token by unticking a checkbox — and it would still WORK, which is
+   * precisely what would stop anyone noticing.
+   */
+  it("refuses a token that is not marked sensitive, rather than using it", () => {
+    const unsafe = [{ name: ATLAS_ACCESS_TOKEN_ENV, value: "leaked-token", sensitive: false }];
+    expect(readAtlasCredentialForTest(unsafe as never)).toEqual({ kind: "refused-insecure" });
+    // The value must not survive anywhere in the decision.
+    expect(JSON.stringify(readAtlasCredentialForTest(unsafe as never))).not.toContain(
+      "leaked-token",
+    );
+  });
+
+  it("refuses when an unsafe entry sits beside a sensitive one", () => {
+    // Preferring the safe sibling would leave the plaintext copy on disk and in every client
+    // snapshot while everything looked healthy — the leak would be invisible precisely because
+    // authentication succeeded.
+    const mixed = [
+      { name: ATLAS_ACCESS_TOKEN_ENV, value: "safe", sensitive: true },
+      { name: ATLAS_ACCESS_TOKEN_ENV, value: "leaked-token", sensitive: false },
+    ];
+    expect(readAtlasCredentialForTest(mixed as never)).toEqual({ kind: "refused-insecure" });
+  });
+
+  it("never sends an unsafe token as a Bearer header", async () => {
+    const seen: Array<Record<string, string> | undefined> = [];
+    const spyFetch: FetchLike = (_url, init) => {
+      seen.push((init as { headers?: Record<string, string> } | undefined)?.headers);
+      return Promise.resolve({ status: 401, text: () => Promise.resolve("unauthenticated") });
+    };
+    const scope = Effect.runSync(Scope.make());
+    const instance = await Effect.runPromise(
+      makeAtlasDriver({ fetch: spyFetch })
+        .create({
+          instanceId: "atlas-unsafe" as never,
+          displayName: "Atlas",
+          accentColor: undefined,
+          environment: [{ name: ATLAS_ACCESS_TOKEN_ENV, value: "leaked-token", sensitive: false }],
+          enabled: true,
+          config: { baseUrl: "http://127.0.0.1:3010" },
+        } as never)
+        .pipe(
+          Effect.provideService(ProviderSessionDirectory, {
+            upsert: () => Effect.void,
+          } as never),
+          Effect.provideService(Scope.Scope, scope),
+        ),
+    );
+
+    // No request carried it, and the driver did not even probe with it.
+    for (const headers of seen) {
+      expect(JSON.stringify(headers ?? {})).not.toContain("leaked-token");
+    }
+    const snapshot = await Effect.runPromise(instance.snapshot.getSnapshot);
+    const wire = JSON.stringify(snapshot);
+    expect(wire).not.toContain("leaked-token");
+    // And the user is told WHY, so they do not just re-enter the same unsafe value.
+    expect(wire).toContain("not marked sensitive");
   });
 });

@@ -1,11 +1,15 @@
 import { ProviderDriverKind } from "@t3tools/contracts";
-import { ClaudeAI, Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { AtlasIcon, ClaudeAI, Icon, OpenAI, OpenCodeIcon } from "../Icons";
 import { PROVIDER_OPTIONS } from "../../session-logic";
 
 export const PROVIDER_ICON_BY_PROVIDER: Partial<Record<ProviderDriverKind, Icon>> = {
   [ProviderDriverKind.make("codex")]: OpenAI,
   [ProviderDriverKind.make("claudeAgent")]: ClaudeAI,
   [ProviderDriverKind.make("opencode")]: OpenCodeIcon,
+  // Atlas gets its own mark. It ROUTES to Anthropic, OpenAI and Ollama, so wearing any one of
+  // their logos would assert exactly the collapse this provider exists to prevent — and the
+  // generic two-letter fallback reads as "unsupported", which is the opposite of true.
+  [ProviderDriverKind.make("atlas")]: AtlasIcon,
 };
 
 function isAvailableProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): option is {

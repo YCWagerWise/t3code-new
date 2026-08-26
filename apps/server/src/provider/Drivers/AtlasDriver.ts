@@ -108,23 +108,48 @@ const decodeAtlasSettings = Schema.decodeSync(AtlasSettings);
 const DEFAULT_BASE_URL = "http://127.0.0.1:3010";
 
 /**
- * The bearer credential for this instance, taken from its sensitive environment.
+ * The bearer credential for this instance — accepted ONLY from a sensitive entry.
  *
- * Absent is a legitimate configuration: a node with no auth configured answers the handshake,
- * and a node that requires one answers 401 — which the probe reports as reachable-but-
- * unauthorised rather than ready. Either way nothing is invented here.
+ * `sensitive` is not a display hint; it is the flag `redactServerSettingsForClient` keys on.
+ * A `sensitive: false` entry is written to settings JSON and broadcast to every
+ * settings-reading client in clear text. So honouring one here would hand a user a way to
+ * leak their own token by unticking a checkbox and still have Atlas authenticate — the
+ * credential would work, which is exactly what would stop anyone noticing.
+ *
+ * An unsafe entry is therefore refused rather than used, and the refusal is REPORTED (see
+ * `classifyHandshake`'s caller) instead of silently downgrading to unauthenticated, because a
+ * user who set a token and sees "not authenticated" with no reason will simply set it again.
+ *
+ * Absent is a legitimate configuration: a node with no auth answers the handshake, and a node
+ * that requires one answers 401 — reachable-but-unauthorised, never ready. Nothing is invented.
  */
-export const readAtlasAccessTokenForTest = (
-  environment: ProviderInstanceEnvironment | undefined,
-): string | undefined => readAtlasAccessToken(environment);
+export type AtlasCredential =
+  | { readonly kind: "none" }
+  | { readonly kind: "token"; readonly value: string }
+  | { readonly kind: "refused-insecure" };
 
-const readAtlasAccessToken = (
+const readAtlasCredential = (
   environment: ProviderInstanceEnvironment | undefined,
-): string | undefined => {
-  const found = environment?.find((variable) => variable.name === ATLAS_ACCESS_TOKEN_ENV);
-  const value = found?.value?.trim();
-  return value === undefined || value.length === 0 ? undefined : value;
+): AtlasCredential => {
+  const entries = (environment ?? []).filter(
+    (variable) => variable.name === ATLAS_ACCESS_TOKEN_ENV,
+  );
+  if (entries.length === 0) return { kind: "none" };
+  // A non-sensitive entry is a leak whether or not it also carries a usable value, so its
+  // mere presence is reported rather than skipped over in favour of a sensitive sibling.
+  if (entries.some((variable) => variable.sensitive !== true)) {
+    return { kind: "refused-insecure" };
+  }
+  const value = entries
+    .map((variable) => variable.value?.trim() ?? "")
+    .find((candidate) => candidate.length > 0);
+  return value === undefined ? { kind: "none" } : { kind: "token", value };
 };
+
+/** Test seam: the credential decision, without standing the whole driver up. */
+export const readAtlasCredentialForTest = (
+  environment: ProviderInstanceEnvironment | undefined,
+): AtlasCredential => readAtlasCredential(environment);
 
 /** Trailing slashes make `${base}/console/v1/...` produce a double slash, which some routers 404. */
 const normalizeBaseUrl = (raw: string | undefined): string =>
@@ -867,15 +892,30 @@ export const makeAtlasDriver = (
       // only sensitive environment entries are blanked by `redactServerSettingsForClient`. So
       // a token in config would be written to settings JSON and broadcast in clear text. This
       // is the seam that is already redacted on the way out and backed by `ServerSecretStore`.
-      const accessToken = readAtlasAccessToken(environment);
+      const credential = readAtlasCredential(environment);
+      const accessToken = credential.kind === "token" ? credential.value : undefined;
       const fetchImpl =
         deps?.fetch ??
         ((url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<FetchLike>);
-      const probe = yield* probeAtlasHost({
-        baseUrl,
-        accessToken,
-        fetch: fetchImpl,
-      });
+      // A token that exists but is stored unsafely is a configuration ERROR, not an absent
+      // credential. Probing without it would render "not authenticated", the user would set
+      // the same value again, and the leak would persist while the symptom looked like a typo.
+      const probe: ProviderProbeResult =
+        credential.kind === "refused-insecure"
+          ? {
+              installed: true,
+              status: "error",
+              auth: { status: "unauthenticated" },
+              message:
+                `${ATLAS_ACCESS_TOKEN_ENV} is set on this Atlas instance but is not marked ` +
+                `sensitive, so it would be stored and sent to clients in clear text. It has ` +
+                `NOT been used. Mark it sensitive in the provider's environment and re-enter it.`,
+            }
+          : yield* probeAtlasHost({
+              baseUrl,
+              accessToken,
+              fetch: fetchImpl,
+            });
       // Only ask for models when the node answered. Listing models from a host that just
       // failed its probe would be exactly the display-only readiness this driver refuses.
       const catalogue =

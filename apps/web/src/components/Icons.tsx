@@ -483,6 +483,30 @@ export const OpenAI: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/**
+ * Atlas — the orchestrator, not a model vendor.
+ *
+ * Deliberately its own mark rather than a borrowed vendor logo. Atlas ROUTES to Anthropic,
+ * OpenAI and Ollama; showing one of their icons next to it would say the opposite of the
+ * distinction this provider exists to make, and a user scanning the list would read Atlas as
+ * "the OpenAI one". Three orbits around a core: many providers, one authority.
+ */
+export const AtlasIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={cn("stroke-black dark:stroke-white", className)}
+    strokeWidth="1.5"
+    strokeLinecap="round"
+  >
+    <circle cx="12" cy="12" r="2.5" className={cn("fill-black dark:fill-white")} stroke="none" />
+    <ellipse cx="12" cy="12" rx="9.25" ry="4.25" />
+    <ellipse cx="12" cy="12" rx="9.25" ry="4.25" transform="rotate(60 12 12)" />
+    <ellipse cx="12" cy="12" rx="9.25" ry="4.25" transform="rotate(120 12 12)" />
+  </svg>
+);
+
 export const ClaudeAI: Icon = ({ className, ...props }) => (
   <svg
     {...props}

@@ -7,7 +7,7 @@ import {
   ProviderDriverKind,
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
-import { ClaudeAI, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { AtlasIcon, ClaudeAI, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
 
 type ProviderSettingsSchema = {
   readonly fields: Readonly<Record<string, Schema.Top>>;
@@ -81,7 +81,9 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
   {
     value: ProviderDriverKind.make("atlas"),
     label: "Atlas",
-    icon: OpenAI,
+    // Its own mark, not a vendor's. Atlas routes to Anthropic/OpenAI/Ollama; wearing one of
+    // their logos would assert the very collapse this provider exists to prevent.
+    icon: AtlasIcon,
     // `AtlasSettings` carries the node URL only. The bearer credential is an instance
     // ENVIRONMENT variable (`ATLAS_ACCESS_TOKEN`, marked sensitive), because provider config
     // is returned to clients verbatim while sensitive environment values are redacted and
