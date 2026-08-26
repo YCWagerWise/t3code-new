@@ -1,4 +1,6 @@
 export * from "./baseSchemas.ts";
+// #341: one place decides whether a ref is safe to act on.
+export * from "./branchOwnership.ts";
 export * from "./background.ts";
 export * from "./auth.ts";
 export * from "./environment.ts";

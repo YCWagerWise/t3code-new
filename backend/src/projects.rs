@@ -225,22 +225,12 @@ pub async fn read_file(cwd: &str, input: &Value) -> Result<Value, String> {
     // cairn confines the path; an escape is refused rather than read
     let contents = cairn::read_file(root, rel).map_err(|e| e.to_string())?;
     let byte_length = contents.len();
-    let truncated = byte_length > MAX_READ_BYTES;
-    let contents = if truncated {
-        // Slice on a CHAR boundary, not a byte count (#229). `MAX_READ_BYTES`
-        // can land in the middle of a multibyte codepoint, and slicing a
-        // `String` there panics — a valid large file (any non-ASCII source,
-        // any CJK text) took the backend down instead of returning a preview.
-        let mut cap = MAX_READ_BYTES.min(contents.len());
-        while cap > 0 && !contents.is_char_boundary(cap) {
-            cap -= 1;
-        }
-        // Prefer a whole final line, but only if that boundary is itself valid.
-        let cut = contents[..cap].rfind('\n').unwrap_or(cap);
-        contents[..cut].to_string()
-    } else {
-        contents
-    };
+    // #229's fix, now the shared helper (#353) rather than a copy. Keeping it
+    // written out here is what let `review.rs` ship the pre-fix version of the
+    // same three lines: the incident was recorded at this site and the sibling
+    // was never updated, because there was nothing to update.
+    let (capped, truncated) = crate::text::cap_at_line_boundary(&contents, MAX_READ_BYTES);
+    let contents = capped.to_string();
     Ok(json!({
         "relativePath": rel,
         "contents": contents,
@@ -749,6 +739,10 @@ const MAX_SEARCH_FILES: usize = 5_000;
 /// Skip anything bigger than this: a match inside a 10MB minified bundle is not
 /// what a code search is for, and reading them makes the search unusable.
 const MAX_SEARCH_FILE_BYTES: u64 = 1_500_000;
+/// How many unsearched-file records are echoed back. The COUNT is never capped;
+/// only the per-file detail is, so a workspace with thousands of unreadable
+/// files reports the scale honestly without returning a megabyte of paths.
+const MAX_REPORTED_UNSEARCHED: usize = 50;
 
 /// Content search across the project, honouring the contract's options.
 ///
@@ -795,6 +789,18 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
     let (all, mut truncated) = entries(root).await?;
     let mut matches: Vec<Value> = Vec::new();
     let mut opened = 0usize;
+    // Candidate files this search could NOT classify or read (#209). Never
+    // silently dropped: they are the difference between "not found" and "not
+    // looked at".
+    let mut unsearched: Vec<(String, String)> = Vec::new();
+    // Candidates deliberately skipped for size. A separate list on purpose —
+    // this one is a policy the product chose, not a failure.
+    let mut skipped_large: Vec<String> = Vec::new();
+    // Candidates that are not text at all (a sqlite db, an image). Also a
+    // policy skip, not a failure: a code search cannot search them and never
+    // could, so counting them as "unsearched" would bury the real failures
+    // under noise every workspace produces.
+    let mut skipped_binary: Vec<String> = Vec::new();
     for (rel, is_dir) in all {
         if is_dir {
             continue;
@@ -808,15 +814,43 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
             break;
         }
         let full = root.join(&rel);
-        if std::fs::metadata(&full)
-            .map(|m| m.len() > MAX_SEARCH_FILE_BYTES)
-            .unwrap_or(true)
-        {
-            continue;
+        // Three DIFFERENT outcomes used to collapse into one silent `continue`
+        // (#209), and the difference is the whole point: "this file is too big
+        // to be worth searching" is a product decision, while "we could not
+        // read this file" means the corpus we searched is not the corpus the
+        // caller asked about. Reporting the second as an ordinary absence of
+        // matches is how a permission error becomes "your query isn't in this
+        // repo".
+        match std::fs::metadata(&full) {
+            Ok(m) if m.len() > MAX_SEARCH_FILE_BYTES => {
+                skipped_large.push(rel.clone());
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                unsearched.push((rel.clone(), format!("metadata: {e}")));
+                continue;
+            }
         }
-        // cairn confines the read to the workspace; a path that escapes is
-        // skipped rather than followed.
-        let Ok(contents) = cairn::read_file(root, &rel) else {
+        // cairn confines the read to the workspace; a path that escapes is not
+        // followed — but it is also not pretended to have been searched.
+        //
+        // Bytes, not text, deliberately: `cairn::read_file` decodes UTF-8, so a
+        // sqlite file and a permission error come back as the same kind of
+        // `Err` and the only way to tell them apart is to grep the message.
+        // `read_file_bytes` keeps the confinement and the open failure and
+        // leaves the decode here, where the difference matters — a binary file
+        // is a policy skip like the size cap, while an unreadable one means the
+        // corpus is smaller than the caller asked for.
+        let bytes = match cairn::read_file_bytes(root, &rel) {
+            Ok(b) => b,
+            Err(e) => {
+                unsearched.push((rel.clone(), format!("read: {e}")));
+                continue;
+            }
+        };
+        let Ok(contents) = String::from_utf8(bytes) else {
+            skipped_binary.push(rel.clone());
             continue;
         };
         opened += 1;
@@ -841,7 +875,36 @@ pub async fn search_contents(cwd: &str, input: &Value) -> Result<Value, String> 
         }
     }
 
-    let mut out = json!({ "matches": matches, "truncated": truncated });
+    // Deliberately NOT failing the request when some candidate could not be
+    // read (#209). The other half of that Direction was "fail the search when
+    // any candidate cannot be classified/read", and it is the wrong rule here:
+    // one unreadable file in a five-thousand-file repo would take the whole
+    // search down, which is a worse product than the bug. Nor is
+    // "fail only if NOTHING was readable" defensible — whether any file
+    // happened to be readable depends on incidental workspace contents, so the
+    // rule almost never fires and cannot be tested deterministically.
+    //
+    // What actually closes the finding is that an empty `matches` is no longer
+    // a CLEAN empty result: every file that could not be read is named, with a
+    // reason, and counted. A caller that gets `matches: []` alongside
+    // `unsearchedCount: 3` can tell "not found" from "not looked at", which is
+    // the exact distinction that was missing.
+
+    let mut out = json!({
+        "matches": matches,
+        "truncated": truncated,
+        // Bounded so a broken workspace cannot return a megabyte of paths, but
+        // the COUNT is always exact — a capped list still tells the truth about
+        // how much was not searched.
+        "unsearched": unsearched
+            .iter()
+            .take(MAX_REPORTED_UNSEARCHED)
+            .map(|(path, reason)| json!({ "path": path, "reason": reason }))
+            .collect::<Vec<_>>(),
+        "unsearchedCount": unsearched.len(),
+        "skippedLargeCount": skipped_large.len(),
+        "skippedBinaryCount": skipped_binary.len(),
+    });
     if let Some(e) = regex_fallback_error {
         out["regexFallbackError"] = json!(e);
     }

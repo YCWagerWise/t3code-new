@@ -279,6 +279,28 @@ export const VcsListRefsResult = Schema.Struct({
   hasPrimaryRemote: Schema.Boolean,
   nextCursor: NonNegativeInt.pipe(Schema.NullOr),
   totalCount: NonNegativeInt,
+  /**
+   * The repository was found but its refs could not be listed. `refs` is then
+   * UNKNOWN, not empty — surfaces must not read "this repo has no branches"
+   * from it, and must not offer to create the default branch. Show
+   * `refsError`.
+   */
+  refsUnavailable: Schema.optional(Schema.Boolean),
+  /**
+   * The refs are real, but which linked worktree holds which branch could not
+   * be determined. Every `worktreePath` below is then `null` because it is
+   * UNKNOWN, not because the branch is free.
+   *
+   * This is the flag that gates destructive branch operations. Deleting,
+   * switching to, or force-updating a ref that another worktree currently has
+   * checked out is what the ownership map exists to prevent; with ownership
+   * unavailable, a `worktreePath: null` is no longer evidence that the ref is
+   * safe to act on, so those affordances must be disabled rather than enabled
+   * against unknown truth.
+   */
+  ownershipUnavailable: Schema.optional(Schema.Boolean),
+  /** Why refs or ownership could not be read, in git's own words. */
+  refsError: Schema.optional(Schema.String),
 });
 export type VcsListRefsResult = typeof VcsListRefsResult.Type;
 

@@ -4,6 +4,8 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type { ContextMenuItem, EnvironmentId, VcsRef, ThreadId } from "@t3tools/contracts";
+// #341: the one place that decides whether a ref is safe to act on.
+import { canActOnRef, refAvailability, refDisabledReason } from "@t3tools/contracts";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { ChevronDownIcon, GitBranchIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
 import {
@@ -236,6 +238,20 @@ export function BranchToolbarBranchSelector({
   );
   const branchRefState = usePaginatedBranches(branchRefTarget);
   const refs = branchRefState.refs;
+  // #341: `worktreePath: null` means "no worktree holds this" ONLY while
+  // ownership is known. A Cairn `worktrees()` failure returns real refs with
+  // every path nulled and sets `ownershipUnavailable`, and reading those as
+  // free is how a user ends up switching to a ref another worktree has checked
+  // out. The decision lives in @t3tools/contracts so the mobile sheet cannot
+  // drift from it again.
+  const refOwnershipContext = useMemo(
+    () => ({
+      ownershipUnavailable: branchRefState.data?.ownershipUnavailable === true,
+      activeWorktreePath,
+    }),
+    [branchRefState.data?.ownershipUnavailable, activeWorktreePath],
+  );
+  const refsError = branchRefState.data?.refsError;
   const hasNextPage =
     branchRefState.data?.nextCursor !== null && branchRefState.data?.nextCursor !== undefined;
   const isFetchingNextPage = branchRefState.isFetchingNextPage;
@@ -677,17 +693,21 @@ export function BranchToolbarBranchSelector({
     const refName = branchByName.get(itemValue);
     if (!refName) return null;
 
-    const hasSecondaryWorktree =
-      refName.worktreePath && activeProjectCwd && refName.worktreePath !== activeProjectCwd;
+    const availability = refAvailability(refName, refOwnershipContext);
+    const hasSecondaryWorktree = availability.kind === "heldByOtherWorktree";
+    const ownershipUnknown = availability.kind === "unknown";
+    const disabledReason = refDisabledReason(refName, refOwnershipContext, refsError);
     const badge = refName.current
       ? "current"
-      : hasSecondaryWorktree
-        ? "worktree"
-        : refName.isRemote
-          ? "remote"
-          : refName.isDefault
-            ? "default"
-            : null;
+      : ownershipUnknown
+        ? "ownership?"
+        : hasSecondaryWorktree
+          ? "worktree"
+          : refName.isRemote
+            ? "remote"
+            : refName.isDefault
+              ? "default"
+              : null;
     return (
       <ComboboxItem
         hideIndicator
@@ -695,7 +715,14 @@ export function BranchToolbarBranchSelector({
         index={index}
         value={itemValue}
         className="pe-1.5"
-        onClick={() => selectBranch(refName)}
+        disabled={!canActOnRef(refName, refOwnershipContext)}
+        title={disabledReason ?? undefined}
+        // Switching is the destructive affordance here: with ownership unknown
+        // this ref may be checked out by another worktree, so it is not offered
+        // rather than offered against a guess (#341).
+        onClick={
+          canActOnRef(refName, refOwnershipContext) ? () => selectBranch(refName) : undefined
+        }
         onContextMenu={(event) => handleBranchContextMenu(event, itemValue)}
       >
         <div className="flex w-full min-w-0 items-center justify-between gap-2">

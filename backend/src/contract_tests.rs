@@ -19,16 +19,64 @@ fn contract_test_fd_slots() -> &'static Arc<tokio::sync::Semaphore> {
     SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
 }
 
-async fn test_state() -> (AppState, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
-    let state = state_at(&dir).await;
-    (state, dir)
+/// The temp workspace one contract test runs in, removed when the test ENDS —
+/// including when it panics.
+///
+/// This used to be a bare `PathBuf` under `std::env::temp_dir()`, with cleanup
+/// left to each test remembering `let _ = std::fs::remove_dir_all(&dir);` as the
+/// last statement of its body. 115 test fns, 28 such calls — and even those 28
+/// leaked on any panic or early return, because a statement at the bottom of a
+/// body does not run when the body unwinds. A FAILING test is exactly when the
+/// directory got left behind, so a red round made the next round redder.
+///
+/// Measured on woodbine before this change: 12,002 `/tmp/t3ct-*` directories in
+/// eleven hours, ~13M each, filling a 31G tmpfs to 80%. /tmp there is RAM, so
+/// that was 25 of the box's 60 GB — and once it filled, unrelated suites
+/// (cairn, hearth, do-storage) began failing with `os error 122 QuotaExceeded`
+/// and getting misattributed to whatever change was under test.
+///
+/// `Drop` is the fix rather than more cleanup calls: it cannot be forgotten by
+/// the next test, and it runs while unwinding.
+pub(crate) struct TestDir(tempfile::TempDir);
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+async fn test_state() -> (AppState, TestDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let state = state_at(dir.path()).await;
+    (state, TestDir(dir))
 }
 
 async fn drop_runtime_kv(state: &AppState) {
     let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
     let db = pool.object_db("threadruntime", "main").await.unwrap();
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
+}
+
+/// #202: break the broker's subscriber table so every `topic_publish` fails.
+///
+/// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
+/// and `Broker::publish` starts with `SELECT sub_id, topic FROM subs` — so
+/// dropping that table is a real, deterministic publish failure at the exact
+/// seam, with no test-only fault hook bolted onto the product.
+async fn break_topic_publish(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE subs", vec![]).await.unwrap();
 }
 
 /// PROOF (#320 anti-regression, packet AE): the product backend must not
@@ -1070,7 +1118,7 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
     let (mut state, dir) = test_state().await;
     let bad = hearth::Runner::open(
-        hearth::Config::new(dir.clone(), dir.join("bad-hearth"), "bad-terminal")
+        hearth::Config::new(dir.to_path_buf(), dir.join("bad-hearth"), "bad-terminal")
             .shell(vec!["/definitely/not/a/t3code-shell".to_string()]),
     )
     .await
@@ -4878,6 +4926,86 @@ async fn a_vcs_watch_status_error_reaches_the_subscriber_as_unavailable() {
     );
 }
 
+/// #174: a status read that fails while the watch is being PLACED is the same
+/// visible failure as one that fails after it is live (#49).
+///
+/// By the time `watch_one_tree` runs, `subscribeVcsStatus` has already sent a
+/// snapshot and registered a durable watch claim. If placement then returns an
+/// error and we only log it, the subscriber keeps a live subscription that no
+/// watcher will ever feed: the panel freezes on the last good status with no
+/// error anywhere. This corrupts the index BETWEEN the snapshot/claim and
+/// placement, which is the exact window the earlier test cannot reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vcs_watch_that_cannot_be_placed_reaches_the_subscriber_as_unavailable() {
+    let (state, dir) = test_state().await;
+    cairn::init_repository(&dir).await.unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let sh = |c: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(c)
+            .current_dir(&dir)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "`{c}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    sh("git config user.email t@t && git config user.name t");
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    sh("git add -A && git commit -qm base");
+
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+    request(&state, &sub_tx, "subscribeVcsStatus", json!({"cwd": cwd})).await;
+    assert_eq!(drain(&mut sub_rx)[0]["values"][0]["_tag"], "snapshot");
+
+    let (watched, baseline) = state
+        .rt
+        .watch_marks("vcs")
+        .await
+        .expect("the watch registry is readable")
+        .into_iter()
+        .next()
+        .expect("the subscriber registered a watch");
+
+    // The repository is readable for the snapshot and the claim, then stops
+    // being readable before placement gets its own status read.
+    std::fs::write(dir.join(".git/index"), b"\x00not a git index\x00").unwrap();
+
+    let watcher = tokio::spawn(watch_one_tree(state.clone(), watched, baseline, None));
+
+    let mut saw = false;
+    while let Ok(Some((raw, _))) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), sub_rx.recv()).await
+    {
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        if v["values"][0]["_tag"] == "localUpdated" {
+            let local = &v["values"][0]["local"];
+            if local["statusUnavailable"] == json!(true) {
+                assert_eq!(
+                    local["isRepo"],
+                    json!(true),
+                    "the repo was demoted instead of degraded: {local}"
+                );
+                assert!(
+                    local["statusError"].as_str().is_some_and(|e| !e.is_empty()),
+                    "the unavailable status carries no error: {local}"
+                );
+                saw = true;
+                break;
+            }
+        }
+    }
+    watcher.abort();
+    assert!(
+        saw,
+        "a watch that could not be placed was swallowed: the subscriber holds a \
+         live subscription and a durable claim that nothing will ever feed"
+    );
+}
+
 /// #51: the subscription snapshot and the durable watch baseline are one read.
 ///
 /// If the snapshot is read clean, then the worktree changes before
@@ -5744,7 +5872,12 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
 /// require the new number to be strictly greater.
 #[tokio::test]
 async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
 
     // First process: burn some sequence, then read the client's mark.
     let mark = {
@@ -5825,7 +5958,12 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
 /// the first backend is dropped entirely before the second one answers.
 #[tokio::test]
 async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
 
     // First process: persist a thread + its history, then drop everything.
     {
@@ -6531,7 +6669,12 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         }
     }
 
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake_editor = bin.join("mate");
@@ -6772,6 +6915,160 @@ async fn project_content_search_honours_every_option() {
         out[0]["exit"]["value"]["truncated"], true,
         "truncation is never silent"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #209: a content search must not report a file it could not READ as a file
+/// that did not MATCH.
+///
+/// `searchContents` used to collapse three different outcomes into one silent
+/// `continue`: a metadata error, a cairn/permission read failure, and a
+/// deliberate large-file skip. The RPC still answered `Ok({matches, truncated})`,
+/// so a permission error on the one file containing the query was rendered by
+/// the UI as a clean "no results" over a corpus the backend never opened.
+///
+/// The faults here are real filesystem faults, not a mocked seam: a file with
+/// mode 000 (readable metadata, unreadable contents) and a dangling symlink
+/// (listed by `entries`, `metadata` fails). Both contain — or claim to contain —
+/// the query, so a silent skip is indistinguishable from a clean miss.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_content_search_reports_files_it_could_not_read_instead_of_calling_them_misses() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (state, dir) = test_state().await;
+    // A file that DOES match and CAN be read — so the search is a real search
+    // and the failure below is not the only thing happening.
+    std::fs::write(dir.join("visible.rs"), "let needle = 1;\n").unwrap();
+    // A file that also matches, but whose contents cannot be read.
+    let locked = dir.join("locked.rs");
+    std::fs::write(&locked, "let needle = 2;\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A candidate whose metadata cannot even be taken.
+    std::os::unix::fs::symlink(dir.join("gone.rs"), dir.join("dangling.rs")).unwrap();
+    // A file that is not text at all. This is the case that must NOT be
+    // reported as a failure: every real workspace has sqlite files, images and
+    // binaries, and counting them as "could not search" would bury the two
+    // genuine failures above under noise the user cannot act on.
+    std::fs::write(dir.join("blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    let search = |body: Value| {
+        let state = state.clone();
+        async move {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            request(&state, &tx, "projects.searchContents", body).await;
+            drain(&mut rx)
+        }
+    };
+    let out = search(json!({
+        "cwd": dir.to_string_lossy(), "query": "needle", "limit": 50,
+        "caseSensitive": false, "wholeWord": false, "useRegex": false,
+    }))
+    .await;
+
+    assert_eq!(
+        out[0]["exit"]["_tag"], "Success",
+        "one unreadable file does not make the whole search fail: {:?}",
+        out[0]["exit"]
+    );
+    let v = &out[0]["exit"]["value"];
+    // The readable match is still returned — this is not "fail the search".
+    assert!(
+        v["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["path"] == "visible.rs"),
+        "the readable match survives: {v:#?}"
+    );
+    // And the corpus we could not read is REPORTED, not dropped.
+    let count = v["unsearchedCount"].as_u64().unwrap_or(0);
+    assert!(
+        count >= 2,
+        "both the unreadable file and the dangling symlink must be counted, \
+         not silently skipped — got {count}: {v:#?}"
+    );
+    let unsearched = v["unsearched"].as_array().expect("per-file detail: {v:#?}");
+    assert!(
+        unsearched.iter().any(|u| u["path"] == "locked.rs"),
+        "the file that CONTAINS the query and could not be read must be named: {v:#?}"
+    );
+    assert!(
+        unsearched.iter().any(|u| u["path"] == "dangling.rs"),
+        "a candidate whose metadata failed must be named: {v:#?}"
+    );
+    for u in unsearched {
+        assert!(
+            u["reason"].as_str().map(|r| !r.is_empty()).unwrap_or(false),
+            "a reason a human can act on, not a bare path: {u:#?}"
+        );
+    }
+    assert!(
+        !unsearched.iter().any(|u| u["path"] == "blob.bin"),
+        "a binary file is a policy skip, not a read failure: {v:#?}"
+    );
+    assert!(
+        v["skippedBinaryCount"].as_u64().unwrap_or(0) >= 1,
+        "and it is still COUNTED, so 'we did not search this' is never silent: {v:#?}"
+    );
+
+    // Restore permissions so the tempdir can actually be removed.
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #209, the case that matters most: the ONLY file containing the query cannot
+/// be read.
+///
+/// `matches` is legitimately empty — there is nothing readable to match. The
+/// bug was that the response was CLEAN empty, indistinguishable from "your
+/// query is not in this repo". It must instead name the file it could not read,
+/// so the UI can say "0 results, 1 file unsearched" rather than "0 results".
+#[cfg(unix)]
+#[tokio::test]
+async fn an_empty_result_over_an_unreadable_match_is_not_a_clean_empty_result() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (state, dir) = test_state().await;
+    let locked = dir.join("only.rs");
+    std::fs::write(&locked, "let needle = 1;\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "projects.searchContents",
+        json!({
+            "cwd": dir.to_string_lossy(), "query": "needle", "limit": 50,
+            "caseSensitive": false, "wholeWord": false, "useRegex": false,
+        }),
+    )
+    .await;
+    let f = drain(&mut rx);
+
+    assert_eq!(f[0]["exit"]["_tag"], "Success", "{:?}", f[0]["exit"]);
+    let v = &f[0]["exit"]["value"];
+    assert!(
+        v["matches"].as_array().unwrap().is_empty(),
+        "nothing readable matched: {v:#?}"
+    );
+    // ...but the result is NOT clean, and that is the whole finding.
+    assert_eq!(
+        v["unsearchedCount"], 1,
+        "the one file that could have matched is counted, not dropped: {v:#?}"
+    );
+    let u = v["unsearched"].as_array().unwrap();
+    assert_eq!(u[0]["path"], "only.rs", "{v:#?}");
+    assert!(
+        u[0]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Permission denied"),
+        "the reason is the actual OS failure, not a generic 'skipped': {v:#?}"
+    );
+
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8108,7 +8405,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
     let runner_b = tools::open_workspace_shell(&tmp, data.clone())
         .await
         .unwrap();
-    let tool_roots_b = tools::ToolRoots::new(tmp.clone(), data.clone(), runner_b.clone()).await;
+    let tool_roots_b = tools::ToolRoots::new(tmp.to_path_buf(), data.clone(), runner_b.clone()).await;
     let shell_b = Arc::new(Shell::new(&data, tool_roots_b.registry_factory()));
     let rt_b = ThreadRuntime::open(shell_b, data.to_str().unwrap(), "main")
         .await
@@ -9432,7 +9729,12 @@ impl agent_sdk_core::Model for Spinner {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_frame_cancels_a_running_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-int-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     // The spinner's tool call must SUCCEED so the loop keeps re-entering; a
     // failing tool can short-circuit the turn into a terminal state and we
@@ -9730,7 +10032,12 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
     use super::dispatch_ws_frame;
-    let dir = std::env::temp_dir().join(format!("t3ct-int-neg-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-int-neg-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
     let _ = std::fs::write(std::path::Path::new(&state.cwd).join("spin.txt"), b"spin");
 
@@ -10151,7 +10458,12 @@ async fn a_revert_discards_the_reverted_turns_transcript_and_frees_their_ordinal
 /// from the store, not from anything the first process remembered.
 #[tokio::test]
 async fn a_worktree_backed_thread_reconnects_with_its_real_metadata_after_a_restart() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let wt_s = wt.to_string_lossy().into_owned();
@@ -10275,7 +10587,12 @@ async fn a_thread_with_no_durable_row_still_snapshots_with_declared_defaults() {
 /// the same data directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     // Process one: open a non-agent pane through the real command.
@@ -10338,7 +10655,12 @@ async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
 ///     subscribe_thread_worktree_snapshot_is_a_recorded_fixture
 #[tokio::test]
 async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
-    let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     let wt = dir.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let state = state_at(&dir).await;
@@ -10435,7 +10757,12 @@ async fn subscribe_thread_worktree_snapshot_is_a_recorded_fixture() {
 /// is a number that grows.
 #[tokio::test]
 async fn an_app_state_opens_a_bounded_number_of_isolates() {
-    let dir = std::env::temp_dir().join(format!("t3ct-iso-{}", uuid::Uuid::new_v4()));
+    // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
+    let dir = tempfile::Builder::new()
+        .prefix("t3ct-iso-")
+        .tempdir()
+        .expect("temp workspace");
+    let dir = TestDir(dir);
     std::fs::create_dir_all(&dir).unwrap();
     let state = state_at(&dir).await;
     // Touch the paths a real session uses, so lazily-opened isolates count too.
@@ -10500,4 +10827,79 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
         found.len() * 5
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #202: a terminal lifecycle command must not acknowledge success when the
+/// frame announcing it could not be published.
+///
+/// `terminal.clear` and `terminal.close` change PTY state and then ack on the
+/// wire. The ONLY way a live or reconnecting subscriber learns about that
+/// change is the broker frame `broadcast_terminal_event` publishes. When that
+/// publish failed it was logged and dropped: the command reported Success while
+/// every other surface kept rendering a pane that no longer exists, with
+/// nothing anywhere saying so. The publish is part of the command's result
+/// contract, so a failed publish is a visible failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_published() {
+    let (state, _dir) = test_state().await;
+
+    for pane in ["pane-a", "pane-b"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "terminal.open",
+            json!({ "threadId": "t-1", "terminalId": pane, "cwd": state.cwd.clone() }),
+        )
+        .await;
+        assert_eq!(
+            drain(&mut rx)[0]["exit"]["_tag"],
+            json!("Success"),
+            "the pane opened"
+        );
+    }
+
+    break_topic_publish(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "terminal.clear",
+        json!({ "threadId": "t-1", "terminalId": "pane-a" }),
+    )
+    .await;
+    let cleared = drain(&mut rx);
+    assert_eq!(
+        cleared[0]["exit"]["_tag"],
+        json!("Failure"),
+        "terminal.clear acked success over a fanout nobody received: {cleared:?}"
+    );
+    assert!(
+        cleared[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .is_some_and(|e| e.contains("subscribers could not be notified")),
+        "the failure does not say the pane WAS cleared and only the fanout failed: {cleared:?}"
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "terminal.close",
+        json!({ "threadId": "t-1", "terminalId": "pane-b" }),
+    )
+    .await;
+    let closed = drain(&mut rx);
+    assert_eq!(
+        closed[0]["exit"]["_tag"],
+        json!("Failure"),
+        "terminal.close acked success over a fanout nobody received: {closed:?}"
+    );
+    assert!(
+        closed[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .is_some_and(|e| e.contains("subscribers could not be notified")),
+        "the failure does not distinguish the close from the fanout: {closed:?}"
+    );
 }

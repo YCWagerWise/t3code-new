@@ -52,5 +52,11 @@ export function useSelectedThreadGitState() {
     sourceControlDiscovery,
     selectedThreadBranches,
     selectedThreadBranchesLoading: selectedThreadBranchState.isPending,
+    // #341: which worktree holds which ref could not be read. Every
+    // `worktreePath` below is then `null` because it is UNKNOWN, not because the
+    // branch is free — so the sheet must disable, not enable.
+    selectedThreadBranchOwnershipUnavailable:
+      selectedThreadBranchState.data?.ownershipUnavailable === true,
+    selectedThreadBranchRefsError: selectedThreadBranchState.data?.refsError,
   };
 }

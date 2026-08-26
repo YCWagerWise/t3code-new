@@ -1,3 +1,5 @@
+import { refDisabledReason } from "@t3tools/contracts";
+import { disabledExistingBranchNames } from "./branchSheetOwnership.ts";
 import { sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { useState } from "react";
@@ -49,13 +51,26 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
   );
   const [worktreeBranchName, setWorktreeBranchName] = useState("");
 
-  const disabledExistingBranchNames: Array<string> = [];
-  for (const branch of availableBranches) {
-    if (branch.worktreePath !== null && branch.worktreePath !== currentWorktreePath) {
-      disabledExistingBranchNames.push(branch.name);
-    }
-  }
-  const disabledExistingBranches = new Set(disabledExistingBranchNames);
+  // #341: the same decision the web selector makes, from the same helper. This
+  // used to be `branch.worktreePath !== null && ...`, which reads a nulled path
+  // as "free" — and a Cairn `worktrees()` failure nulls EVERY path while setting
+  // `ownershipUnavailable`. With ownership unknown the whole list is disabled,
+  // because none of it is evidence of anything.
+  const refOwnershipContext = {
+    ownershipUnavailable: gitState.selectedThreadBranchOwnershipUnavailable === true,
+    activeWorktreePath: currentWorktreePath,
+  };
+  const disabledExistingBranches = disabledExistingBranchNames(
+    availableBranches,
+    refOwnershipContext,
+  );
+  const ownershipUnavailableNotice = gitState.selectedThreadBranchOwnershipUnavailable
+    ? (refDisabledReason(
+        { worktreePath: null },
+        refOwnershipContext,
+        gitState.selectedThreadBranchRefsError,
+      ) ?? null)
+    : null;
 
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
@@ -145,15 +160,29 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
               No local branches found.
             </Text>
           ) : null}
+          {/* #341: say WHY everything is disabled. Silently greying the list
+              out reads as "these branches are all busy", which is a different
+              and equally wrong claim. */}
+          {ownershipUnavailableNotice ? (
+            <Text className="text-foreground-secondary text-sm font-medium">
+              {ownershipUnavailableNotice}
+            </Text>
+          ) : null}
           {availableBranches.map((branch) => {
             const disabled = disabledExistingBranches.has(branch.name);
-            const subtitle = branch.worktreePath
-              ? branch.worktreePath === currentWorktreePath
-                ? "Checked out in this thread"
-                : "Checked out in another worktree"
-              : branch.isDefault
-                ? "Default branch"
-                : "Local branch";
+            // With ownership unknown, "Local branch" would assert the thing we
+            // could not read (#341).
+            const subtitle = branch.current
+              ? "Checked out in this thread"
+              : gitState.selectedThreadBranchOwnershipUnavailable
+                ? "Ownership unavailable"
+                : branch.worktreePath
+                  ? branch.worktreePath === currentWorktreePath
+                    ? "Checked out in this thread"
+                    : "Checked out in another worktree"
+                  : branch.isDefault
+                    ? "Default branch"
+                    : "Local branch";
 
             return (
               <Pressable

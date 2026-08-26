@@ -80,7 +80,15 @@ export function useKnownTerminalSessions(input: {
         .map((summary) => ({
           target: {
             environmentId: input.environmentId!,
-            threadId: ThreadId.make(summary.threadId),
+            // `KnownTerminalSessionTarget` stopped hardcoding `threadId` and
+            // took an `owner` union instead, so a subagent's session-owned PTY
+            // becomes representable. This call site was not migrated with it and
+            // has been a type error since. Behaviour is UNCHANGED: the filter
+            // above still admits only thread-owned panes, so every target built
+            // here is `kind: "thread"`. Teaching this hook to emit
+            // `kind: "session"` is the other half of #149 and is a behaviour
+            // change, not a type fix — deliberately not done here.
+            owner: { kind: "thread" as const, threadId: ThreadId.make(summary.threadId) },
             terminalId: summary.terminalId,
           },
           state: combineTerminalSessionState(summary, EMPTY_TERMINAL_BUFFER_STATE),

@@ -1289,7 +1289,22 @@ async fn watch_one_tree(
             return;
         }
         Err(e) => {
-            tracing::warn!(%cwd, %e, "could not place status watch; vcs panel will update on commands only");
+            // #174: the subscriber already has a snapshot and a DURABLE watch
+            // claim by the time we get here, so returning quietly leaves it with
+            // a live subscription that no watcher will ever feed — the panel
+            // freezes on the last good status and nothing anywhere says so.
+            // This is the same `statusUnavailable` frame the already-live error
+            // path publishes (#49). We publish the PLACEMENT error rather than
+            // re-reading status: a re-read that happens to succeed would report
+            // a healthy repository while no watch exists.
+            tracing::warn!(%cwd, %e, "could not place status watch; publishing status as unavailable");
+            publish_vcs_status_parts(
+                &state,
+                &cwd,
+                vcs::status_unavailable(&e.to_string()),
+                Value::Null,
+            )
+            .await;
             return;
         }
     };
@@ -1425,9 +1440,25 @@ fn terminal_meta_topic(thread_id: &str) -> String {
 /// `ThreadRuntime::topic_publish` on a product-named topic — the process-local
 /// `Vec<Sender>` used to leak a dead subscriber on every reconnect, and a
 /// second backend process attached to the same isolate never saw the frame.
-async fn broadcast_terminal_event(state: &AppState, event: Value) {
+///
+/// #202: this is NOT telemetry. `terminal.clear` / `terminal.close` /
+/// `terminal.open`-restart change PTY state and then acknowledge success on the
+/// wire; the only way a live or reconnecting subscriber learns about that change
+/// is the frame published here. A publish that fails and is merely logged means
+/// the command reports success while every other surface keeps rendering a pane
+/// that no longer exists (or still shows the pre-clear screen) with nothing
+/// anywhere saying so. So the failure is returned and the RPC refuses to ack
+/// clean — the caller reports what actually happened AND that the fanout did not.
+///
+/// The metadata arm is deliberately different in ONE way: a pane-store read
+/// failure is published as a visible `store_unavailable` frame rather than
+/// returned, because that frame IS the honest delivery. Only a failure to
+/// DELIVER — either topic — is an error.
+async fn broadcast_terminal_event(state: &AppState, event: Value) -> Result<(), String> {
+    let mut failure: Option<String> = None;
     if let Err(e) = state.rt.topic_publish(TERMINAL_EVENTS_TOPIC, &event).await {
         tracing::error!(%e, "terminal event publish failed");
+        failure = Some(format!("terminal event publish failed: {e}"));
     }
 
     let thread = event
@@ -1456,6 +1487,15 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) {
     let topic = terminal_meta_topic(&thread);
     if let Err(e) = state.rt.topic_publish(&topic, &payload).await {
         tracing::error!(%e, %thread, "terminal metadata publish failed");
+        let m = format!("terminal metadata publish failed: {e}");
+        failure = Some(match failure {
+            Some(prev) => format!("{prev}; {m}"),
+            None => m,
+        });
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -3782,11 +3822,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             if restarting {
                 // the contract has a distinct `restarted` event; a pane that only
                 // saw a new snapshot could not tell a restart from a repaint.
-                broadcast_terminal_event(
+                if let Err(e) = broadcast_terminal_event(
                     &state,
                     json!({ "type": "restarted", "threadId": owner.thread_id(), "terminalId": term, "snapshot": snap }),
                 )
-                .await;
+                .await
+                {
+                    return exit_failure(
+                        tx,
+                        &id,
+                        &format!("terminal.open: the pane restarted but subscribers could not be notified: {e}"),
+                    );
+                }
             }
             exit_success(tx, &id, snap);
         }
@@ -3853,12 +3900,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
             };
             terminal::clear(&runner).await;
-            broadcast_terminal_event(
+            if let Err(e) = broadcast_terminal_event(
                 &state,
                 json!({ "type": "output", "threadId": owner.thread_id(), "terminalId": term,
                         "data": terminal::repaint("") }),
             )
-            .await;
+            .await
+            {
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!("terminal.clear: the pane was cleared but subscribers could not be notified: {e}"),
+                );
+            }
             exit_success(tx, &id, Value::Null);
         }
         "terminal.close" => {
@@ -3874,11 +3928,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(killed) => killed,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
             };
-            broadcast_terminal_event(
+            if let Err(e) = broadcast_terminal_event(
                 &state,
                 json!({ "type": "closed", "threadId": owner.thread_id(), "terminalId": term, "killedShell": killed }),
             )
-            .await;
+            .await
+            {
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!("terminal.close: the pane was closed but subscribers could not be notified: {e}"),
+                );
+            }
             exit_success(tx, &id, Value::Null);
         }
         "terminal.attach" => {

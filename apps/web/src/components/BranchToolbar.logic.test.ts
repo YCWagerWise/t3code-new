@@ -1,4 +1,4 @@
-import { EnvironmentId, type VcsRef } from "@t3tools/contracts";
+import { canActOnRef, EnvironmentId, refAvailability, type VcsRef } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   dedupeRemoteBranchesWithLocalMatches,
@@ -818,5 +818,64 @@ describe("sanitizeNewRefName", () => {
   it("does not collapse dashes the user typed", () => {
     expect(sanitizeNewRefName("new - branch")).toBe("new---branch");
     expect(sanitizeNewRefName("foo--bar")).toBe("foo--bar");
+  });
+});
+
+/**
+ * #341: the branch PICKER's own gate, at the level the picker uses it.
+ *
+ * `packages/contracts/src/branchOwnership.test.ts` pins the helper. This pins
+ * that the picker's population of refs — the real `VcsRef[]` shape it renders —
+ * is classified correctly when a Cairn `worktrees()` failure has nulled every
+ * `worktreePath` and set `ownershipUnavailable`. That is the state the old
+ * `refName.worktreePath && ...` check read as "every branch is free".
+ */
+describe("branch picker ownership gate (#341)", () => {
+  const ACTIVE = "/repo/main";
+  // The shape the picker actually renders: one current ref, one plain local
+  // ref, one held by a second worktree.
+  const refs: VcsRef[] = [
+    { name: "main", current: true, isDefault: true, worktreePath: ACTIVE },
+    { name: "feature/demo", current: false, isDefault: false, worktreePath: null },
+    { name: "feature/held", current: false, isDefault: false, worktreePath: "/repo/wt-2" },
+  ];
+
+  it("offers the free ref and refuses the held one while ownership is known", () => {
+    const ctx = { ownershipUnavailable: false, activeWorktreePath: ACTIVE };
+    const offered = refs.filter((ref) => canActOnRef(ref, ctx)).map((ref) => ref.name);
+    expect(offered).toEqual(["main", "feature/demo"]);
+    expect(refAvailability(refs[2]!, ctx)).toEqual({
+      kind: "heldByOtherWorktree",
+      worktreePath: "/repo/wt-2",
+    });
+  });
+
+  it("offers NOTHING but the current ref once ownership is unavailable", () => {
+    // Cairn worktrees() failed: every worktreePath is null because it is
+    // UNKNOWN. The pre-fix picker rendered all three as switchable.
+    const nulled: VcsRef[] = refs.map((ref) =>
+      ref.current ? ref : { ...ref, worktreePath: null },
+    );
+    const ctx = { ownershipUnavailable: true, activeWorktreePath: ACTIVE };
+    const offered = nulled.filter((ref) => canActOnRef(ref, ctx)).map((ref) => ref.name);
+    expect(offered).toEqual(["main"]);
+    // And specifically: the one that WAS free is no longer offered, because
+    // "free" is not a thing we can currently know.
+    expect(canActOnRef(nulled[1]!, ctx)).toBe(false);
+  });
+
+  it("does not hide the refs — it disables acting on them", () => {
+    // The stated non-goal: do not answer this by dropping refs or treating
+    // `refs: []` as "no branches". The list is still the list.
+    const ctx = { ownershipUnavailable: true, activeWorktreePath: ACTIVE };
+    // The gate decides ACTIONABILITY, and nothing else — it is not a filter.
+    // Every ref is still in the list; only one of them can be acted on.
+    expect(refs).toHaveLength(3);
+    expect(refs.filter((ref) => canActOnRef(ref, ctx))).toHaveLength(1);
+    expect(refs.map((ref) => refAvailability(ref, ctx).kind)).toEqual([
+      "free", // the current ref, exempt
+      "unknown",
+      "unknown",
+    ]);
   });
 });

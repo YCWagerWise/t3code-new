@@ -63,10 +63,39 @@ export const ProjectContentMatch = Schema.Struct({
 });
 export type ProjectContentMatch = typeof ProjectContentMatch.Type;
 
+/**
+ * A candidate file the search could not classify or read (#209).
+ *
+ * This is NOT the large-file skip, which is a policy the product chose and is
+ * counted separately. This one means the corpus that was searched is smaller
+ * than the corpus the caller asked about — a permission error, a transient
+ * filesystem error, or a cairn confinement failure on a file that may well
+ * contain the query. Without it, all three are indistinguishable from "no
+ * match", and the UI renders a clean empty result over a repo the backend
+ * never actually read.
+ */
+export const ProjectUnsearchedFile = Schema.Struct({
+  path: TrimmedNonEmptyString,
+  reason: TrimmedNonEmptyString,
+});
+export type ProjectUnsearchedFile = typeof ProjectUnsearchedFile.Type;
+
 export const ProjectSearchContentsResult = Schema.Struct({
   matches: Schema.Array(ProjectContentMatch),
   truncated: Schema.Boolean,
   regexFallbackError: Schema.optional(Schema.String),
+  // Per-file detail for what could not be searched, capped by the backend.
+  // `unsearchedCount` is the UNCAPPED total, so a caller can always tell how
+  // much of the corpus is missing even when the detail list is truncated.
+  unsearched: Schema.optional(Schema.Array(ProjectUnsearchedFile)),
+  unsearchedCount: Schema.optional(NonNegativeInt),
+  // Files skipped for exceeding the size limit — a deliberate policy, kept
+  // separate from failures so "we chose not to" never reads as "we could not".
+  skippedLargeCount: Schema.optional(NonNegativeInt),
+  // Files that are not text (a sqlite db, an image). Also a policy skip and
+  // also NOT a failure — a code search never could search them, so folding
+  // them into `unsearched` would bury real failures under noise.
+  skippedBinaryCount: Schema.optional(NonNegativeInt),
 });
 export type ProjectSearchContentsResult = typeof ProjectSearchContentsResult.Type;
 

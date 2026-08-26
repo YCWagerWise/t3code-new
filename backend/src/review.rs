@@ -38,15 +38,15 @@ fn source(
     head: Option<&str>,
     diff: String,
 ) -> Value {
-    let truncated = diff.len() > MAX_DIFF_BYTES;
     let diff_hash = diff_hash(&diff);
-    let diff = if truncated {
-        // cut on a line boundary so the client never renders half a hunk header
-        let cut = diff[..MAX_DIFF_BYTES].rfind('\n').unwrap_or(MAX_DIFF_BYTES);
-        diff[..cut].to_string()
-    } else {
-        diff
-    };
+    // ONE helper, shared with `projects::read_file` (#353). This site used to
+    // slice `diff[..MAX_DIFF_BYTES]` directly, which panics when that byte lands
+    // inside a multibyte character — the `rfind` that looks like it would save
+    // it runs on the already-sliced value. `projects.rs` had the same code with
+    // the boundary walk added after an incident; the fix went in where the crash
+    // was seen and not where the logic lived, so this copy kept shipping.
+    let (capped, truncated) = crate::text::cap_at_line_boundary(&diff, MAX_DIFF_BYTES);
+    let diff = capped.to_string();
     json!({
         "id": id,
         "kind": kind,
@@ -480,5 +480,65 @@ mod tests {
         })).await.expect("an empty file reads fine");
         assert_eq!(ok["newContents"], "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PROOF (#353): a >400 KB diff whose byte at the cap is a UTF-8
+    /// CONTINUATION byte returns a truncated preview instead of panicking.
+    ///
+    /// This is the exact shape that took the backend down at the sibling site
+    /// (`projects.rs`, whose comment records the incident). The old line was
+    /// `diff[..MAX_DIFF_BYTES].rfind('\n')` — a byte slice evaluated BEFORE the
+    /// `rfind` that appears to guard it.
+    ///
+    /// The assertion is on the RETURNED VALUE, deliberately. A panic is not an
+    /// `Err`, so a test that merely checks `is_ok()` on a caught unwind would
+    /// pass for the wrong reason.
+    #[test]
+    fn a_diff_whose_cap_lands_mid_character_is_truncated_not_a_panic() {
+        // Pad with ASCII so that byte 400_000 falls INSIDE a 3-byte character:
+        // bytes 399_998..=400_000 are one '€'.
+        let mut diff = String::from("--- a/x\n+++ b/x\n");
+        diff.push_str(&"+ascii line\n".repeat(1000));
+        while diff.len() < 399_998 {
+            diff.push('x');
+        }
+        assert_eq!(diff.len(), 399_998);
+        diff.push('\u{20ac}'); // 3 bytes: 399_998, 399_999, 400_000
+        diff.push_str(&"y".repeat(10_000));
+        assert!(diff.len() > super::MAX_DIFF_BYTES);
+        assert!(
+            !diff.is_char_boundary(super::MAX_DIFF_BYTES),
+            "the fixture must actually straddle the cap, or it proves nothing"
+        );
+
+        let v = super::source("r1", "branch", "t", None, None, diff.clone());
+
+        assert_eq!(v["truncated"], true, "the client is told it is not seeing all of it");
+        let out = v["diff"].as_str().expect("a diff string came back");
+        assert!(!out.is_empty(), "a truncated preview is still a preview");
+        assert!(diff.starts_with(out), "the preview is a real prefix of the diff");
+        assert!(
+            out.len() <= super::MAX_DIFF_BYTES,
+            "the BYTE bound is what bounds the payload: {} > {}",
+            out.len(),
+            super::MAX_DIFF_BYTES
+        );
+        assert!(
+            out.ends_with("ascii line") || !out.contains('\n') || out.ends_with('x'),
+            "cut on a whole line where one exists"
+        );
+    }
+
+    /// The same fixture through `projects::read_file`'s path, so #229's fix
+    /// cannot regress now that both sites share one helper.
+    #[test]
+    fn the_shared_helper_keeps_the_read_file_path_boundary_safe() {
+        let mut text = "a".repeat(399_998);
+        text.push('\u{20ac}');
+        assert!(!text.is_char_boundary(400_000));
+        let (out, truncated) = crate::text::cap_at_line_boundary(&text, 400_000);
+        assert!(truncated);
+        assert_eq!(out.len(), 399_998, "backed up off the continuation byte");
+        assert!(text.starts_with(out));
     }
 }

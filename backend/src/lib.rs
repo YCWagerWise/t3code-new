@@ -11,5 +11,7 @@ pub mod review;
 pub mod settings;
 pub mod sourcecontrol;
 pub mod terminal;
+// #353: the one place text gets capped for the wire.
+pub mod text;
 pub mod tools;
 pub mod vcs;
