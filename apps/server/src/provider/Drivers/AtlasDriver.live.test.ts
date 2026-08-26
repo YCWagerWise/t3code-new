@@ -22,7 +22,13 @@ import * as Effect from "effect/Effect";
 import { ThreadId } from "@t3tools/contracts";
 
 import { makeAtlasDriver, probeAtlasHost } from "./AtlasDriver.ts";
-import { readCatalog, readEvents, type AtlasEndpoint, type FetchLike } from "./AtlasConsole.ts";
+import {
+  readCatalog,
+  readEvents,
+  readFeed,
+  type AtlasEndpoint,
+  type FetchLike,
+} from "./AtlasConsole.ts";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 
@@ -171,7 +177,8 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     const session = await Effect.runPromise(
       adapter.startSession({ threadId, runtimeMode: "local" } as never),
     );
-    expect(session.resumeCursor).toEqual({ epoch: 1, after: 0 });
+    // The lifecycle half starts at the top of epoch 1; the feed half is carried alongside it.
+    expect(session.resumeCursor).toMatchObject({ epoch: 1, after: 0 });
 
     // A real Start, on a local model that bills nothing.
     const turn = await Effect.runPromise(
@@ -207,19 +214,67 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
         Effect.sync(() => seenAfterRestart.push(event.type)),
       ),
     );
+    // Both halves, as ProviderService persists them — a cursor carrying only the lifecycle
+    // position would leave the frame log to replay from its top, which is precisely what
+    // happened the first time this test was written and is worth pinning.
+    const framePage = await readFeed(endpoint(), String(threadId), { epoch: 0, after: 0 });
     const resumed = await Effect.runPromise(
       restarted.adapter.startSession({
         threadId,
         runtimeMode: "local",
-        resumeCursor: page.cursor,
+        resumeCursor: { ...page.cursor, feed: framePage.cursor },
       } as never),
     );
-    expect(resumed.resumeCursor).toEqual({ epoch: 1, after: 3 });
+    expect(resumed.resumeCursor).toMatchObject({ epoch: 1, after: 3 });
     await new Promise<void>((resolve) => setTimeout(resolve, 1500));
     expect(seenAfterRestart).toEqual([]);
     await Effect.runPromise(restarted.adapter.stopSession(threadId));
     await Effect.runPromise(Fiber.interrupt(fiber2));
   });
+
+  it("renders what a real model actually said, not just that a turn ended", async () => {
+    const created = await instance({});
+    const adapter = created.adapter;
+    const threadId = ThreadId.make(`live-content-${Date.now()}`);
+    const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() =>
+          seen.push({
+            type: event.type,
+            payload: (event as unknown as { payload: Record<string, unknown> }).payload,
+          }),
+        ),
+      ),
+    );
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+    await Effect.runPromise(
+      adapter.sendTurn({
+        threadId,
+        input: "Reply with exactly the word: pong",
+        // Local, tools-capable, and unbilled.
+        modelSelection: { model: "ollama/qwen2.5-coder:7b" },
+      } as never),
+    );
+
+    // Wait for the ANSWER, not merely for the turn to close — the whole point of the finding.
+    for (let attempt = 0; attempt < 900; attempt += 1) {
+      if (seen.some((event) => event.type === "content.delta")) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+    await Effect.runPromise(adapter.stopSession(threadId));
+    await Effect.runPromise(Fiber.interrupt(fiber));
+
+    // What the model chose to say is its business — a local 7B may answer, or may recite the
+    // tool list it was handed. What is under test is that its words REACH the lens at all,
+    // which before this change they never did: the turn closed with nothing in between.
+    const answer = seen.find((event) => event.type === "content.delta");
+    expect(answer).toBeDefined();
+    expect(answer?.payload["streamKind"]).toEqual("assistant_text");
+    expect(String(answer?.payload["delta"]).length).toBeGreaterThan(0);
+    // And the boundary still arrives, from the supervisor rather than from a frame.
+    expect(seen.some((event) => event.type === "turn.completed")).toBe(true);
+  }, 120_000);
 
   it("cancels a real turn through the authority, and a repeated cancel commits once", async () => {
     const created = await instance({});

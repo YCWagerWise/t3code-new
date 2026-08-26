@@ -47,13 +47,16 @@ import {
   cancelTurn,
   type AtlasCursor,
   type AtlasEndpoint,
+  type AtlasFeedCursor,
   type AtlasLifecycleEvent,
   type FetchLike,
   fingerprint,
   parseAtlasCursor,
+  projectFeedFrame,
   projectLifecycleEvent,
   readCatalog,
   readEvents,
+  readFeed,
   resolveInput,
   startTurn,
   turnRequestId,
@@ -242,6 +245,8 @@ const nowIso = () => new Date().toISOString();
 
 interface LiveThread {
   cursor: AtlasCursor;
+  /** Position in the FRAME feed — a different log with its own epoch space. */
+  feedCursor: AtlasFeedCursor;
   activeTurnId: string | undefined;
   /**
    * The id the in-flight send was committed under, kept so a retry of the SAME logical send
@@ -373,23 +378,34 @@ export const makeAtlasAdapter = (
         const live = threads.get(threadId);
         if (live === undefined) break;
         try {
+          // Two logs, read together. The lifecycle log carries the turn's BOUNDARIES and the
+          // frame feed carries what it SAID — a reader that takes only the first renders a
+          // turn that starts and completes with nothing in between.
           const page = await readEvents(input.endpoint, threadId, live.cursor);
+          const frames = await readFeed(input.endpoint, threadId, live.feedCursor);
           backoff = 0;
-          if (page.events.length > 0) {
-            const current = threads.get(threadId);
-            if (current === undefined) break;
-            threads.set(threadId, { ...current, cursor: page.cursor });
-            observe(threadId, page.events);
-            const projected = page.events.flatMap((event) =>
+          const current = threads.get(threadId);
+          if (current === undefined) break;
+          threads.set(threadId, { ...current, cursor: page.cursor, feedCursor: frames.cursor });
+          if (page.events.length > 0) observe(threadId, page.events);
+          const projected = [
+            ...page.events.flatMap((event) =>
               projectLifecycleEvent(event, {
                 threadId: threadId as unknown as ThreadId,
                 createdAt: nowIso(),
               }),
-            );
-            if (projected.length > 0) publish(projected);
-            // More may already be waiting; ask again before parking.
-            continue;
-          }
+            ),
+            ...frames.frames.flatMap((frame) =>
+              projectFeedFrame(frame, {
+                threadId: threadId as unknown as ThreadId,
+                createdAt: nowIso(),
+                ...(current.activeTurnId === undefined ? {} : { turnId: current.activeTurnId }),
+              }),
+            ),
+          ];
+          if (projected.length > 0) publish(projected);
+          // More may already be waiting; ask again before parking.
+          if (page.events.length > 0 || frames.frames.length > 0) continue;
           await gate.wait(idlePollMs);
         } catch {
           // A feed read that fails must not kill the reader: Atlas's log is durable and the
@@ -457,9 +473,15 @@ export const makeAtlasAdapter = (
         // Resume where the last process stopped. Resetting to `{epoch:1, after:0}` here — as
         // this driver used to — threw away the persisted position on every restart and
         // re-rendered the whole thread; an unparseable blob is the only case that replays.
-        const resumed = parseAtlasCursor(start.resumeCursor) ?? { epoch: 1, after: 0 };
+        // One persisted blob carries BOTH positions: `{...lifecycle, feed?}`. An older blob
+        // that predates the feed reader parses as the lifecycle half and starts the frame feed
+        // at its beginning, which replays content rather than skipping it.
+        const persisted = start.resumeCursor as Record<string, unknown> | undefined;
+        const resumed = parseAtlasCursor(persisted) ?? { epoch: 1, after: 0 };
+        const resumedFeed = parseAtlasCursor(persisted?.["feed"]) ?? { epoch: 0, after: 0 };
         threads.set(threadId, {
           cursor: resumed,
+          feedCursor: resumedFeed,
           activeTurnId: undefined,
           pendingRequestId: undefined,
           awaitingRef: undefined,
@@ -471,7 +493,7 @@ export const makeAtlasAdapter = (
           status: "ready" as const,
           runtimeMode: start.runtimeMode,
           threadId: start.threadId,
-          resumeCursor: resumed,
+          resumeCursor: { ...resumed, feed: resumedFeed },
           createdAt: nowIso(),
           updatedAt: nowIso(),
         };
@@ -483,6 +505,7 @@ export const makeAtlasAdapter = (
           const threadId = String(turn.threadId);
           const live = threads.get(threadId) ?? {
             cursor: { epoch: 1, after: 0 },
+            feedCursor: { epoch: 0, after: 0 },
             activeTurnId: undefined,
             pendingRequestId: undefined,
             awaitingRef: undefined,
@@ -533,7 +556,10 @@ export const makeAtlasAdapter = (
             // The cursor as it stands now. `ProviderService` persists exactly this value onto
             // the session binding (`ProviderService.ts` `directory.upsert({ resumeCursor })`),
             // which is what `startSession` reads back on the next process.
-            resumeCursor: (threads.get(threadId) ?? committed).cursor,
+            resumeCursor: {
+              ...(threads.get(threadId) ?? committed).cursor,
+              feed: (threads.get(threadId) ?? committed).feedCursor,
+            },
           };
         },
         catch: (cause) => refuse("sendTurn", cause),

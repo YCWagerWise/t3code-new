@@ -272,6 +272,8 @@ const makeFakeAtlas = () => {
   const commands: Array<Record<string, unknown>> = [];
   const receipts = new Map<string, unknown>();
   const log: Array<Record<string, unknown>> = [];
+  const frames: Array<Record<string, unknown>> = [];
+  const FEED_EPOCH = 1_700_000_000_000;
   let failReads = 0;
   let reads = 0;
   let consumedUpTo = 0;
@@ -290,6 +292,14 @@ const makeFakeAtlas = () => {
 
   const fetch: FetchLike = (url, init) => {
     const href = String(url);
+    if (href.includes("/feed")) {
+      const after = Number(new URL(href).searchParams.get("after") ?? 0);
+      const visible = frames.filter((frame) => Number(frame["seq"]) > after);
+      return Promise.resolve({
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify({ epoch: FEED_EPOCH, frames: visible })),
+      });
+    }
     if (href.includes("/events")) {
       reads += 1;
       if (failReads > 0) {
@@ -324,10 +334,16 @@ const makeFakeAtlas = () => {
     return Promise.resolve({ status: 200, text: () => Promise.resolve(JSON.stringify(receipt)) });
   };
 
+  /** Publish an agent frame — what the turn SAID, on the other log. */
+  const say = (kind: string, payload: Record<string, unknown>): void => {
+    frames.push({ epoch: FEED_EPOCH, seq: frames.length + 1, kind, role: "agent", payload });
+  };
+
   return {
     fetch,
     commands,
     append,
+    say,
     reads: () => reads,
     consumedUpTo: () => consumedUpTo,
     failNextReads: (count: number) => {
@@ -441,6 +457,77 @@ describe("the Atlas feed, once a session is open", () => {
   });
 });
 
+describe("what the turn said", () => {
+  it("delivers the answer, not just the fact that a turn ended", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<{ type: string; payload: unknown }> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() =>
+          seen.push({ type: event.type, payload: (event as { payload: unknown }).payload }),
+        ),
+      ),
+    );
+    await startSession(adapter);
+    await Effect.runPromise(
+      adapter.sendTurn({ threadId: ThreadId.make("thr-1"), input: "ping" } as never),
+    );
+    // The boundary log and the frame log both speak, as a real node's do.
+    node.append("command.accepted", { command: { kind: "start" } });
+    node.say("assistant", { text: "pong" });
+    node.append("provider.stopped", stopObservation());
+    await waitFor(() => seen.some((event) => event.type === "content.delta"), "the answer");
+    await teardown(adapter, fiber);
+
+    // The regression this closes: a turn that starts and completes with nothing in between.
+    const answer = seen.find((event) => event.type === "content.delta");
+    expect(answer?.payload).toEqual({ streamKind: "assistant_text", delta: "pong" });
+    expect(seen.map((event) => event.type)).toContain("turn.completed");
+  });
+
+  it("opens a request a user can act on when a tool call is held", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<Record<string, unknown>> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => seen.push(event as unknown as Record<string, unknown>)),
+      ),
+    );
+    await startSession(adapter);
+    node.say("approval", {
+      request_id: "run-1:call-7",
+      request_type: "command_execution_approval",
+      reason: "wants to run rm",
+      args: { cmd: "rm -rf /" },
+    });
+    await waitFor(() => seen.some((event) => event["type"] === "request.opened"), "the request");
+    await teardown(adapter, fiber);
+
+    const opened = seen.find((event) => event["type"] === "request.opened");
+    // Atlas's `{run_id}:{call_id}` travels intact — it is the only string an approval may quote
+    // back, and `await_approval` matches it exactly.
+    expect(opened?.["requestId"]).toEqual("run-1:call-7");
+  });
+
+  it("stays silent on frames it does not understand rather than guessing a turn state", async () => {
+    const node = makeFakeAtlas();
+    const adapter = adapterFor(node);
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await startSession(adapter);
+    node.say("usage", { tokens: 12 });
+    node.say("ctx", { used: 1, window: 2 });
+    // The console's own commands must never echo back as content.
+    node.say("turn", { state: "done" });
+    await settle();
+    await teardown(adapter, fiber);
+    // A `turn` frame projected here would make the lens a second boundary author.
+    expect(seen).toEqual([]);
+  });
+});
+
 describe("the cursor across a restart", () => {
   it("resumes from the persisted cursor instead of replaying the thread from zero", async () => {
     const node = makeFakeAtlas();
@@ -457,14 +544,24 @@ describe("the cursor across a restart", () => {
 
     // This is the value ProviderService persists onto the session binding
     // (`directory.upsert({ resumeCursor })` in ProviderService.ts).
-    expect(turn.resumeCursor).toEqual({ epoch: 1, after: 1 });
+    // The feed half carries the stream's real epoch once the reader has seen it, so a restart
+    // resumes that log too instead of re-reading it from the top.
+    expect(turn.resumeCursor).toEqual({
+      epoch: 1,
+      after: 1,
+      feed: { epoch: 1_700_000_000_000, after: 0 },
+    });
 
     // A new process, same durable log, hydrated from what was persisted.
     const adapterB = adapterFor(node);
     const seenB: Array<string> = [];
     const fiberB = collect(adapterB, seenB);
     const session = await startSession(adapterB, turn.resumeCursor);
-    expect(session.resumeCursor).toEqual({ epoch: 1, after: 1 });
+    expect(session.resumeCursor).toEqual({
+      epoch: 1,
+      after: 1,
+      feed: { epoch: 1_700_000_000_000, after: 0 },
+    });
     await settle();
     // The already-consumed event is NOT re-delivered...
     expect(seenB).toEqual([]);
@@ -481,7 +578,7 @@ describe("the cursor across a restart", () => {
     const session = await startSession(adapter, { nonsense: true });
     await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
     // Replaying costs a re-render; guessing a position would silently drop events.
-    expect(session.resumeCursor).toEqual({ epoch: 1, after: 0 });
+    expect(session.resumeCursor).toEqual({ epoch: 1, after: 0, feed: { epoch: 0, after: 0 } });
   });
 });
 

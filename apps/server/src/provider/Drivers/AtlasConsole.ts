@@ -463,7 +463,8 @@ export const parseAtlasCursor = (raw: unknown): AtlasCursor | null => {
   if (typeof raw !== "object" || raw === null) return null;
   const epoch = (raw as Record<string, unknown>)["epoch"];
   const after = (raw as Record<string, unknown>)["after"];
-  if (typeof epoch !== "number" || !Number.isFinite(epoch) || epoch < 1) return null;
+  // The lifecycle log counts epochs from 1; the frame feed uses 0 for "no stream read yet".
+  if (typeof epoch !== "number" || !Number.isFinite(epoch) || epoch < 0) return null;
   if (typeof after !== "number" || !Number.isFinite(after) || after < 0) return null;
   return { epoch, after };
 };
@@ -551,5 +552,219 @@ export const resolveInput = async (
           ? (parsed["message"] as string)
           : `resolve_input answered ${response.status}`,
     });
+  }
+};
+
+// ─────────────────────── the frame feed (what the turn SAID) ───────────────────────
+
+/**
+ * Where a reader is in a thread's FRAME feed.
+ *
+ * Separate from {@link AtlasCursor} because these are two different logs with two different
+ * epoch spaces. The lifecycle log is the supervisor's record of what a run *did* — accepted,
+ * connected, stopped — and its epoch counts from 1. The frame feed is what the turn *said*,
+ * and its epoch is a wall-clock stamp minted per stream. Sharing one cursor between them would
+ * mean one log's epoch silently resetting the other's position.
+ */
+export interface AtlasFeedCursor {
+  readonly epoch: number;
+  readonly after: number;
+}
+
+export interface AtlasFrame {
+  readonly seq: number;
+  readonly epoch: number;
+  readonly kind: string;
+  readonly role: string;
+  readonly payload: Record<string, unknown>;
+}
+
+export interface AtlasFramePage {
+  readonly frames: ReadonlyArray<AtlasFrame>;
+  readonly cursor: AtlasFeedCursor;
+}
+
+const decodeFrame = (entry: unknown): AtlasFrame | null => {
+  if (typeof entry !== "object" || entry === null) return null;
+  const row = entry as Record<string, unknown>;
+  const seq = row["seq"];
+  const kind = row["kind"];
+  if (typeof seq !== "number" || typeof kind !== "string") return null;
+  const payload = row["payload"];
+  return {
+    seq,
+    epoch: typeof row["epoch"] === "number" ? row["epoch"] : 0,
+    kind,
+    role: typeof row["role"] === "string" ? row["role"] : "",
+    payload:
+      typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {},
+  };
+};
+
+/**
+ * Read the thread's frames after `cursor`.
+ *
+ * The answer a model gave is published HERE, not on the lifecycle log — the drive's own comment
+ * says it plainly: "the supervisor records that a run completed, never what it said"
+ * (`atlas-host/src/lib.rs`, `publish_outcome_frames`). A driver that polls only `/events` can
+ * therefore render a turn that starts and completes with nothing in between, which is exactly
+ * the empty-turn failure this feed closes.
+ *
+ * A new `epoch` is a new stream, so the position resets to the start of it rather than being
+ * carried across — an `after` from the previous epoch names a frame that is not in this one.
+ */
+export const readFeed = async (
+  endpoint: AtlasEndpoint,
+  threadId: string,
+  cursor: AtlasFeedCursor,
+): Promise<AtlasFramePage> => {
+  const url =
+    `${endpoint.baseUrl}/console/v1/threads/${encodeURIComponent(threadId)}/feed` +
+    `?after=${cursor.after}${cursor.epoch > 0 ? `&epoch=${cursor.epoch}` : ""}`;
+  const response = await endpoint.fetch(url, { method: "GET", headers: headers(endpoint) });
+  const body = await response.text();
+  if (response.status < 200 || response.status >= 300) {
+    throw new AtlasRefusal({
+      status: response.status,
+      code: "feed_unavailable",
+      message: `feed answered ${response.status}`,
+    });
+  }
+  const parsed = parse(body);
+  const epoch = typeof parsed?.["epoch"] === "number" ? (parsed["epoch"] as number) : cursor.epoch;
+  const raw = Array.isArray(parsed?.["frames"]) ? (parsed["frames"] as unknown[]) : [];
+  const frames = raw.flatMap((entry) => {
+    const decoded = decodeFrame(entry);
+    return decoded === null ? [] : [decoded];
+  });
+  // A stream we have not read before starts at its beginning, not at a stale offset.
+  const base = epoch === cursor.epoch ? cursor.after : 0;
+  const highest = frames.reduce((max, frame) => (frame.seq > max ? frame.seq : max), base);
+  return { frames, cursor: { epoch, after: highest } };
+};
+
+/** Frames the console itself wrote. Echoing our own commands back as content would double them. */
+const AGENT_ROLE = "agent";
+
+/**
+ * Turn one Atlas frame into T3 runtime events.
+ *
+ * Deliberately narrow: this projects CONTENT and REQUESTS only. Turn boundaries stay with the
+ * supervisor's lifecycle log, because Atlas is explicit that a run has exactly one boundary
+ * author (`run_supervisor::project_to_feed`) — projecting `turn`/`lifecycle` frames here as
+ * well would make the lens a second author, and the two can disagree.
+ *
+ * An unrecognised kind returns nothing rather than guessing. Atlas's own note on why that
+ * matters: an unknown *kind* is ignored, whereas an unknown turn *state* used to fall through
+ * and render as a completed turn — closing the turn green while the agent was still working.
+ */
+export const projectFeedFrame = (
+  frame: AtlasFrame,
+  context: { readonly threadId: ThreadId; readonly createdAt: string; readonly turnId?: string },
+): ReadonlyArray<ProviderRuntimeEvent> => {
+  if (frame.role !== AGENT_ROLE) return [];
+  const base = {
+    eventId: EventId.make(`atlas-frame-${frame.epoch}-${frame.seq}`),
+    provider: ATLAS_DRIVER_KIND,
+    threadId: context.threadId,
+    createdAt: context.createdAt,
+    ...(context.turnId === undefined ? {} : { turnId: TurnId.make(context.turnId) }),
+  };
+  const text = typeof frame.payload["text"] === "string" ? (frame.payload["text"] as string) : "";
+
+  const delta = (streamKind: string): ReadonlyArray<ProviderRuntimeEvent> =>
+    text.length === 0
+      ? []
+      : [
+          {
+            ...base,
+            type: "content.delta",
+            payload: { streamKind, delta: text },
+          } as ProviderRuntimeEvent,
+        ];
+
+  switch (frame.kind) {
+    // The answer. This is the frame whose absence made a completed Atlas turn render empty.
+    case "assistant":
+      return delta("assistant_text");
+    case "thinking":
+      return delta("reasoning_text");
+    case "tool_call": {
+      const name = frame.payload["name"] ?? frame.payload["tool"];
+      return [
+        {
+          ...base,
+          type: "item.started",
+          payload: {
+            itemType: "tool_call",
+            ...(typeof name === "string" && name.length > 0 ? { title: name } : {}),
+            data: frame.payload,
+          },
+        } as ProviderRuntimeEvent,
+      ];
+    }
+    case "tool_result":
+      return [
+        {
+          ...base,
+          type: "item.completed",
+          payload: { itemType: "tool_call", data: frame.payload },
+        } as ProviderRuntimeEvent,
+      ];
+    // A held tool call. `request_id` is Atlas's `{run_id}:{call_id}` and is the ONLY string an
+    // approval may quote back — `await_approval` matches on it exactly and ignores anything else.
+    case "approval": {
+      const requestId = frame.payload["request_id"];
+      if (typeof requestId !== "string") return [];
+      const requestType = frame.payload["request_type"];
+      return [
+        {
+          ...base,
+          requestId,
+          type: "request.opened",
+          payload: {
+            requestType:
+              typeof requestType === "string" && requestType.length > 0
+                ? requestType
+                : "command_execution_approval",
+            ...(typeof frame.payload["reason"] === "string"
+              ? { detail: frame.payload["reason"] as string }
+              : {}),
+            args: frame.payload["args"],
+          },
+        } as ProviderRuntimeEvent,
+      ];
+    }
+    case "error":
+      return [
+        {
+          ...base,
+          type: "runtime.error",
+          payload: {
+            errorClass: "provider_error",
+            message:
+              typeof frame.payload["message"] === "string"
+                ? (frame.payload["message"] as string)
+                : "atlas reported an error",
+          },
+        } as ProviderRuntimeEvent,
+      ];
+    case "warning":
+      return [
+        {
+          ...base,
+          type: "runtime.warning",
+          payload: {
+            message:
+              typeof frame.payload["message"] === "string"
+                ? (frame.payload["message"] as string)
+                : "atlas reported a warning",
+          },
+        } as ProviderRuntimeEvent,
+      ];
+    // `user` is already in T3's own transcript; `turn`/`lifecycle` belong to the supervisor;
+    // `ctx`/`usage` have no T3 runtime event. All deliberately silent.
+    default:
+      return [];
   }
 };
