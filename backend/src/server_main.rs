@@ -2841,19 +2841,28 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // carrying the original timestamp so the row is identical.
                 match state.rt.pending_user_inputs(thread_id).await {
                     Ok(asks) => {
+                        // #293: these arrive TYPED now, so the four `unwrap_or`s
+                        // that used to live here are gone — not tightened, gone,
+                        // because there is no longer an Option to default. The
+                        // two that mattered: `sessionId` defaulted to `""`,
+                        // projecting a real parked ask under an identity no
+                        // answer could route to; and `createdAt` defaulted to
+                        // the SERVER'S CURRENT CLOCK, so a question parked for
+                        // an hour rendered brand new on every reconnect and no
+                        // staleness or timeout UI could fire against it. A
+                        // durable record's age is a fact about the record.
                         for ask in asks {
-                            let session_id = ask["sessionId"].as_str().unwrap_or("");
                             activities.push(json!({
-                                "id": format!("user-input:{session_id}"),
+                                "id": format!("user-input:{}", ask.session_id),
                                 "tone": "approval",
                                 "kind": "user-input.requested",
-                                "summary": ask["prompt"].as_str().unwrap_or("The agent has a question"),
+                                "summary": ask.prompt,
                                 "payload": {
-                                    "requestId": session_id,
-                                    "prompt": ask["prompt"].clone(),
-                                    "questions": ask["questions"].clone(),
+                                    "requestId": ask.session_id,
+                                    "prompt": ask.prompt,
+                                    "questions": ask.questions,
                                 },
-                                "createdAt": ask["requestedAt"].as_str().unwrap_or(now.as_str()),
+                                "createdAt": ask.requested_at,
                             }));
                         }
                     }

@@ -20,3 +20,36 @@
 # invocation instead of only the ones run with the env var set by hand.
 [net]
 git-fetch-with-cli = true
+
+# `cargo test-all` — the declared check for this backend (#378, re-graded from #325).
+#
+# WHY THIS ALIAS EXISTS. It is not a convenience.
+#
+# `cargo test` is FAIL-FAST ACROSS TARGETS. When one target fails, every target
+# after it is never built and never run — and the output STILL ENDS in a
+# cheerful `test result: ok` line from the ones that did run. A single flake
+# therefore removes whole test binaries from the count while the tail of the
+# output looks green. On this repo that hid 21 tests behind one flake:
+# restart_reconnect (15), shell_session (4), log_backpressure (1),
+# agent_default_model (1).
+#
+# That is worse than a red build. A red build tells you something; a short
+# green one tells you the same thing a complete green one does, while being
+# false.
+#
+# `--no-fail-fast` runs every target regardless, so the number reported is the
+# whole suite. With it the honest shared-tree figure is 270 passed / 0 failed /
+# 0 ignored across 7 targets — the tree really is green. What was missing was
+# the ability to KNOW that, which is the entire finding.
+#
+# ALSO NOTE, because `--lib` is a trap in this repo specifically:
+# `src/server_main.rs` is a separate `[[bin]]`, so the contract tests compile
+# into the `t3code-server` binary and NOT into the lib. `cargo test --lib`
+# reports a plausible ~119 and contains none of them. `--all-targets` covers
+# both.
+#
+# Do NOT silence a flake with `#[ignore]`: that removes the flake and the
+# guarantee it was protecting in the same edit.
+[alias]
+test-all = "test --all-targets --no-fail-fast"
+test-all-release = "test --all-targets --no-fail-fast --release"

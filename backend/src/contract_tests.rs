@@ -371,9 +371,17 @@ fn checkpoint_thread(id: &str) -> Value {
         "title": id,
         "runtimeMode": "full-access",
         // The thread decoder refuses to INVENT these two, so a fixture that
-        // omits them is not a valid durable thread row. `null` is a recorded
-        // "no selection", which is what this fixture means.
-        "modelSelection": Value::Null,
+        // omits them is not a valid durable thread row.
+        //
+        // This used to be `Value::Null` with a comment calling that "a recorded
+        // no selection". That reading is no longer the contract: #87's
+        // `required_model_selection` demands an OBJECT with `instanceId` and
+        // `model`, and rejects null exactly as it rejects a missing key — on
+        // the stated reasoning that a persisted row whose selection cannot be
+        // read must not be projected as though some default had been chosen.
+        // A fixture writing a row production would refuse to write is not
+        // exercising production.
+        "modelSelection": json!({ "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }),
         "interactionMode": "default",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
@@ -5972,7 +5980,7 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         state
             .rt
             .save_thread(&json!({ "runtimeMode": "full-access","id": "t-reconnect", "title": "before the restart",
-                "projectId": "p-workspace", "modelSelection": null, "interactionMode": "default",
+                "projectId": "p-workspace", "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
                 "createdAt": now_iso(), "updatedAt": now_iso()}))
             .await
             .unwrap();
@@ -8337,7 +8345,7 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-durable-only", "projectId": "p-workspace", "title": "written durably",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9140,10 +9148,24 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
     );
 }
 
+/// A durable thread row for the checkpoint/revert proofs.
+///
+/// `modelSelection` used to be `null` here. That stopped being a legal row when
+/// #87 made `ThreadRecord::from_row` fail closed on it — the comment there calls
+/// defaulting a persisted row's access level "a privilege grant performed by a
+/// missing key", and the same reasoning covers the model: a thread whose
+/// recorded selection cannot be read must not be projected as if some default
+/// had been chosen.
+///
+/// So the FIXTURE was the thing that was wrong, not the decoder. A test that
+/// writes a row production would refuse to write is not exercising production;
+/// it is exercising a shape that can no longer exist. These 12 tests were
+/// failing on a row the runtime would never persist.
 fn thread_row_ck(id: &str) -> Value {
     json!({
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
+        "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
 }
@@ -9366,7 +9388,7 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
     // The thread is dispatched into the WORKTREE.
     let thread = json!({
         "id": "t-wt", "projectId": "p-workspace", "title": "wt-thread",
-        "modelSelection": null,
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
         "runtimeMode": "full-access",
         "interactionMode": "default",
         "worktreePath": worktree.to_string_lossy(),
@@ -9597,7 +9619,7 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-archived", "projectId": "p-workspace", "title": "old",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(), "archivedAt": now_iso(),
         }))
         .await
@@ -9747,7 +9769,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-live", "projectId": "p-workspace", "title": "int",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -10047,7 +10069,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-neg", "projectId": "p-workspace", "title": "int-neg",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -10143,7 +10165,7 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     // (interrupt on an unknown thread is a no-op, not an error).
     state.rt.save_thread(&json!({ "runtimeMode": "full-access",
         "id": "t-int", "projectId": "p-workspace", "title": "int",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })).await.unwrap();
     let ready = state.terminal.run("echo ready", false, Some(10), false).await;

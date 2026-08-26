@@ -551,13 +551,16 @@ async fn a_pending_question_is_answerable_again_after_a_restart() {
     let rt = boot(&data).await;
     let asks = rt.pending_user_inputs("thread-1").await.unwrap();
     assert_eq!(asks.len(), 1, "the ask must survive the restart: {asks:?}");
+    // #293: `pending_user_inputs` returns a TYPED `PendingUserInput` now, not a
+    // `Value` to index into — which is the point of that change, since indexing
+    // was how `unwrap_or("")` became reachable at the call site.
     assert_eq!(
-        asks[0]["sessionId"], "sess-1",
+        asks[0].session_id, "sess-1",
         "the routing needed to answer it comes from the durable request, not a process map"
     );
-    assert_eq!(asks[0]["questions"][0]["options"][1], "dev", "the options survive, so the answer is a choice");
+    assert_eq!(asks[0].questions[0]["options"][1], "dev", "the options survive, so the answer is a choice");
     assert_eq!(
-        asks[0]["requestedAt"], "2026-01-01T00:00:00.000Z",
+        asks[0].requested_at, "2026-01-01T00:00:00.000Z",
         "the rebuilt row carries the original timestamp, so it replaces the live row instead of stacking"
     );
 }
