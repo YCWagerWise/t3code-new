@@ -334,11 +334,11 @@ pub async fn discover() -> Value {
 /// report honestly that this environment cannot look them up.
 pub async fn lookup_repository(input: &Value) -> Result<Value, String> {
     let provider = input.get("provider").and_then(Value::as_str).unwrap_or("unknown");
-    let repository = input
+    let repository = validate_github_repository(input
         .get("repository")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or("repository is required")?;
+        .ok_or("repository is required")?)?;
     if provider != "github" {
         return Err(format!(
             "this environment can only look up github repositories (asked for {provider})"
@@ -427,11 +427,11 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
     // see, not just this environment's workspace or one of its worktrees (#181).
     let cwd_owned = crate::vcs::resolve_cwd(requested_cwd, workspace_root).await?;
     let cwd = cwd_owned.as_str();
-    let repository = input
+    let repository = validate_github_repository(input
         .get("repository")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .ok_or("repository is required")?;
+        .ok_or("repository is required")?)?;
     let provider = input.get("provider").and_then(Value::as_str).unwrap_or("github");
     if provider != "github" {
         return Err(format!(
@@ -497,6 +497,34 @@ pub async fn publish_repository(input: &Value, workspace_root: &str) -> Result<V
         "upstreamBranch": if pushed { json!(branch) } else { Value::Null },
         "status": if pushed { "pushed" } else { "remote_added" },
     }))
+}
+
+fn validate_github_repository(repository: &str) -> Result<&str, String> {
+    let repository = repository.trim();
+    if repository.starts_with('-') {
+        return Err("repository must be a GitHub repository name, not a CLI option".into());
+    }
+    let mut parts = repository.split('/');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if parts.next().is_some() {
+        return Err("repository must be NAME or OWNER/NAME".into());
+    }
+
+    fn valid_part(part: &str) -> bool {
+        !part.is_empty()
+            && !part.starts_with('-')
+            && !part.ends_with('-')
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    }
+
+    match second {
+        Some(name) if valid_part(first) && valid_part(name) => Ok(repository),
+        None if valid_part(first) => Ok(repository),
+        _ => Err("repository must be NAME or OWNER/NAME".into()),
+    }
 }
 
 #[cfg(test)]
@@ -631,5 +659,30 @@ mod tests {
         assert_eq!(maybe(Some("   ".into())), none());
         assert_eq!(maybe(None), none());
         assert_eq!(maybe(Some(" v1 ".into())), some("v1"));
+    }
+
+    #[test]
+    fn github_repository_identifiers_reject_cli_option_shapes() {
+        for repository in ["repo", "owner/repo", "owner.with-dots/repo_name"] {
+            assert_eq!(validate_github_repository(repository).unwrap(), repository);
+        }
+
+        for repository in [
+            "--template",
+            "--team",
+            "--add-readme",
+            "owner/--template",
+            "-owner/repo",
+            "owner/repo/extra",
+            "owner/",
+            "/repo",
+            "owner repo",
+        ] {
+            let err = validate_github_repository(repository).unwrap_err();
+            assert!(
+                err.contains("repository"),
+                "{repository:?} should fail as a repository identifier: {err}"
+            );
+        }
     }
 }
