@@ -10501,3 +10501,82 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// PROOF (#237): `run_turn` REFUSES when the durable thread record cannot prove
+/// how the turn should run — it does not invent `full-access` and the workspace
+/// root and run the provider anyway.
+///
+/// Two rows, one defect each, both previously survivable:
+///
+/// * NO ROW AT ALL. The old code read through the display helper `threads()`,
+///   filtered for the id, found nothing, and fell through to
+///   `provider_instance_id(&model)` / `full-access` / `default` / `options: []`
+///   / `cwd: None`. A transient store failure and a genuinely deleted thread
+///   were the same input, and the answer to both was "run it with everything
+///   turned on, in the main checkout".
+/// * A ROW MISSING `runtimeMode`. `pick("runtimeMode", "full-access")` read the
+///   absent key and granted the most access there is. `ThreadRecord::from_row`
+///   refuses that row instead, so the turn never starts.
+///
+/// What proves the refusal is that NO SESSION IS BOUND: `run_turn` reaching the
+/// provider is exactly what writes `thread_session`, so an empty
+/// `sessions_for_thread` after the prompt has been persisted is the fallback
+/// path not having been taken. The prompt itself IS persisted — a refusal that
+/// also lost the user's message would read on reload as if they never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_turn_refuses_a_thread_whose_durable_record_cannot_prove_its_policy() {
+    let dir = std::env::temp_dir().join(format!("t3ct-237-{}", uuid::Uuid::new_v4()));
+    let state = state_at(&dir).await;
+
+    // CASE 1: no durable row.
+    super::run_turn(
+        json!({
+            "threadId": "t-237-missing",
+            "message": { "text": "do the thing", "messageId": "m-237-a" },
+        }),
+        ModelRef::ClaudeResume { model: "test".into() },
+        state.clone(),
+    );
+    // CASE 2: a row that exists but cannot prove its access level.
+    state
+        .rt
+        .save_thread(&json!({
+            "id": "t-237-bad", "projectId": "p-workspace", "title": "bad",
+            "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    super::run_turn(
+        json!({
+            "threadId": "t-237-bad",
+            "message": { "text": "do the thing", "messageId": "m-237-b" },
+        }),
+        ModelRef::ClaudeResume { model: "test".into() },
+        state.clone(),
+    );
+
+    for (thread, msg) in [("t-237-missing", "m-237-a"), ("t-237-bad", "m-237-b")] {
+        // The refusal is asynchronous (`run_turn` spawns), so wait on the fact
+        // rather than on a fixed sleep.
+        let mut seen = false;
+        for _ in 0..200 {
+            if state.rt.has_message(thread, msg).await.unwrap_or(false) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            seen,
+            "{thread}: the refused turn must still persist the user's prompt {msg} — \
+             a refusal that drops it reads on reload as if they never asked"
+        );
+        assert!(
+            state.rt.sessions_for_thread(thread).await.unwrap().is_empty(),
+            "{thread}: a session was bound, so the turn REACHED THE PROVIDER. That is \
+             the invented-defaults path (#237): full-access, interaction default, no \
+             options, workspace root — none of which this thread's durable record proves."
+        );
+    }
+}

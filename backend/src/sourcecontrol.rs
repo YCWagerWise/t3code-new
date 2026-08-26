@@ -352,14 +352,18 @@ pub async fn lookup_repository(input: &Value) -> Result<Value, String> {
     // `ExecPolicy`, sandbox, timeout and output ceiling every other cairn
     // consumer gets, which is also what finally makes `ExecPolicy::git_only()`
     // mean something on this path.
-    let v: Value = cairn::gh_repo_view(repository, &cairn::Config::default())
+    // cairn now returns a TYPED `GitHubRepository` rather than raw JSON, so the
+    // three `unwrap_or("")` defaults this used to carry are gone: a field the
+    // lookup could not produce is cairn's error, not an empty string this layer
+    // invents and then hands to `clone_repository` as a remote URL.
+    let repo = cairn::gh_repo_view(repository, &cairn::Config::default())
         .await
         .map_err(|e| e.to_string())?;
     Ok(json!({
         "provider": "github",
-        "nameWithOwner": v.get("nameWithOwner").cloned().unwrap_or(json!(repository)),
-        "url": v.get("url").cloned().unwrap_or(json!("")),
-        "sshUrl": v.get("sshUrl").cloned().unwrap_or(json!("")),
+        "nameWithOwner": repo.name_with_owner,
+        "url": repo.url,
+        "sshUrl": repo.ssh_url,
     }))
 }
 
