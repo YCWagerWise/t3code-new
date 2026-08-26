@@ -4595,7 +4595,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 .respond_to_approval(&session, turn, &call_id, allow)
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(true) => {
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     if let Err(e) = publish_approval_resolved(
@@ -4606,6 +4606,21 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                         exit_failure(tx, &id, &format!("approval settlement projection failed: {e}"));
                                         return;
                                     }
+                                }
+                                Ok(false) => {
+                                    let detail =
+                                        "the approval did not match any pending request";
+                                    tracing::warn!(%request_id, "approval response matched no pending request");
+                                    if let Err(projection) = publish_approval_failed(
+                                        &state, &thread_id_of(&command), &request_id, detail,
+                                    )
+                                    .await
+                                    {
+                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        return;
+                                    }
+                                    exit_failure(tx, &id, detail);
+                                    return;
                                 }
                                 Err(e) => {
                                     // The answer did not land. Saying nothing
