@@ -3370,6 +3370,69 @@ async fn stop_command_fails_when_sdk_interrupt_state_is_unreadable() {
     );
 }
 
+/// #267: WHEN THE DURABLE CANCEL FAILS, NO CTRL-C IS SENT.
+///
+/// The ordering is the contract, not a style preference. `stop_thread_checked`
+/// used to interrupt the shared PTY FIRST and only then attempt the SDK's
+/// durable cancel. Ctrl-C into a shared PTY cannot be taken back — it kills
+/// whatever bash command happens to be in the foreground, which may have
+/// nothing to do with this turn. So a failed cancel left the user with a dead
+/// command AND a turn still running with nothing durable recorded.
+///
+/// The proof is a real `sleep` in the shared shell, faulted SDK state, and the
+/// assertion that the command RAN TO COMPLETION — the inverse of
+/// `stop_interrupts_the_hearth_foreground_and_cancels_the_turn`, which proves
+/// the same shell IS interrupted when the cancel succeeds. Both are needed:
+/// either alone is satisfiable by a stop that never interrupts anything.
+#[tokio::test]
+async fn a_failed_durable_cancel_sends_no_interrupt_to_the_shared_shell() {
+    let (state, dir) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-stop-no-ctrlc")).await.unwrap();
+
+    // A live shell with a real foreground command in it.
+    let runner = state.terminal.clone();
+    let running = tokio::spawn(async move { runner.run("sleep 3", false, Some(25), false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Now break ONLY the SDK's durable side.
+    drop_thread_session_table(&dir).await;
+
+    let started = std::time::Instant::now();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.turn.interrupt", "threadId": "t-stop-no-ctrlc",
+    }})).await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a failed durable cancel must fail the RPC: {exit}"
+    );
+
+    // THE POINT: the foreground command was never interrupted. It ran its full
+    // ~3s and reported a clean exit, because no Ctrl-C was ever sent.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), running)
+        .await
+        .expect("the foreground command finished on its own")
+        .expect("join");
+    assert!(
+        !outcome.interrupted,
+        "a Ctrl-C reached the shared PTY even though the durable cancel failed — \
+         that is the irreversible side effect #267 is about: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.exit_code, 0,
+        "the untouched command exits cleanly: {outcome:?}"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(2),
+        "it ran to completion rather than being cut short: {:?}",
+        started.elapsed()
+    );
+}
+
 /// #108: a stop command whose Hearth foreground interrupt cannot be delivered
 /// must fail the RPC before the generic synchronous-command Success ack.
 #[tokio::test]
@@ -5972,7 +6035,7 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         state
             .rt
             .save_thread(&json!({ "runtimeMode": "full-access","id": "t-reconnect", "title": "before the restart",
-                "projectId": "p-workspace", "modelSelection": null, "interactionMode": "default",
+                "projectId": "p-workspace", "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
                 "createdAt": now_iso(), "updatedAt": now_iso()}))
             .await
             .unwrap();
@@ -8337,7 +8400,7 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-durable-only", "projectId": "p-workspace", "title": "written durably",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -9143,7 +9206,7 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
 fn thread_row_ck(id: &str) -> Value {
     json!({
         "id": id, "projectId": "p-workspace", "title": "ck", "runtimeMode": "full-access",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })
 }
@@ -9366,7 +9429,7 @@ async fn a_worktree_backed_thread_checkpoints_and_reverts_the_worktree_not_the_w
     // The thread is dispatched into the WORKTREE.
     let thread = json!({
         "id": "t-wt", "projectId": "p-workspace", "title": "wt-thread",
-        "modelSelection": null,
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" },
         "runtimeMode": "full-access",
         "interactionMode": "default",
         "worktreePath": worktree.to_string_lossy(),
@@ -9597,7 +9660,7 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-archived", "projectId": "p-workspace", "title": "old",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(), "archivedAt": now_iso(),
         }))
         .await
@@ -9747,7 +9810,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-live", "projectId": "p-workspace", "title": "int",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -10047,7 +10110,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         .rt
         .save_thread(&json!({ "runtimeMode": "full-access",
             "id": "t-int-neg", "projectId": "p-workspace", "title": "int-neg",
-            "modelSelection": null, "interactionMode": "default",
+            "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
             "createdAt": now_iso(), "updatedAt": now_iso(),
         }))
         .await
@@ -10143,7 +10206,7 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     // (interrupt on an unknown thread is a no-op, not an error).
     state.rt.save_thread(&json!({ "runtimeMode": "full-access",
         "id": "t-int", "projectId": "p-workspace", "title": "int",
-        "modelSelection": null, "interactionMode": "default",
+        "modelSelection": { "instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001" }, "interactionMode": "default",
         "createdAt": now_iso(), "updatedAt": now_iso(),
     })).await.unwrap();
     let ready = state.terminal.run("echo ready", false, Some(10), false).await;
