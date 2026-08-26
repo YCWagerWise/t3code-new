@@ -4914,8 +4914,9 @@ fn run_turn(command: Value, model: ModelRef, state: AppState) {
                 .map_err(|e| format!("invalid model option: {e}"))
                 .unwrap_or_else(|e| {
                     tracing::warn!(%e, "dropping invalid persisted model options for turn");
-                    Vec::new()
+                    None
                 })
+                .unwrap_or_default()
         };
         let def = AgentDefinition {
             name: "t3code".into(),
