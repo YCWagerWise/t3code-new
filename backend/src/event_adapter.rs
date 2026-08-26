@@ -189,25 +189,6 @@ pub(super) fn approval_requested_activity(
     })
 }
 
-pub(super) fn pending_approval_activity(thread_id: &str, row: &Value) -> Result<Value, String> {
-    let approval = agent_sdk_shell::PendingApproval::decode(thread_id, row)?;
-    let mut activity = approval_requested_activity(
-        &approval.session_id,
-        approval.turn,
-        &approval.call_id,
-        &approval.tool,
-        &approval.args,
-        None,
-        approval.requested_at.as_deref().unwrap_or(""),
-    );
-    if approval.requested_at.is_none() {
-        if let Some(o) = activity.as_object_mut() {
-            o.remove("createdAt");
-        }
-    }
-    Ok(activity)
-}
-
 pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(String, Value)>) {
     let now = now.to_string();
     let now = now.as_str();

@@ -2294,7 +2294,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
             let cat = state.catalog.read().await;
-            exit_success(tx, &id, server_config(&cat, &loaded.rules, &loaded.issues));
+            exit_success(tx, &id, server_config(&cat, &loaded, &[]));
         }
 
         // Diagnostics (#67). The settings Diagnostics page is the one screen that
@@ -2430,7 +2430,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
-            let custom = loaded.rules;
+            let custom = loaded;
             let next = if method == "server.upsertKeybinding" {
                 keybindings::upsert(&custom, &input)
             } else {
@@ -2452,7 +2452,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // DECODED, so a malformed blob or a bad entry is rewritten away and
             // its issue is stale the moment the write lands. Recomputing from
             // the tree we just wrote is the honest report.
-            let wire = keybindings::result_wire(&next, &[]);
+            let wire = keybindings::result_wire(&next);
             exit_success(tx, &id, wire.clone());
             // Every other open surface (a second window, the command palette's
             // hint column) reads the projection this stream feeds, not this
@@ -3100,8 +3100,8 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 &id,
                 config_snapshot_event(server_config(
                     &*state.catalog.read().await,
-                    &loaded.rules,
-                    &loaded.issues,
+                    &loaded,
+                    &[],
                 )),
             );
             // Fanout attaches through the SDK's durable config topic (packet

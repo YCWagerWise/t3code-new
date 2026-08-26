@@ -962,7 +962,7 @@ async fn thread_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() {
         "hasPendingUserInput": false,
         "hasActionableProposedPlan": false,
     });
-    upsert_thread_on_shell(&state, thread).await.unwrap();
+    upsert_thread_on_shell(&state, thread).await;
 
     let frames = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
         f.get("values")
@@ -6194,8 +6194,7 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
                 json!({"id": format!("t-{i}"), "title": "before", "projectId": "p",
                        "createdAt": now_iso(), "updatedAt": now_iso()}),
             )
-            .await
-            .unwrap();
+            .await;
         }
         let (tx, mut rx) = mpsc::unbounded_channel();
         request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -6223,8 +6222,7 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
         json!({"id": "t-after-restart", "title": "after", "projectId": "p",
                "createdAt": now_iso(), "updatedAt": now_iso()}),
     )
-    .await
-    .unwrap();
+    .await;
 
     // Match on the NEW thread id, not just kind — subscribe delivers the
     // broker's retained latest frame (seq 5, from the pre-restart upserts)
