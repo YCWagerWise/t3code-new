@@ -6668,6 +6668,88 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #337: the real dispatch route must read first-turn lifecycle metadata from
+/// `bootstrap.createThread`, not only from top-level fields or an already
+/// persisted row. A draft thread has no durable row yet; rejecting this shape
+/// before `ensure_thread_on_shell` runs strands the composer draft.
+#[tokio::test]
+async fn first_turn_launch_reads_runtime_metadata_from_bootstrap_create_thread() {
+    let (state, dir) = test_state().await;
+    let wt = dir.join("wt-dispatch");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    let (shell_tx, mut shell_rx) = mpsc::unbounded_channel();
+    request(&state, &shell_tx, "orchestration.subscribeShell", json!({})).await;
+    let _ = drain(&mut shell_rx);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.start",
+            "commandId": "c-bootstrap-mode",
+            "threadId": "t-bootstrap-mode",
+            "message": {
+                "messageId": "m-bootstrap-mode",
+                "role": "user",
+                "text": "start with the selected mode",
+                "attachments": []
+            },
+            "modelSelection": {
+                "instanceId": "claudeAgent",
+                "model": "claude-haiku-4-5-20251001"
+            },
+            "bootstrap": { "createThread": {
+                "projectId": "p-bootstrap",
+                "title": "Bootstrap mode",
+                "runtimeMode": "approval-required",
+                "interactionMode": "plan",
+                "branch": "feature/bootstrap-mode",
+                "worktreePath": wt.to_string_lossy(),
+            }},
+        }}),
+    )
+    .await;
+
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("dispatch exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "bootstrap runtimeMode under createThread must pass dispatch admission: {exit}"
+    );
+
+    let saved = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-bootstrap-mode")
+        .expect("dispatch persisted the draft thread");
+    assert_eq!(saved["runtimeMode"], "approval-required");
+    assert_eq!(saved["interactionMode"], "plan");
+    assert_eq!(saved["worktreePath"], wt.to_string_lossy().as_ref());
+    assert_eq!(saved["branch"], "feature/bootstrap-mode");
+
+    let announced = drain_until(&mut shell_rx, std::time::Duration::from_secs(2), |f| {
+        f.get("values")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.iter().any(|x| x["kind"] == "thread-upserted"))
+    })
+    .await;
+    let thread = announced
+        .iter()
+        .flat_map(|f| f["values"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["kind"] == "thread-upserted" && v["thread"]["id"] == "t-bootstrap-mode")
+        .map(|v| v["thread"].clone())
+        .unwrap_or_else(|| panic!("no bootstrap thread-upserted in {announced:#?}"));
+    assert_eq!(thread["runtimeMode"], "approval-required");
+    assert_eq!(thread["interactionMode"], "plan");
+}
+
 /// #72: the path picker and open-in-editor are implemented, and their
 /// failures are DISTINGUISHABLE.
 #[tokio::test]
