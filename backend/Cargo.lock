@@ -62,6 +62,7 @@ dependencies = [
  "agent-sdk-runtime",
  "agent-sdk-stream",
  "async-trait",
+ "do-pubsub",
  "serde",
  "serde_json",
  "tokio",
@@ -110,6 +111,7 @@ dependencies = [
  "agent-sdk-core",
  "async-trait",
  "do-coord",
+ "do-pubsub",
  "do-rs",
  "do-step",
  "fs2",
@@ -1171,6 +1173,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "do-analytics",
+ "do-coord",
  "do-core",
  "do-rpc",
  "do-runtime",
@@ -1202,6 +1205,7 @@ dependencies = [
  "do-core",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
