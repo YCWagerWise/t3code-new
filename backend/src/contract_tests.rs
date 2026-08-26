@@ -5770,8 +5770,9 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     };
     assert!(mark > 0, "the first process actually advanced the sequence");
 
-    // Second process over the SAME data dir. Nothing is carried in memory —
-    // this is the restart the old counter could not survive.
+    // Fresh AppState over the SAME data dir. This proves the durable read path
+    // after all in-process handles are dropped; crash recovery is covered by
+    // `thread_snapshot_survives_sigkill_without_drop`.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -5815,14 +5816,14 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RESTART is the only honest test of a durable read model: a reconnecting
-/// client must be handed the same thread by a backend that was not running
-/// when the thread was written.
+/// A fresh runtime over the same durable store is the fast contract proof for
+/// the read model: a reconnecting client must be handed the same thread from
+/// durable state, not from a memory-only copy.
 ///
 /// `subscribe_thread_snapshot_reads_durable_messages` proves the snapshot
-/// comes from the store rather than a memory copy, but it asks the SAME
-/// process that did the write — so an in-process cache would pass it. Here
-/// the first backend is dropped entirely before the second one answers.
+/// comes from the store rather than a memory copy, but this stays in one OS
+/// process and drops handles cleanly. `thread_snapshot_survives_sigkill_without_drop`
+/// covers the abrupt-crash case.
 #[tokio::test]
 async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
     let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
@@ -5850,7 +5851,8 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         }
     }
 
-    // Second process over the same directory — nothing carried in memory.
+    // Fresh AppState over the same directory. This proves the durable read path,
+    // not crash recovery: the writer above got to run `Drop`.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -5893,6 +5895,118 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
             .any(|f| f["values"][0]["kind"] == "synchronized"),
         "the client is told the subscription is live"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_snapshot_survives_sigkill_without_drop() {
+    let dir = std::env::temp_dir().join(format!("t3ct-crash-{}", uuid::Uuid::new_v4()));
+    let ready = dir.join("child-ready");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut child = std::process::Command::new(exe);
+    child
+        .arg("contract_tests::crash_child_persists_thread_then_parks")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("T3CODE_CRASH_CHILD_DIR", &dir)
+        .env("T3CODE_CRASH_CHILD_READY", &ready)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = child.spawn().expect("spawn crash-writer child");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "crash-writer child exited before ready: status={status:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "crash-writer child did not signal readiness"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    child.kill().expect("send SIGKILL to crash-writer child");
+    let status = child.wait().expect("wait for crash-writer child");
+    assert!(
+        !status.success(),
+        "crash-writer child exited cleanly instead of being killed: {status:?}"
+    );
+
+    let state = state_at(&dir).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.subscribeThread",
+        json!({"threadId": "t-crash-reconnect"}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+
+    let snap = frames
+        .iter()
+        .find(|f| f["values"][0]["kind"] == "snapshot")
+        .unwrap_or_else(|| panic!("a crashed backend's thread snapshot came back: {frames:#?}"));
+    let thread = &snap["values"][0]["snapshot"]["thread"];
+    assert_eq!(thread["id"], "t-crash-reconnect");
+    let msgs = thread["messages"].as_array().expect("messages array");
+    assert_eq!(
+        msgs.iter()
+            .map(|m| m["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["m-crash-user", "m-crash-assistant"],
+        "the SIGKILLed writer's transcript came back in order, got {msgs:?}"
+    );
+    assert_eq!(msgs[1]["text"], "survived the crash");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "helper process for thread_snapshot_survives_sigkill_without_drop"]
+async fn crash_child_persists_thread_then_parks() {
+    let Some(dir) = std::env::var_os("T3CODE_CRASH_CHILD_DIR") else {
+        return;
+    };
+    let Some(ready) = std::env::var_os("T3CODE_CRASH_CHILD_READY") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let ready = std::path::PathBuf::from(ready);
+    let state = state_at(&dir).await;
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access","id": "t-crash-reconnect", "title": "before sigkill",
+            "projectId": "p-workspace", "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso()}))
+        .await
+        .unwrap();
+    for (id, role, text) in [
+        ("m-crash-user", "user", "hi"),
+        ("m-crash-assistant", "assistant", "survived the crash"),
+    ] {
+        state
+            .rt
+            .append_message(
+                "t-crash-reconnect",
+                &json!({"id": id, "role": role, "text": text,
+                "streaming": false, "createdAt": now_iso(), "updatedAt": now_iso()}),
+            )
+            .await
+            .unwrap();
+    }
+    std::fs::write(ready, b"ready").unwrap();
+    std::future::pending::<()>().await;
 }
 
 /// #37: switching the model on an EXISTING thread persists the new selection
