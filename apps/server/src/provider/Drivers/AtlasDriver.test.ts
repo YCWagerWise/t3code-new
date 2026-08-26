@@ -5,10 +5,11 @@ import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import {
   ATLAS_DRIVER_KIND,
   atlasStartCommand,
-  classifyHandshake,
-  probeAtlasHost,
+  bindingFromSlug,
+  bindingSlug,
   type FetchLike,
-} from "./AtlasDriver.ts";
+} from "./AtlasConsole.ts";
+import { classifyHandshake, probeAtlasHost } from "./AtlasDriver.ts";
 
 /**
  * The Atlas provider exists because the ACP runtime the other two drivers spawn cannot be
@@ -176,34 +177,55 @@ describe("atlasStartCommand", () => {
     text: "do the thing",
   };
 
-  it("puts the picker's model on the wire where Atlas reads it", () => {
+  it("puts the provider AND the model on the wire, as two facts", () => {
     const command = atlasStartCommand({
       ...base,
-      modelId: "gpt-5.4",
+      binding: { provider: "openai", model_id: "gpt-5.4" },
       workspaceId: "ws-alpha",
     });
 
     expect(command["protocol_version"]).toBe(1);
     expect(command["thread_id"]).toBe("thr-1");
-    expect(command["run_id"]).toBe("run-1");
-    expect(command["request_id"]).toBe("req-1");
     const inner = command["command"] as Record<string, unknown>;
     expect(inner["kind"]).toBe("start");
-    expect(inner["text"]).toBe("do the thing");
-    // Top-level keys, not nested: Atlas flattens the binding onto the Start command.
-    expect(inner["model_id"]).toBe("gpt-5.4");
+    const binding = inner["binding"] as Record<string, unknown>;
+    // The company travels with the model. A bare "gpt-5.4" cannot say who serves it, and the
+    // host no longer guesses.
+    expect(binding["provider"]).toBe("openai");
+    expect(binding["model_id"]).toBe("gpt-5.4");
     expect(inner["workspace_id"]).toBe("ws-alpha");
   });
 
-  it("omits a selection entirely rather than sending an empty one", () => {
-    // Atlas refuses a present-but-blank `model_id` explicitly and treats an ABSENT one as the
-    // node default. Sending `""` would turn "no preference" into a 400, so the key must not
-    // appear at all.
-    const command = atlasStartCommand({ ...base, modelId: undefined, workspaceId: undefined });
+  it("omits the binding entirely rather than sending an empty one", () => {
+    // Atlas treats an ABSENT binding as the node default and REFUSES a malformed one, so an
+    // empty object would turn "no preference" into a 400.
+    const command = atlasStartCommand({ ...base, binding: undefined, workspaceId: undefined });
     const inner = command["command"] as Record<string, unknown>;
 
-    expect("model_id" in inner).toBe(false);
+    expect("binding" in inner).toBe(false);
     expect("workspace_id" in inner).toBe(false);
+  });
+});
+
+describe("the picker slug", () => {
+  it("round-trips a provider and a model through one string", () => {
+    const binding = { provider: "anthropic", model_id: "claude-opus-4-8" };
+    expect(bindingSlug(binding)).toBe("anthropic/claude-opus-4-8");
+    expect(bindingFromSlug("anthropic/claude-opus-4-8")).toEqual(binding);
+
+    // An ollama id contains punctuation of its own; splitting greedily would corrupt it.
+    expect(bindingFromSlug("ollama/qwen2.5-coder:7b")).toEqual({
+      provider: "ollama",
+      model_id: "qwen2.5-coder:7b",
+    });
+  });
+
+  it("refuses a slug with no provider instead of guessing one", () => {
+    // This is the lens-side half of the deleted unknown->Ollama inference. A model id alone is
+    // exactly the ambiguous input the whole design removes.
+    for (const bad of ["gpt-5.4", "", "/gpt-5.4", "openai/", " openai/gpt-5.4"]) {
+      expect(bindingFromSlug(bad)).toBeNull();
+    }
   });
 });
 

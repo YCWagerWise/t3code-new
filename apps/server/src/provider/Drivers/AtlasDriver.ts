@@ -31,15 +31,34 @@
  *
  * @module provider/Drivers/AtlasDriver
  */
-import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import { type ServerProvider, type ThreadId, TurnId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { makeAgentSdkTextGeneration } from "../../textGeneration/AgentSdkTextGeneration.ts";
-import { ProviderDriverError, ProviderUnsupportedError } from "../Errors.ts";
+import {
+  ATLAS_DRIVER_KIND,
+  AtlasRefusal,
+  atlasStartCommand,
+  bindingFromSlug,
+  cancelTurn,
+  type AtlasCursor,
+  type AtlasEndpoint,
+  type FetchLike,
+  projectLifecycleEvent,
+  readCatalog,
+  readEvents,
+  startTurn,
+} from "./AtlasConsole.ts";
+import {
+  ProviderAdapterRequestError,
+  ProviderDriverError,
+  ProviderUnsupportedError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type { ProviderRuntimeEvent } from "@t3tools/contracts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -48,8 +67,6 @@ import {
 import { buildServerProvider, type ProviderProbeResult } from "../providerSnapshot.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type { ServerProviderShape } from "../Services/ServerProvider.ts";
-
-export const ATLAS_DRIVER_KIND = ProviderDriverKind.make("atlas");
 
 /**
  * Where the node is and how to authenticate to it.
@@ -74,16 +91,6 @@ const DEFAULT_BASE_URL = "http://127.0.0.1:3010";
 /** Trailing slashes make `${base}/console/v1/...` produce a double slash, which some routers 404. */
 const normalizeBaseUrl = (raw: string | undefined): string =>
   (raw?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
-
-/** The subset of `fetch` this driver uses, so a test can supply one without a network. */
-export type FetchLike = (
-  url: string,
-  init?: {
-    readonly method?: string;
-    readonly headers?: Record<string, string>;
-    readonly body?: string;
-  },
-) => Promise<{ readonly status: number; readonly text: () => Promise<string> }>;
 
 export interface AtlasHostProbeInput {
   readonly baseUrl: string;
@@ -210,72 +217,186 @@ const readHandshake = (
 };
 
 /**
- * The `RunCommand::Start` envelope Atlas's command route expects.
+ * The adapter: T3's turn verbs, expressed as Atlas console commands.
  *
- * Pure and exported so a test asserts the exact bytes that reach the host rather than
- * asserting a 200 came back. `model_id` carries the picker's slug straight through: Atlas
- * validates it and refuses an unusable one explicitly rather than substituting a default, so
- * the refusal a user sees originates from the authority, not from a guess made here.
- */
-export const atlasStartCommand = (input: {
-  readonly fleetId: string;
-  readonly threadId: string;
-  readonly runId: string;
-  readonly requestId: string;
-  readonly actor: string;
-  readonly text: string;
-  readonly modelId: string | undefined;
-  readonly workspaceId: string | undefined;
-}): Record<string, unknown> => ({
-  protocol_version: 1,
-  fleet_id: input.fleetId,
-  thread_id: input.threadId,
-  run_id: input.runId,
-  request_id: input.requestId,
-  actor: input.actor,
-  command: {
-    kind: "start",
-    text: input.text,
-    limits: {},
-    ...(input.modelId === undefined ? {} : { model_id: input.modelId }),
-    ...(input.workspaceId === undefined ? {} : { workspace_id: input.workspaceId }),
-  },
-});
-
-/**
- * Every adapter member, refusing.
+ * Atlas owns the run. So `sendTurn` does not execute anything — it commits a `Start` and lets
+ * the host's supervisor be the authority on what happens next, and `streamEvents` renders what
+ * the host's durable log says happened. That division is why a T3 restart cannot lose a turn:
+ * the transcript is Atlas's, and this reconnects to it by cursor.
  *
- * Registration and readiness are what this commit claims. Driving a turn is the next seam, and
- * until it exists each entry point says so in a typed error. The alternative — returning empty
- * successes — would make the composer look usable and fail silently at the first turn, which
- * is the failure mode this whole line of work is about.
+ * The members Atlas has no console verb for still return a typed refusal rather than an empty
+ * success. A stub that reports success makes the composer look usable and fails silently at
+ * the first use, which is the defect this driver exists to remove — it does not get to sneak
+ * back in as a convenience.
  */
 const unsupported = (operation: string) =>
-  Effect.fail(
-    new ProviderUnsupportedError({
-      provider: `${ATLAS_DRIVER_KIND} (${operation})`,
-    }),
-  );
+  Effect.fail(new ProviderUnsupportedError({ provider: `${ATLAS_DRIVER_KIND} (${operation})` }));
 
-const makeUnimplementedAtlasAdapter = (): ProviderAdapterShape<ProviderUnsupportedError> => ({
-  provider: ATLAS_DRIVER_KIND,
-  // Atlas refuses a model change inside a live attempt by design — a selection is immutable
-  // within an attempt and may change only between settled turns. `in-session` would promise
-  // the composer something the authority will reject.
-  capabilities: { sessionModelSwitch: "unsupported" },
-  startSession: () => unsupported("startSession"),
-  sendTurn: () => unsupported("sendTurn"),
-  interruptTurn: () => unsupported("interruptTurn"),
-  respondToRequest: () => unsupported("respondToRequest"),
-  respondToUserInput: () => unsupported("respondToUserInput"),
-  stopSession: () => unsupported("stopSession"),
-  listSessions: () => Effect.succeed([]),
-  hasSession: () => Effect.succeed(false),
-  readThread: () => unsupported("readThread"),
-  rollbackThread: () => unsupported("rollbackThread"),
-  stopAll: () => unsupported("stopAll"),
-  streamEvents: Stream.empty,
-});
+const nowIso = () => new Date().toISOString();
+
+interface LiveThread {
+  cursor: AtlasCursor;
+  activeTurnId: string | undefined;
+}
+
+const makeAtlasAdapter = (input: {
+  readonly endpoint: AtlasEndpoint;
+  readonly fleetId: string;
+  readonly instanceId: string;
+}): ProviderAdapterShape<ProviderUnsupportedError | ProviderAdapterRequestError> => {
+  // One cursor per thread, held by the READER. Atlas's log is the durable copy; this is only
+  // the bookmark, so losing it costs a replay and never an event.
+  const threads = new Map<string, LiveThread>();
+  const emit = new Map<string, (events: ReadonlyArray<ProviderRuntimeEvent>) => void>();
+
+  const refuse = (operation: string, cause: unknown) =>
+    new ProviderAdapterRequestError({
+      provider: ATLAS_DRIVER_KIND,
+      operation,
+      detail:
+        cause instanceof AtlasRefusal
+          ? // Atlas's own words. The refusal is the product — "openai does not serve model X
+            // on this node" is what a user can act on, and replacing it with "turn failed"
+            // throws away the only useful part.
+            cause.message
+          : String((cause as { message?: unknown })?.message ?? cause),
+    });
+
+  return {
+    provider: ATLAS_DRIVER_KIND,
+    // Atlas refuses a binding change inside a live attempt by design: a selection is immutable
+    // within an attempt and may change only between settled turns. Declaring `in-session`
+    // would promise the composer something the authority will reject.
+    capabilities: { sessionModelSwitch: "unsupported" },
+
+    startSession: (start) =>
+      Effect.sync(() => {
+        const threadId = String(start.threadId);
+        threads.set(threadId, { cursor: { epoch: 1, after: 0 }, activeTurnId: undefined });
+        return {
+          provider: ATLAS_DRIVER_KIND,
+          providerInstanceId: input.instanceId as never,
+          status: "ready" as const,
+          runtimeMode: start.runtimeMode,
+          threadId: start.threadId,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        };
+      }),
+
+    sendTurn: (turn) =>
+      Effect.tryPromise({
+        try: async () => {
+          const threadId = String(turn.threadId);
+          const live = threads.get(threadId) ?? {
+            cursor: { epoch: 1, after: 0 },
+            activeTurnId: undefined,
+          };
+          // The picker's slug carries BOTH facts. A slug with no provider is refused rather
+          // than guessed at — guessing is precisely what the host stopped doing.
+          const slug = turn.modelSelection?.model;
+          const binding = slug === undefined ? undefined : bindingFromSlug(slug);
+          if (slug !== undefined && binding === null) {
+            throw new AtlasRefusal({
+              status: 400,
+              code: "invalid_request",
+              message: `model selection ${JSON.stringify(slug)} does not name a provider; expected "provider/model_id"`,
+            });
+          }
+          // The request id IS the turn id: Atlas dedupes on it, so a redelivered send resolves
+          // to the same run rather than opening a second one.
+          const requestId = `t3:${threadId}:${Date.now()}`;
+          const run = await startTurn(input.endpoint, {
+            ...atlasStartCommand({
+              fleetId: input.fleetId,
+              threadId,
+              runId: requestId,
+              requestId,
+              actor: "t3",
+              text: turn.input ?? "",
+              binding: binding ?? undefined,
+              workspaceId: undefined,
+            }),
+          });
+          const runId = typeof run["run_id"] === "string" ? run["run_id"] : requestId;
+          threads.set(threadId, { ...live, activeTurnId: runId });
+          void pump(threadId);
+          return {
+            threadId: turn.threadId,
+            turnId: TurnId.make(runId),
+            resumeCursor: live.cursor,
+          };
+        },
+        catch: (cause) => refuse("sendTurn", cause),
+      }),
+
+    interruptTurn: (threadId) =>
+      Effect.tryPromise({
+        try: () =>
+          cancelTurn(input.endpoint, {
+            threadId: String(threadId),
+            fleetId: input.fleetId,
+            requestId: `t3:cancel:${String(threadId)}:${Date.now()}`,
+          }),
+        catch: (cause) => refuse("interruptTurn", cause),
+      }),
+
+    // Approvals and structured questions ARE modelled by Atlas (`Kind::Approve`, `Kind::Answer`
+    // on the feed), but they are appended to the feed socket rather than issued as console
+    // commands, and this driver does not hold that socket yet. Refused rather than accepted
+    // and dropped: a user who approves a tool call and is silently ignored is worse off than
+    // one who is told the path does not exist.
+    respondToRequest: () => unsupported("respondToRequest"),
+    respondToUserInput: () => unsupported("respondToUserInput"),
+
+    stopSession: (threadId) =>
+      Effect.sync(() => {
+        threads.delete(String(threadId));
+        emit.delete(String(threadId));
+      }),
+    listSessions: () => Effect.succeed([]),
+    hasSession: (threadId) => Effect.succeed(threads.has(String(threadId))),
+    readThread: () => unsupported("readThread"),
+    rollbackThread: () => unsupported("rollbackThread"),
+    stopAll: () =>
+      Effect.sync(() => {
+        threads.clear();
+        emit.clear();
+      }),
+    streamEvents: Stream.asyncPush<ProviderRuntimeEvent>((push) =>
+      Effect.sync(() => {
+        emit.set("*", (events) => events.forEach((event) => push.single(event)));
+        return Effect.sync(() => emit.delete("*"));
+      }),
+    ),
+  };
+
+  /**
+   * Drain everything after the thread's cursor and publish it.
+   *
+   * Cursor-driven rather than tailing, so a reconnect resumes where it stopped: re-reading
+   * from zero would re-render the thread, and reading from "now" would drop whatever landed
+   * while the reader was away.
+   */
+  async function pump(threadId: string): Promise<void> {
+    const live = threads.get(threadId);
+    if (live === undefined) return;
+    try {
+      const page = await readEvents(input.endpoint, threadId, live.cursor);
+      threads.set(threadId, { ...live, cursor: page.cursor });
+      const projected = page.events.flatMap((event) =>
+        projectLifecycleEvent(event, {
+          threadId: threadId as unknown as ThreadId,
+          createdAt: nowIso(),
+        }),
+      );
+      if (projected.length > 0) emit.get("*")?.(projected);
+    } catch {
+      // A feed read that fails must not kill the turn: Atlas's log is durable and the next
+      // pump resumes from the same cursor, so this degrades to a delay rather than a loss.
+    }
+  }
+};
 
 export interface AtlasDriverDeps {
   readonly fetch?: FetchLike;
@@ -303,6 +424,14 @@ export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSet
         accessToken: config.accessToken,
         fetch: fetchImpl,
       });
+      // Only ask for models when the node answered. Listing models from a host that just
+      // failed its probe would be exactly the display-only readiness this driver refuses.
+      const catalogue =
+        probe.status === "ready"
+          ? yield* Effect.promise(() =>
+              readCatalog({ baseUrl, accessToken: config.accessToken, fetch: fetchImpl }),
+            )
+          : [];
       const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: ATLAS_DRIVER_KIND,
@@ -315,10 +444,17 @@ export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSet
           presentation: { displayName: displayName ?? "Atlas", showInteractionModeToggle: false },
           enabled,
           checkedAt,
-          // Deliberately empty until the host's catalog is the source (`/_models`). A
-          // hardcoded list here would be the hand-copied contract this seam exists to end,
-          // and would offer models this node may not be able to run.
-          models: [],
+          // Sourced from the host's own catalog, never hardcoded here: a list written in the
+          // lens is a second registry, and two registries drift. Each row's slug carries its
+          // PROVIDER (`anthropic/claude-opus-4-8`), so choosing a model in the composer states
+          // a company as well as a model and nothing downstream has to infer one.
+          models: catalogue.map((model) => ({
+            slug: model.slug,
+            name: model.name,
+            isCustom: false,
+            isDefault: false,
+            capabilities: null,
+          })),
           probe,
         }),
         instanceId,
@@ -346,7 +482,11 @@ export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSet
         accentColor,
         enabled,
         snapshot,
-        adapter: makeUnimplementedAtlasAdapter(),
+        adapter: makeAtlasAdapter({
+          endpoint: { baseUrl, accessToken: config.accessToken, fetch: fetchImpl },
+          fleetId: "default",
+          instanceId: String(instanceId),
+        }),
         // Deterministic local generation, with no `deps`: commit messages and thread titles
         // come from the local fallback rather than a model call this driver cannot yet make.
         textGeneration: makeAgentSdkTextGeneration(),
