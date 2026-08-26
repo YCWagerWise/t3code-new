@@ -768,3 +768,140 @@ export const projectFeedFrame = (
       return [];
   }
 };
+
+// ─────────────────────── the console socket (answering back) ───────────────────────
+
+/**
+ * The minimum a socket must do for this driver, so a test can supply one.
+ *
+ * Deliberately not `WebSocket`: the driver only ever sends text and observes open/close, and
+ * depending on the whole DOM interface would make it untestable without a real server.
+ */
+export interface AtlasSocket {
+  send(data: string): void;
+  close(): void;
+}
+
+export interface AtlasSocketHandlers {
+  readonly onOpen: () => void;
+  readonly onClose: () => void;
+}
+
+export type AtlasSocketFactory = (url: string, handlers: AtlasSocketHandlers) => AtlasSocket;
+
+/** `http(s)://host` → `ws(s)://host`. The socket lives on the same origin as the console API. */
+export const feedSocketUrl = (endpoint: AtlasEndpoint, threadId: string): string => {
+  const base = endpoint.baseUrl.replace(/^http/, "ws");
+  const token =
+    endpoint.accessToken === undefined
+      ? ""
+      : `&access_token=${encodeURIComponent(endpoint.accessToken)}`;
+  // `after=-1` asks for no replay: this socket exists to SEND and to be PRESENT, and the
+  // frames are already being read over HTTP. Replaying them here would double every event.
+  return `${base}/_feed?run_id=${encodeURIComponent(threadId)}&after=-1${token}`;
+};
+
+/** The default factory, over the runtime's own WebSocket. */
+export const browserSocketFactory: AtlasSocketFactory = (url, handlers) => {
+  const socket = new WebSocket(url);
+  socket.addEventListener("open", handlers.onOpen);
+  socket.addEventListener("close", handlers.onClose);
+  socket.addEventListener("error", handlers.onClose);
+  return {
+    send: (data: string) => socket.send(data),
+    close: () => socket.close(),
+  };
+};
+
+/**
+ * A console presence on a thread's feed, held for the life of the session.
+ *
+ * **This is not an optimisation — a held socket is what makes approval possible at all.**
+ * `await_approval` (atlas-host) refuses a gated tool outright when nobody is listening:
+ *
+ *     if rx.live(feed::ROLE_CONSOLE).await.unwrap_or(0) == 0 {
+ *         return ToolGate::Deny(".. and no console is attached to approve it")
+ *     }
+ *
+ * So a driver that connected only once it had a decision to send would arrive after the gate
+ * had already denied the call. The socket is opened when the session opens, and reconnects on
+ * drop, so the answer is possible before the question is asked.
+ */
+export const makeConsolePresence = (input: {
+  readonly endpoint: AtlasEndpoint;
+  readonly threadId: string;
+  readonly connect: AtlasSocketFactory;
+  /** Injectable so a test drives reconnection without waiting on wall time. */
+  readonly schedule?: (run: () => void, ms: number) => void;
+}) => {
+  const schedule =
+    input.schedule ??
+    ((run: () => void, ms: number) => {
+      setTimeout(run, ms);
+    });
+  let socket: AtlasSocket | undefined;
+  let open = false;
+  let closed = false;
+  let attempt = 0;
+  // Decisions made while the socket was down. Dropping one silently would strand the turn that
+  // is waiting for it, and Atlas's gate deadline is the only other thing that would end it.
+  let queued: Array<string> = [];
+
+  const flush = (): void => {
+    if (!open || socket === undefined) return;
+    const pending = queued;
+    queued = [];
+    for (const message of pending) socket.send(message);
+  };
+
+  const dial = (): void => {
+    if (closed) return;
+    socket = input.connect(feedSocketUrl(input.endpoint, input.threadId), {
+      onOpen: () => {
+        open = true;
+        attempt = 0;
+        flush();
+      },
+      onClose: () => {
+        if (closed) return;
+        open = false;
+        socket = undefined;
+        attempt += 1;
+        // Re-dial, always. A presence that gives up after one drop stops being a console, and
+        // atlas-host reads "no console attached" as a reason to DENY the next gated tool — so
+        // a silently dead socket turns into refused tool calls rather than a visible error.
+        schedule(dial, Math.min(250 * 2 ** (attempt - 1), 10_000));
+      },
+    });
+  };
+
+  dial();
+
+  return {
+    /** Queue-then-send, so a decision made during a reconnect is not lost. */
+    send: (kind: string, payload: Record<string, unknown>): void => {
+      queued = [...queued, JSON.stringify({ kind, payload })];
+      flush();
+    },
+    reconnect: dial,
+    isOpen: () => open,
+    pending: () => queued.length,
+    close: (): void => {
+      closed = true;
+      open = false;
+      socket?.close();
+      socket = undefined;
+    },
+  };
+};
+export type AtlasConsolePresence = ReturnType<typeof makeConsolePresence>;
+
+/**
+ * T3's five decisions, as the one boolean Atlas's `ApprovePayload` carries.
+ *
+ * `acceptForSession`/`acceptAlways` collapse to `true` here because the contract has nowhere
+ * to put the scope — recording that fact rather than hiding it, since a caller reading this
+ * back cannot tell a one-off accept from a standing one.
+ */
+export const approvalIsGranted = (decision: string): boolean =>
+  decision === "accept" || decision === "acceptForSession" || decision === "acceptAlways";

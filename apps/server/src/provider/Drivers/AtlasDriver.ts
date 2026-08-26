@@ -50,14 +50,18 @@ import {
   type AtlasFeedCursor,
   type AtlasLifecycleEvent,
   type FetchLike,
+  approvalIsGranted,
+  browserSocketFactory,
+  type AtlasConsolePresence,
+  type AtlasSocketFactory,
   fingerprint,
+  makeConsolePresence,
   parseAtlasCursor,
   projectFeedFrame,
   projectLifecycleEvent,
   readCatalog,
   readEvents,
   readFeed,
-  resolveInput,
   startTurn,
   turnRequestId,
 } from "./AtlasConsole.ts";
@@ -305,6 +309,8 @@ export interface AtlasAdapterInput {
   /** Injectable so a test drives the reader deterministically instead of waiting on wall time. */
   readonly sleep?: (ms: number) => Promise<void>;
   readonly idlePollMs?: number;
+  /** Injectable so a test can drive the console socket without a server. */
+  readonly connect?: AtlasSocketFactory;
 }
 
 export const makeAtlasAdapter = (
@@ -332,6 +338,25 @@ export const makeAtlasAdapter = (
   };
   const readers = new Map<string, { stop: () => void; wake: () => void }>();
   const sleep = input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const connect = input.connect ?? browserSocketFactory;
+  // One console presence per thread, opened with the session — see `makeConsolePresence` on
+  // why this cannot be deferred until a decision needs sending.
+  const presences = new Map<string, AtlasConsolePresence>();
+  const presenceFor = (threadId: string): AtlasConsolePresence => {
+    const existing = presences.get(threadId);
+    if (existing !== undefined) return existing;
+    const presence = makeConsolePresence({
+      endpoint: input.endpoint,
+      threadId,
+      connect,
+      // Reconnect on the adapter's own clock, so a test drives it deterministically.
+      schedule: (run, ms) => {
+        void sleep(ms).then(run);
+      },
+    });
+    presences.set(threadId, presence);
+    return presence;
+  };
   const idlePollMs = input.idlePollMs ?? IDLE_POLL_MS;
 
   const refuse = (operation: string, cause: unknown) =>
@@ -487,6 +512,8 @@ export const makeAtlasAdapter = (
           awaitingRef: undefined,
         });
         startReader(threadId);
+        // Attach BEFORE any turn can gate a tool: an unattached console is an auto-deny.
+        presenceFor(threadId);
         return {
           provider: ATLAS_DRIVER_KIND,
           providerInstanceId: input.instanceId as never,
@@ -590,43 +617,34 @@ export const makeAtlasAdapter = (
      * refuses and the user is told why rather than having the click swallowed.
      */
     respondToRequest: (threadId, requestId, decision) =>
-      Effect.tryPromise({
-        try: () => {
-          const key = String(threadId);
-          const requestRef = threads.get(key)?.awaitingRef ?? String(requestId);
-          return resolveInput(input.endpoint, {
-            threadId: key,
-            fleetId: input.fleetId,
-            requestId: `t3:resolve:${key}:${requestRef}:${fingerprint(String(decision))}`,
-            requestRef,
-            // The decision travels whole. Collapsing `acceptForSession`/`acceptAlways` into a
-            // bare boolean here would throw away scope the authority is entitled to record.
-            answer: { kind: "approval", decision: String(decision) },
-          });
-        },
-        catch: (cause) => refuse("respondToRequest", cause),
+      Effect.sync(() => {
+        const key = String(threadId);
+        // The id Atlas stated on the approval FRAME — `{run_id}:{call_id}` — which reached T3
+        // through `request.opened` and is handed straight back here. `await_approval` compares
+        // it exactly and ignores anything else, so a stale answer for a different held call
+        // cannot release this one.
+        //
+        // Deliberately NOT the supervisor's `request_ref` from a `waiting_for_input` lifecycle
+        // row: that is a different id on a different log, and answering with it would match
+        // nothing and leave the tool held until the gate's deadline.
+        presenceFor(key).send("approve", {
+          request_id: String(requestId),
+          approved: approvalIsGranted(String(decision)),
+        });
       }),
 
-    /** The same seam, carrying a structured answer instead of a decision. */
+    /** The same presence, carrying a structured answer instead of a yes/no. */
     respondToUserInput: (threadId, requestId, answers) =>
-      Effect.tryPromise({
-        try: () => {
-          const key = String(threadId);
-          const requestRef = threads.get(key)?.awaitingRef ?? String(requestId);
-          return resolveInput(input.endpoint, {
-            threadId: key,
-            fleetId: input.fleetId,
-            requestId: `t3:answer:${key}:${requestRef}:${fingerprint(JSON.stringify(answers))}`,
-            requestRef,
-            answer: { kind: "answer", answers },
-          });
-        },
-        catch: (cause) => refuse("respondToUserInput", cause),
+      Effect.sync(() => {
+        const key = String(threadId);
+        presenceFor(key).send("answer", { request_id: String(requestId), value: answers });
       }),
 
     stopSession: (threadId) =>
       Effect.sync(() => {
         stopReader(String(threadId));
+        presences.get(String(threadId))?.close();
+        presences.delete(String(threadId));
         threads.delete(String(threadId));
       }),
     listSessions: () => Effect.succeed([]),
@@ -636,6 +654,8 @@ export const makeAtlasAdapter = (
     stopAll: () =>
       Effect.sync(() => {
         for (const threadId of [...readers.keys()]) stopReader(threadId);
+        for (const presence of presences.values()) presence.close();
+        presences.clear();
         threads.clear();
         emit.clear();
         pending = [];

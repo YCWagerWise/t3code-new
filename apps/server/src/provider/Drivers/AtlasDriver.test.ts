@@ -7,6 +7,7 @@ import { ThreadId } from "@t3tools/contracts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import {
   ATLAS_DRIVER_KIND,
+  type AtlasSocketFactory,
   atlasStartCommand,
   bindingFromSlug,
   bindingSlug,
@@ -624,90 +625,152 @@ describe("turn identity", () => {
   });
 });
 
+/** A console socket a test can open, drop and inspect, with no server involved. */
+const makeFakeSocket = () => {
+  const sent: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+  const urls: Array<string> = [];
+  let live: { onOpen: () => void; onClose: () => void } | undefined;
+  let openNow = true;
+
+  const connect: AtlasSocketFactory = (url, handlers) => {
+    urls.push(url);
+    live = handlers;
+    if (openNow) queueMicrotask(handlers.onOpen);
+    return {
+      send: (data: string) => {
+        const frame = JSON.parse(data) as { kind: string; payload: Record<string, unknown> };
+        sent.push(frame);
+      },
+      close: () => {},
+    };
+  };
+
+  return {
+    connect,
+    sent,
+    urls,
+    /** Simulate the socket dropping, so queued decisions can be observed. */
+    drop: () => {
+      openNow = false;
+      live?.onClose();
+    },
+    restore: () => {
+      openNow = true;
+      live?.onOpen();
+    },
+  };
+};
+
+const socketAdapterFor = (
+  node: ReturnType<typeof makeFakeAtlas>,
+  socket: ReturnType<typeof makeFakeSocket>,
+) =>
+  makeAtlasAdapter({
+    endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: "tok", fetch: node.fetch },
+    fleetId: "default",
+    instanceId: "atlas-1",
+    sleep: instantSleep,
+    idlePollMs: 0,
+    connect: socket.connect,
+  });
+
 describe("approvals", () => {
-  it("answers the request_ref the host stated, over the console command path", async () => {
+  it("attaches a console the moment the session opens, because an unattached one auto-denies", async () => {
     const node = makeFakeAtlas();
-    const adapter = adapterFor(node);
-    const seen: Array<string> = [];
-    const fiber = collect(adapter, seen);
+    const socket = makeFakeSocket();
+    const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
-    // The authority says it is waiting, and names the ref.
-    node.append("waiting_for_input", {
-      observation: { type: "waiting_for_input", request_ref: "req-from-atlas" },
-    });
-    await waitFor(() => node.consumedUpTo() >= 1, "the reader to consume the waiting event");
+    await settle();
+
+    // atlas-host's `await_approval` refuses a gated tool outright when nobody is listening:
+    // "and no console is attached to approve it". Connecting only once a decision existed
+    // would arrive after that denial, so presence is part of opening a session.
+    expect(socket.urls).toHaveLength(1);
+    expect(socket.urls[0]).toContain("/_feed?run_id=thr-1");
+    // No replay: the frames are already read over HTTP, and replaying here would double them.
+    expect(socket.urls[0]).toContain("after=-1");
+    expect(socket.urls[0]).toContain("access_token=tok");
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+  });
+
+  it("answers the id Atlas stated on the approval frame, and carries the decision", async () => {
+    const node = makeFakeAtlas();
+    const socket = makeFakeSocket();
+    const adapter = socketAdapterFor(node, socket);
+    await startSession(adapter);
+    await settle();
     await Effect.runPromise(
       adapter.respondToRequest(
         ThreadId.make("thr-1"),
-        "t3-local-id" as never,
+        "run-1:call-7" as never,
         "acceptForSession" as never,
       ),
     );
-    await teardown(adapter, fiber);
+    await settle();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
 
-    const command = node.resolveCommand()?.["command"] as Record<string, unknown>;
-    // The ref is Atlas's, not T3's local id — a ref invented here matches nothing.
-    expect(command["request_ref"]).toEqual("req-from-atlas");
-    // The decision travels whole rather than collapsing into a boolean.
-    expect(command["answer"]).toEqual({ kind: "approval", decision: "acceptForSession" });
+    expect(socket.sent).toHaveLength(1);
+    expect(socket.sent[0]?.kind).toEqual("approve");
+    // `{run_id}:{call_id}` intact — `await_approval` matches it exactly and a stale answer for
+    // another held call must not release this one.
+    expect(socket.sent[0]?.payload).toEqual({ request_id: "run-1:call-7", approved: true });
   });
 
-  it("carries a structured answer through the same seam", async () => {
+  it("declines as a decision, not as silence", async () => {
     const node = makeFakeAtlas();
-    const adapter = adapterFor(node);
-    const seen: Array<string> = [];
-    const fiber = collect(adapter, seen);
+    const socket = makeFakeSocket();
+    const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
-    node.append("waiting_for_input", {
-      observation: { type: "waiting_for_input", request_ref: "ask-1" },
-    });
-    await waitFor(() => node.consumedUpTo() >= 1, "the reader to consume the waiting event");
+    await settle();
+    await Effect.runPromise(
+      adapter.respondToRequest(ThreadId.make("thr-1"), "run-1:call-9" as never, "decline" as never),
+    );
+    await settle();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    expect(socket.sent[0]?.payload).toEqual({ request_id: "run-1:call-9", approved: false });
+  });
+
+  it("carries a structured answer over the same presence", async () => {
+    const node = makeFakeAtlas();
+    const socket = makeFakeSocket();
+    const adapter = socketAdapterFor(node, socket);
+    await startSession(adapter);
+    await settle();
     await Effect.runPromise(
       adapter.respondToUserInput(
         ThreadId.make("thr-1"),
-        "ask-1" as never,
+        "run-1:ask-1" as never,
         { branch: "main" } as never,
       ),
     );
-    await teardown(adapter, fiber);
-
-    expect((node.resolveCommand()?.["command"] as Record<string, unknown>)["answer"]).toEqual({
+    await settle();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    expect(socket.sent[0]).toEqual({
       kind: "answer",
-      answers: { branch: "main" },
+      payload: { request_id: "run-1:ask-1", value: { branch: "main" } },
     });
   });
 
-  it("surfaces the host's refusal verbatim when the run is not waiting", async () => {
+  it("holds a decision made while the socket is down instead of dropping it", async () => {
     const node = makeFakeAtlas();
-    const refusing: FetchLike = (url, init) =>
-      String(url).includes("/events")
-        ? node.fetch(url, init)
-        : Promise.resolve({
-            status: 409,
-            text: () =>
-              Promise.resolve(
-                JSON.stringify({ code: "conflict", message: "run is not waiting for input" }),
-              ),
-          });
-    const adapter = makeAtlasAdapter({
-      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: undefined, fetch: refusing },
-      fleetId: "default",
-      instanceId: "atlas-1",
-      sleep: instantSleep,
-      idlePollMs: 0,
-    });
+    const socket = makeFakeSocket();
+    const adapter = socketAdapterFor(node, socket);
     await startSession(adapter);
-    // `flip` turns the expected failure into the success channel: the refusal IS the result
-    // under test, so a passing turn here would be the bug.
-    const refusal = await Effect.runPromise(
-      Effect.flip(
-        adapter.respondToRequest(ThreadId.make("thr-1"), "req-1" as never, "accept" as never),
-      ),
+    await settle();
+    socket.drop();
+
+    await Effect.runPromise(
+      adapter.respondToRequest(ThreadId.make("thr-1"), "run-1:call-1" as never, "accept" as never),
     );
+    await settle();
+    // Nothing sent yet — but the user's click is not lost either.
+    expect(socket.sent).toHaveLength(0);
+
+    socket.restore();
+    await settle();
     await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
-    // Atlas's own sentence, not "approval failed" — it is the only actionable part.
-    expect(String((refusal as { detail: string }).detail)).toContain(
-      "run is not waiting for input",
-    );
+    // A dropped decision would strand the turn until Atlas's gate deadline expired.
+    expect(socket.sent).toHaveLength(1);
+    expect(socket.sent[0]?.payload).toEqual({ request_id: "run-1:call-1", approved: true });
   });
 });
