@@ -873,6 +873,18 @@ export interface AtlasSocket {
 
 export interface AtlasSocketHandlers {
   readonly onOpen: () => void;
+  /**
+   * Any inbound frame. Used as the proof that Atlas has RECORDED this console's presence.
+   *
+   * The client's `open` event fires when the upgrade completes, which is strictly earlier than
+   * the server writing its presence row — and `await_approval` denies a gated tool when the
+   * presence count is zero. Treating `open` as attached therefore left a window where a
+   * session reported ready and a tool call arriving inside it was refused anyway.
+   *
+   * `ws.rs` calls `enter_presence` BEFORE sending its opening heartbeat, so the first frame to
+   * arrive is a receipt for that write.
+   */
+  readonly onMessage: () => void;
   readonly onClose: () => void;
 }
 
@@ -894,6 +906,7 @@ export const feedSocketUrl = (endpoint: AtlasEndpoint, threadId: string): string
 export const browserSocketFactory: AtlasSocketFactory = (url, handlers) => {
   const socket = new WebSocket(url);
   socket.addEventListener("open", handlers.onOpen);
+  socket.addEventListener("message", handlers.onMessage);
   socket.addEventListener("close", handlers.onClose);
   socket.addEventListener("error", handlers.onClose);
   return {
@@ -930,6 +943,7 @@ export const makeConsolePresence = (input: {
     });
   let socket: AtlasSocket | undefined;
   let open = false;
+  let attached = false;
   let closed = false;
   let attempt = 0;
   // Decisions made while the socket was down. Dropping one silently would strand the turn that
@@ -959,14 +973,21 @@ export const makeConsolePresence = (input: {
         if (closed) return;
         open = true;
         attempt = 0;
+        flush();
+      },
+      // Presence confirmed by the node, not merely a completed upgrade. This is what
+      // `whenAttached` waits on.
+      onMessage: () => {
+        if (closed) return;
+        attached = true;
         for (const wake of waiters) wake();
         waiters = [];
-        flush();
       },
       onClose: () => {
         if (reconnectScheduled || closed) return;
         reconnectScheduled = true;
         open = false;
+        attached = false;
         socket = undefined;
         attempt += 1;
         // Re-dial, always. A presence that gives up after one drop stops being a console, and
@@ -994,7 +1015,7 @@ export const makeConsolePresence = (input: {
      * be asked. Readiness therefore means attached, not dialling.
      */
     whenAttached: (): Promise<void> =>
-      open
+      attached
         ? Promise.resolve()
         : new Promise<void>((resolve) => {
             waiters = [...waiters, resolve];

@@ -16,6 +16,7 @@ import {
   type FetchLike,
 } from "./AtlasConsole.ts";
 import { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
+import { runtimeEventToActivities } from "../../orchestration/Layers/ProviderRuntimeIngestion.ts";
 
 /**
  * A stub host that records what it was asked and answers what it was told to.
@@ -596,6 +597,64 @@ describe("a run the supervisor ended", () => {
     for (const reason of ["cancel_timeout", "progress_timeout", "heartbeat_timeout"]) {
       for (const event of projectLifecycleEvent(stalledRow(reason), projectionContext)) {
         expect(() => decode(event)).not.toThrow();
+      }
+    }
+  });
+});
+
+describe("Atlas tool frames through the real ingestion reducer", () => {
+  /**
+   * Decoding proves a projection is well-formed; it does not prove the reducer downstream
+   * makes one item out of two events. So the captured `tool_call`/`tool_result` pair is run
+   * through `runtimeEventToActivities` — the actual ingestion path — and the two activities
+   * are required to land on the same item.
+   *
+   * This is the check that would have caught the original defect twice over: the events were
+   * undecodable AND uncorrelated, and adapter-level collection saw neither.
+   */
+  const toolFrames = () => {
+    const started = CAPTURED_FRAMES.find((frame) => frame.kind === "tool_call") as AtlasFrame;
+    const finished = CAPTURED_FRAMES.find((frame) => frame.kind === "tool_result") as AtlasFrame;
+    return {
+      started: projectFeedFrame(started, projectionContext)[0] as ProviderRuntimeEvent,
+      finished: projectFeedFrame(finished, projectionContext)[0] as ProviderRuntimeEvent,
+    };
+  };
+
+  it("turns one Atlas tool call into one correlated item, start to finish", () => {
+    const { started, finished } = toolFrames();
+    const openedActivities = runtimeEventToActivities(started);
+    const closedActivities = runtimeEventToActivities(finished);
+
+    // Non-empty is itself load-bearing: the reducer drops any item whose type is not a
+    // TOOL_LIFECYCLE_ITEM_TYPE, so the original `"tool_call"` produced NOTHING here — the
+    // defect was invisible at the adapter layer and silent at this one.
+    expect(openedActivities.length).toBeGreaterThan(0);
+    expect(closedActivities.length).toBeGreaterThan(0);
+
+    // The reducer carries the correlation as `payload.toolCallId`, taken from the event's
+    // itemId. Both ends must agree, or the timeline shows an orphan start that never finishes
+    // beside a result from nowhere.
+    const openedId = (openedActivities[0]?.payload as Record<string, unknown>)["toolCallId"];
+    const closedId = (closedActivities[0]?.payload as Record<string, unknown>)["toolCallId"];
+    expect(openedId).toBeDefined();
+    expect(closedId).toEqual(openedId);
+    expect(openedId).toEqual("atlas-tool-call-7");
+  });
+
+  it("reports the tool as finished, not still running", () => {
+    const { started, finished } = toolFrames();
+    const openPayload = runtimeEventToActivities(started)[0]?.payload as Record<string, unknown>;
+    const closedPayload = runtimeEventToActivities(finished)[0]?.payload as Record<string, unknown>;
+    expect(openPayload["status"]).toEqual("inProgress");
+    // A completed call left `inProgress` is a spinner that never stops.
+    expect(closedPayload["status"]).toEqual("completed");
+  });
+
+  it("survives ingestion for every captured frame kind, not just the tool pair", () => {
+    for (const frame of CAPTURED_FRAMES) {
+      for (const event of projectFeedFrame(frame, projectionContext)) {
+        expect(() => runtimeEventToActivities(event), `kind "${frame.kind}"`).not.toThrow();
       }
     }
   });

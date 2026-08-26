@@ -78,6 +78,7 @@ import {
   type ProviderDriver,
   type ProviderInstance,
 } from "../ProviderDriver.ts";
+import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { buildServerProvider, type ProviderProbeResult } from "../providerSnapshot.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type { ServerProviderShape } from "../Services/ServerProvider.ts";
@@ -812,7 +813,9 @@ export interface AtlasDriverDeps {
 }
 
 /** Build the Atlas driver. `deps.fetch` exists so a test can stand the driver up without a node. */
-export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSettings, never> => ({
+export const makeAtlasDriver = (
+  deps?: AtlasDriverDeps,
+): ProviderDriver<AtlasSettings, ProviderSessionDirectory> => ({
   driverKind: ATLAS_DRIVER_KIND,
   metadata: {
     displayName: "Atlas",
@@ -883,6 +886,12 @@ export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSet
         streamChanges: Stream.empty,
       };
 
+      // The real durable home for the cursor. `R` on `ProviderDriver` exists precisely for
+      // this — the registry aggregates each driver's requirements and the runtime supplies
+      // them — so the reader's position reaches `ProviderSessionDirectory` in production and
+      // not only when a test hands the adapter a callback.
+      const directory = yield* ProviderSessionDirectory;
+
       return {
         instanceId,
         driverKind: ATLAS_DRIVER_KIND,
@@ -895,6 +904,19 @@ export const makeAtlasDriver = (deps?: AtlasDriverDeps): ProviderDriver<AtlasSet
           endpoint: { baseUrl, accessToken: config.accessToken, fetch: fetchImpl },
           fleetId: "default",
           instanceId: String(instanceId),
+          // Awaited by the reader before it advances, and a failure is propagated rather than
+          // swallowed: `upsert` failing must leave the in-memory cursor where it was so the
+          // next read re-delivers the page instead of skipping past it.
+          onSessionCursor: (update) =>
+            Effect.runPromise(
+              directory.upsert({
+                threadId: update.threadId as unknown as ThreadId,
+                provider: ATLAS_DRIVER_KIND,
+                providerInstanceId: update.providerInstanceId as never,
+                status: "running",
+                resumeCursor: update.cursor,
+              }),
+            ),
         }),
         // Deterministic local generation, with no `deps`: commit messages and thread titles
         // come from the local fallback rather than a model call this driver cannot yet make.

@@ -4,7 +4,10 @@ import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import { ThreadId } from "@t3tools/contracts";
 
+import * as Scope from "effect/Scope";
+
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
+import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
   ATLAS_DRIVER_KIND,
   type AtlasSocketFactory,
@@ -13,7 +16,12 @@ import {
   bindingSlug,
   type FetchLike,
 } from "./AtlasConsole.ts";
-import { classifyHandshake, makeAtlasAdapter, probeAtlasHost } from "./AtlasDriver.ts";
+import {
+  classifyHandshake,
+  makeAtlasAdapter,
+  makeAtlasDriver,
+  probeAtlasHost,
+} from "./AtlasDriver.ts";
 
 /**
  * The Atlas provider exists because the ACP runtime the other two drivers spawn cannot be
@@ -242,7 +250,7 @@ describe("provider registration", () => {
     expect(kinds).toContain(ATLAS_DRIVER_KIND);
   });
 
-  it("needs no infrastructure services, because it spawns nothing", () => {
+  it("bootstraps with no settings at all", () => {
     const atlas = BUILT_IN_DRIVERS.find((driver) => driver.driverKind === ATLAS_DRIVER_KIND);
 
     expect(atlas).toBeDefined();
@@ -250,6 +258,75 @@ describe("provider registration", () => {
     // A default config must be usable with no settings at all, or the driver cannot be
     // bootstrapped before a user has configured it.
     expect(() => atlas?.defaultConfig()).not.toThrow();
+  });
+
+  /**
+   * This used to be titled "needs no infrastructure services" — and it never actually checked
+   * that, which is how the cursor hook shipped declared-but-unwired: the adapter accepted an
+   * `onSessionCursor` that only tests ever supplied, so nothing a reader saw between turns
+   * reached durable storage.
+   *
+   * The driver now requires `ProviderSessionDirectory`, which is exactly what `R` on
+   * `ProviderDriver` is for, and asking for it in the type is what makes the registry supply
+   * it in production rather than leaving the seam dangling.
+   */
+  it("persists a reader cursor through the real session directory", async () => {
+    const node = makeFakeAtlas();
+    const written: Array<Record<string, unknown>> = [];
+    const scope = Effect.runSync(Scope.make());
+
+    // The PRODUCTION construction path — `makeAtlasDriver().create()`, not a hand-built
+    // adapter — so this fails if the hook is ever left dangling again.
+    const instance = await Effect.runPromise(
+      makeAtlasDriver({ fetch: node.fetch })
+        .create({
+          instanceId: "atlas-wired" as never,
+          displayName: "Atlas",
+          accentColor: undefined,
+          environment: [],
+          enabled: true,
+          config: { baseUrl: "http://127.0.0.1:3010" } as never,
+        } as never)
+        .pipe(
+          Effect.provideService(ProviderSessionDirectory, {
+            upsert: (binding: Record<string, unknown>) =>
+              Effect.sync(() => {
+                written.push(binding);
+              }),
+          } as never),
+          Effect.provideService(Scope.Scope, scope),
+        ),
+    );
+
+    const adapter = instance.adapter as unknown as ReturnType<typeof adapterFor>;
+    const seen: Array<string> = [];
+    const fiber = collect(adapter, seen);
+    await Effect.runPromise(
+      adapter.startSession({ threadId: ThreadId.make("thr-1"), runtimeMode: "local" } as never),
+    );
+    // Something on each log, so both halves of the cursor have somewhere to move to.
+    node.append("command.accepted", { command: { kind: "start" } });
+    node.say("assistant", { text: "pong" });
+
+    await waitFor(
+      () =>
+        written.some((binding) => {
+          const cursor = binding["resumeCursor"] as
+            | { after?: number; feed?: { after?: number } }
+            | undefined;
+          return (cursor?.after ?? 0) >= 1 && (cursor?.feed?.after ?? 0) >= 1;
+        }),
+      "the reader's position to reach the directory",
+    );
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+    await Effect.runPromise(Fiber.interrupt(fiber));
+
+    const last = written[written.length - 1] as Record<string, unknown>;
+    expect(last["threadId"]).toEqual("thr-1");
+    expect(last["providerInstanceId"]).toEqual("atlas-wired");
+    // Both logs, written mid-turn — not at a turn boundary, which is all the shipped path
+    // managed before this was wired.
+    expect(last["resumeCursor"]).toMatchObject({ epoch: 1, after: 1 });
   });
 });
 
@@ -416,7 +493,12 @@ const settle = async (): Promise<void> => {
  * resulting tight loop starves the event loop so nothing else makes progress.
  */
 const silentSocket: AtlasSocketFactory = (_url, handlers) => {
-  queueMicrotask(handlers.onOpen);
+  queueMicrotask(() => {
+    handlers.onOpen();
+    // A real node sends a heartbeat as soon as it has recorded presence; readiness waits on
+    // that frame rather than on the upgrade.
+    handlers.onMessage();
+  });
   return { send: () => {}, close: () => {} };
 };
 
@@ -671,7 +753,11 @@ const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
   const connect: AtlasSocketFactory = (url, handlers) => {
     urls.push(url);
     live = handlers;
-    if (openNow) queueMicrotask(handlers.onOpen);
+    if (openNow)
+      queueMicrotask(() => {
+        handlers.onOpen();
+        handlers.onMessage();
+      });
     return {
       send: (data: string) => {
         const frame = JSON.parse(data) as { kind: string; payload: Record<string, unknown> };
@@ -692,9 +778,20 @@ const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
       openNow = false;
       live?.onClose();
     },
+    /**
+     * A FAILED connection, as the browser factory reports one: `error` then `close`, both
+     * routed to the same handler.
+     */
+    failWithErrorThenClose: () => {
+      openNow = false;
+      const handlers = live;
+      handlers?.onClose();
+      handlers?.onClose();
+    },
     restore: () => {
       openNow = true;
       live?.onOpen();
+      live?.onMessage();
     },
   };
 };
@@ -728,6 +825,44 @@ describe("approvals", () => {
     // No replay: the frames are already read over HTTP, and replaying here would double them.
     expect(socket.urls[0]).toContain("after=-1");
     expect(socket.urls[0]).toContain("access_token=tok");
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+  });
+
+  it("waits for the node to confirm presence, not merely for the socket to open", async () => {
+    const node = makeFakeAtlas();
+    let announce: (() => void) | undefined;
+    // A socket that completes its upgrade but has not yet been recorded by the node — the real
+    // window between the client's `open` and the server's `enter_presence` write.
+    const slowPresence: AtlasSocketFactory = (_url, handlers) => {
+      queueMicrotask(handlers.onOpen);
+      announce = handlers.onMessage;
+      return { send: () => {}, close: () => {} };
+    };
+    const adapter = makeAtlasAdapter({
+      endpoint: { baseUrl: "http://127.0.0.1:3010", accessToken: "tok", fetch: node.fetch },
+      fleetId: "default",
+      instanceId: "atlas-1",
+      sleep: instantSleep,
+      idlePollMs: 0,
+      connect: slowPresence,
+    });
+
+    let ready = false;
+    const session = Effect.runPromise(
+      adapter.startSession({ threadId: ThreadId.make("thr-1"), runtimeMode: "local" } as never),
+    ).then(() => {
+      ready = true;
+    });
+    await settle();
+    // Reporting ready here is what let a fast gated call be denied for "no console attached"
+    // while the composer showed a live session.
+    expect(ready).toBe(false);
+
+    // The node speaks — `ws.rs` writes presence before its opening heartbeat, so the first
+    // frame is a receipt for that write.
+    announce?.();
+    await session;
+    expect(ready).toBe(true);
     await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
   });
 
@@ -789,6 +924,42 @@ describe("approvals", () => {
     });
   });
 
+  it("re-dials once when a failed connection reports both error and close", async () => {
+    const node = makeFakeAtlas();
+    const socket = makeFakeSocket(node);
+    const adapter = socketAdapterFor(node, socket);
+    await startSession(adapter);
+    await settle();
+    const dialsAfterOpen = socket.urls.length;
+
+    // `browserSocketFactory` sends BOTH events to the same callback, and a failed connect
+    // fires them in sequence. Un-latched, each failure scheduled two re-dials, doubling every
+    // retry until the backoff meant nothing.
+    socket.failWithErrorThenClose();
+    await settle();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+
+    expect(socket.urls.length - dialsAfterOpen).toEqual(1);
+  });
+
+  it("re-dials again after a socket that WAS working drops", async () => {
+    const node = makeFakeAtlas();
+    const socket = makeFakeSocket(node);
+    const adapter = socketAdapterFor(node, socket);
+    await startSession(adapter);
+    await settle();
+    const dialsAfterOpen = socket.urls.length;
+
+    // The other half of the latch, and the one my first attempt broke: latching on open as
+    // well meant a healthy socket that later dropped never came back, so the console silently
+    // stopped existing and every subsequent gated tool call was denied.
+    socket.drop();
+    await settle();
+    await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
+
+    expect(socket.urls.length).toBeGreaterThan(dialsAfterOpen);
+  });
+
   it("does not report a decision delivered until Atlas has stored it", async () => {
     const node = makeFakeAtlas();
     const socket = makeFakeSocket(node);
@@ -836,7 +1007,10 @@ describe("approvals", () => {
     // A socket that accepts writes and drops them: the shape of a half-open connection, and
     // the case where claiming success is most harmful.
     const blackhole: AtlasSocketFactory = (_url, handlers) => {
-      queueMicrotask(handlers.onOpen);
+      queueMicrotask(() => {
+        handlers.onOpen();
+        handlers.onMessage();
+      });
       return { send: () => {}, close: () => {} };
     };
     const adapter = makeAtlasAdapter({
