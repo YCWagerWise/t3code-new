@@ -4,10 +4,10 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as Clock from "effect/Clock";
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 
 import { HostProcessEnvironment, HostProcessPlatform } from "./hostProcess.ts";
 import * as Context from "effect/Context";
@@ -44,10 +44,17 @@ export type CommandAvailabilityChecker = (
   options?: CommandAvailabilityOptions,
 ) => Effect.Effect<boolean, never, FileSystem.FileSystem | Path.Path>;
 
-export class CommandResolutionError extends Data.TaggedError("CommandResolutionError")<{
-  readonly command: string;
-  readonly reason: "not-found";
-}> {}
+/**
+ * Whether a command-resolution failure means "not on PATH" (ordinary, expected, cacheable as
+ * absence) rather than a genuine operational fault such as a permission-denied directory along
+ * the search path. This is the one classification rule the whole module resolves absence
+ * through — `apps/server/src/processRunner.ts` applies the identical rule
+ * (`error.reason._tag === "NotFound"`) to spawn failures, because both are the same
+ * `PlatformError` taxonomy underneath.
+ */
+export function isNotFoundPlatformError(error: PlatformError.PlatformError): boolean {
+  return error.reason._tag === "NotFound";
+}
 
 const WINDOWS_SHELL_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
 
@@ -544,10 +551,20 @@ const isExecutableFile = Effect.fn("shell.isExecutableFile")(function* (
   filePath: string,
   platform: NodeJS.Platform,
   windowsPathExtensions: ReadonlyArray<string>,
-): Effect.fn.Return<boolean, never, FileSystem.FileSystem | Path.Path> {
+): Effect.fn.Return<boolean, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path> {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const stat = yield* fileSystem.stat(filePath).pipe(Effect.orElseSucceed(() => null));
+  // A missing candidate is the ordinary, expected outcome of probing PATH entries one at a time —
+  // most of them will not have the file. Only a stat failure that is *not* "not found" (EACCES on
+  // an unreadable directory, say) is a real operational fault, and that one is left to fail this
+  // call for real rather than being read as "not this candidate" and silently skipped.
+  const stat = yield* fileSystem
+    .stat(filePath)
+    .pipe(
+      Effect.catch((cause) =>
+        isNotFoundPlatformError(cause) ? Effect.succeed(null) : Effect.fail(cause),
+      ),
+    );
   if (stat === null || stat.type !== "File") return false;
 
   if (platform === "win32") {
@@ -559,10 +576,17 @@ const isExecutableFile = Effect.fn("shell.isExecutableFile")(function* (
   return canExecuteFile(filePath);
 });
 
+/**
+ * Resolves a command to its absolute path, or `null` if it is genuinely not on PATH — an ordinary,
+ * expected outcome for an optional CLI or editor nobody installed, not a failure. Only a real
+ * operational fault (a permission-denied directory along the search path, say) fails this Effect,
+ * so `Effect.fn`'s span records a Failure exactly when there is a genuine problem to look at, and
+ * never for the routine case of "not installed".
+ */
 const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlatform")(function* (
   command: string,
   options: CommandAvailabilityOptions & { readonly platform: NodeJS.Platform },
-): Effect.fn.Return<string, CommandResolutionError, FileSystem.FileSystem | Path.Path> {
+): Effect.fn.Return<string | null, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path> {
   const path = yield* Path.Path;
   const platform = options.platform;
   const env = options.env ?? process.env;
@@ -580,12 +604,12 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
         return candidate;
       }
     }
-    return yield* new CommandResolutionError({ command, reason: "not-found" });
+    return null;
   }
 
   const pathValue = resolvePathEnvironmentVariable(env);
   if (pathValue.length === 0) {
-    return yield* new CommandResolutionError({ command, reason: "not-found" });
+    return null;
   }
 
   const cacheKey = [platform, pathValue, windowsPathExtensions.join(";"), command].join(
@@ -595,9 +619,6 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
   const nowNanos = yield* Clock.currentTimeNanos;
   const cached = cache.get(cacheKey);
   if (cached !== undefined && cached.expiresAtNanos > nowNanos) {
-    if (cached.resolvedPath === null) {
-      return yield* new CommandResolutionError({ command, reason: "not-found" });
-    }
     return cached.resolvedPath;
   }
 
@@ -618,14 +639,17 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
       }
     }
   }
+  // Only a scan that reached the end of PATH without a real fault gets cached as absence — a
+  // genuine operational error above returned (failed) this Effect well before this line, so it is
+  // never recorded here and the next caller gets a fresh attempt instead of a replayed fault.
   cacheCommandResolution(cache, cacheKey, null, nowNanos);
-  return yield* new CommandResolutionError({ command, reason: "not-found" });
+  return null;
 });
 
 export const resolveCommandPath = Effect.fn("shell.resolveCommandPath")(function* (
   command: string,
   options: CommandAvailabilityOptions = {},
-) {
+): Effect.fn.Return<string | null, PlatformError.PlatformError, FileSystem.FileSystem | Path.Path> {
   return yield* resolveCommandPathForPlatform(command, {
     env: options.env ?? (yield* HostProcessEnvironment),
     platform: yield* HostProcessPlatform,
@@ -667,9 +691,12 @@ export const isCommandAvailable = Effect.fn("shell.isCommandAvailable")(function
   command: string,
   options: CommandAvailabilityOptions = {},
 ) {
-  return yield* resolveCommandPath(command, options).pipe(
-    Effect.as(true),
-    Effect.catchTag("CommandResolutionError", () => Effect.succeed(false)),
+  // `resolveCommandPath` no longer fails for the ordinary "not on PATH" case (see above), so a
+  // `null` answers this directly; a genuine operational fault still reaches here as a real
+  // failure, already correctly traced by the spans it passed through, and is folded into "not
+  // available" for this boolean convenience wrapper the same way it always was.
+  return (
+    (yield* resolveCommandPath(command, options).pipe(Effect.orElseSucceed(() => null))) !== null
   );
 });
 

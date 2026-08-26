@@ -1,7 +1,11 @@
+// @effect-diagnostics nodeBuiltinImport:off - builds real PATH-scan fixtures on disk.
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -356,14 +360,97 @@ effectIt.layer(NodeServices.layer)("isCommandAvailable", (it) => {
 });
 
 effectIt.layer(NodeServices.layer)("resolveCommandPath", (it) => {
-  it.effect("fails when PATH is empty", () =>
-    Effect.gen(function* () {
-      const result = yield* resolveCommandPath("definitely-not-installed", {
-        env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
-      }).pipe(Effect.provideService(HostProcessPlatform, "win32"), Effect.result);
+  it.effect(
+    "a) resolves an empty PATH to null (an ordinary result), never a Failure — the routine absence case",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* resolveCommandPath("definitely-not-installed", {
+          env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+        }).pipe(Effect.provideService(HostProcessPlatform, "win32"), Effect.result);
 
-      expect(result._tag).toBe("Failure");
-    }),
+        // `Effect.fn`'s span only closes as Failure when the effect it wraps fails — a
+        // `Result.Success` here is the direct proof that "not on PATH" never opens one, which is
+        // the fix for the dominant `shell.resolveCommandPath*` Failure-trace source.
+        expect(result._tag).toBe("Success");
+        expect(result._tag === "Success" ? result.success : undefined).toBe(null);
+      }),
+  );
+
+  it.effect(
+    "a) also resolves to null after scanning a real, non-empty PATH and finding nothing there",
+    () =>
+      Effect.gen(function* () {
+        const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-shell-absent-"));
+        try {
+          const result = yield* resolveCommandPath("definitely-not-installed-either", {
+            env: { PATH: root },
+          }).pipe(Effect.provideService(HostProcessPlatform, "linux"), Effect.result);
+
+          expect(result._tag).toBe("Success");
+          expect(result._tag === "Success" ? result.success : undefined).toBe(null);
+        } finally {
+          NodeFS.rmSync(root, { recursive: true, force: true });
+        }
+      }),
+  );
+
+  it.effect(
+    "b) a real filesystem fault distinct from 'not found' still fails, and is not read as absence",
+    () =>
+      Effect.gen(function* () {
+        const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-shell-fault-"));
+        try {
+          // A PATH entry that is a *file*, not a directory: resolving anything "inside" it hits
+          // ENOTDIR — `PlatformError.reason._tag === "BadResource"`, not "NotFound" — a genuine
+          // operational fault, reproduced without needing root or permission games.
+          const blocker = NodePath.join(root, "blocker");
+          NodeFS.writeFileSync(blocker, "not a directory");
+
+          const result = yield* resolveCommandPath("whatever", {
+            env: { PATH: blocker },
+          }).pipe(Effect.provideService(HostProcessPlatform, "linux"), Effect.result);
+
+          expect(result._tag).toBe("Failure");
+        } finally {
+          NodeFS.rmSync(root, { recursive: true, force: true });
+        }
+      }),
+  );
+
+  it.effect(
+    "c) a genuine fault leaves no absence cached — the next call gets a fresh attempt",
+    () =>
+      Effect.gen(function* () {
+        const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-shell-fault-cache-"));
+        try {
+          const command = "recovers-after-a-real-fault";
+          const blocker = NodePath.join(root, "blocker");
+          NodeFS.writeFileSync(blocker, "not a directory");
+
+          const faulted = yield* resolveCommandPath(command, {
+            env: { PATH: blocker },
+          }).pipe(Effect.provideService(HostProcessPlatform, "linux"), Effect.result);
+          expect(faulted._tag).toBe("Failure");
+
+          // Replace the blocking file with a real, executable binary under the same PATH string
+          // shape used above. If the fault had been cached as absence, this would still answer
+          // `null` (or wait out the cache TTL); instead it finds the binary immediately, because a
+          // genuine failure never reached the line that writes a cache entry.
+          NodeFS.rmSync(blocker, { force: true });
+          NodeFS.mkdirSync(blocker);
+          const binaryPath = NodePath.join(blocker, command);
+          NodeFS.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+          NodeFS.chmodSync(binaryPath, 0o755);
+
+          const recovered = yield* resolveCommandPath(command, {
+            env: { PATH: blocker },
+          }).pipe(Effect.provideService(HostProcessPlatform, "linux"));
+
+          expect(recovered).toBe(binaryPath);
+        } finally {
+          NodeFS.rmSync(root, { recursive: true, force: true });
+        }
+      }),
   );
 });
 

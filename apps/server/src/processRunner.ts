@@ -11,7 +11,7 @@ import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { isNotFoundPlatformError, resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
   collectUint8StreamText,
   decodeUtf8,
@@ -191,15 +191,6 @@ export const isWindowsCommandNotFound = Effect.fn("processRunner.isWindowsComman
   },
 );
 
-/**
- * POSIX absence: the spawner never found an executable to run at all. Every other spawn cause
- * (EACCES, ENOEXEC, a bad cwd, ...) is a genuine operational fault, not an absence, and is left to
- * fail normally.
- */
-function isCommandNotFoundPlatformError(error: PlatformError.PlatformError): boolean {
-  return error.reason._tag === "NotFound";
-}
-
 const collectText = Effect.fn("processRunner.collectText")(function* (input: {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
@@ -355,7 +346,7 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
   if (Result.isFailure(spawnResult)) {
     if (
       input.commandNotFoundBehavior === "result" &&
-      isCommandNotFoundPlatformError(spawnResult.failure)
+      isNotFoundPlatformError(spawnResult.failure)
     ) {
       return {
         stdout: "",
