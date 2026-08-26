@@ -1777,7 +1777,7 @@ async fn stop_thread_checked(
     } else {
         state.rt.interrupt(thread_id).await
     }
-    .map_err(|e| format!("runtime cancel failed: {e}"));
+    .map_err(|e| format!("runtime cancel failed: {e}"))?;
 
     interrupt_foreground_terminal(&state.terminal)
         .await
