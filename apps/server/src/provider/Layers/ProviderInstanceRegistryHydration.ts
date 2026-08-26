@@ -91,6 +91,22 @@ export const deriveProviderInstanceConfigMap = (
     const legacyKey = driver.driverKind as keyof ServerSettings["providers"];
     const legacyConfig = settings.providers[legacyKey];
     if (legacyConfig === undefined) {
+      // Nothing configured. For a driver that spawns a local binary that is the right
+      // answer — an instance nobody asked for would probe for something that is not
+      // installed. But a driver that spawns nothing and ships a usable default config is
+      // simply absent from the composer until someone writes a settings key by hand, which
+      // is how a fresh install ends up reporting "No provider available" while a perfectly
+      // good provider sits unregistered.
+      //
+      // Bootstrapping does not assert readiness: the instance still probes and reports what
+      // the node actually said, so an unreachable one shows as unavailable rather than
+      // hidden.
+      if (driver.metadata.bootstrapWithoutConfig === true) {
+        merged[instanceId] = {
+          driver: driver.driverKind,
+          config: driver.defaultConfig(),
+        };
+      }
       continue;
     }
 

@@ -1,4 +1,5 @@
 import {
+  AtlasSettings,
   ClaudeSettings,
   CodexSettings,
   OpenCodeSettings,
@@ -68,6 +69,20 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     label: "OpenAI-compatible (Ollama, LM Studio, …)",
     icon: OpenAI,
     settingsSchema: OpenaiCompatSettings,
+  },
+  // Atlas: a running host, not a local binary. It spawns nothing and addresses a node over
+  // `/console/v1`, with Atlas as the authority for runs, turns and workspaces.
+  //
+  // Without an entry HERE the driver is invisible to the app no matter how well it works
+  // server-side: this list drives both the Providers panel and the Add Provider flow, so a
+  // registered, buildable, probeable driver still renders as "No provider available". That is
+  // exactly what the `openaiCompat` note above records happening to Ollama (#70), and Atlas
+  // reached it the same way.
+  {
+    value: ProviderDriverKind.make("atlas"),
+    label: "Atlas",
+    icon: OpenAI,
+    settingsSchema: AtlasSettings,
   },
   // Cursor and Grok were removed from this build (#150). Their entries stayed
   // here after the drivers were deleted, so Add Provider still offered Grok

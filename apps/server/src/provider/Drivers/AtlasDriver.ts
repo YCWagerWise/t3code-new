@@ -822,6 +822,16 @@ export const makeAtlasDriver = (
     // One instance per node URL is the natural unit, and two instances pointed at the same
     // node are two lenses on one authority — which Atlas already supports.
     supportsMultipleInstances: true,
+    // This driver spawns nothing and its default config already points at a node
+    // (`DEFAULT_BASE_URL`), so an instance is useful before anyone configures one. Without
+    // this the driver is registered, buildable and probeable, and still never reaches the
+    // composer: hydration only materializes an instance from settings that do not exist yet,
+    // so a fresh install reports "No provider available" while the probe would have answered.
+    //
+    // Bootstrapping is not the same as claiming readiness. The instance still probes the node
+    // and reports `installed`/`auth`/`status` from what it actually said, so a box with no
+    // atlas-host running gets an honest unavailable provider rather than a hidden one.
+    bootstrapWithoutConfig: true,
   },
   configSchema: AtlasSettings,
   defaultConfig: (): AtlasSettings => decodeAtlasSettings({}),

@@ -50,6 +50,21 @@ export interface ProviderDriverMetadata {
    * rejects multi-instance configurations with a clear error.
    */
   readonly supportsMultipleInstances?: boolean;
+  /**
+   * Whether an instance of this driver should exist even when nothing is
+   * configured for it. Defaults to `false`.
+   *
+   * Hydration otherwise materializes an instance only from an explicit
+   * `providerInstances.<id>` entry or a legacy `settings.providers.<kind>`
+   * mirror. That is right for a driver that spawns a local binary — an
+   * instance nobody configured would probe for something that is not there.
+   *
+   * It is wrong for a driver that spawns nothing and whose default config is
+   * already usable. Such a driver is registered, buildable and probeable, yet
+   * never reaches the composer, so a fresh install reports "No provider
+   * available" while the driver it needs sits one unwritten settings key away.
+   */
+  readonly bootstrapWithoutConfig?: boolean;
 }
 
 /**

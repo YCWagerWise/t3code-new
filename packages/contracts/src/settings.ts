@@ -597,6 +597,57 @@ export const OpenaiCompatSettings = makeProviderSettingsSchema(
 );
 export type OpenaiCompatSettings = typeof OpenaiCompatSettings.Type;
 
+/**
+ * Atlas — a running atlas-host this app talks to over its console API.
+ *
+ * Unlike the ACP-backed providers there is no binary to find: the driver spawns nothing and
+ * addresses a host. So the only things a user configures are WHERE the node is and HOW to
+ * authenticate to it.
+ *
+ * This schema exists because the settings UI is driven by a client-side definition list, not
+ * by the server's driver registry. A driver with no entry there cannot be rendered and cannot
+ * be created through Add Provider — the same reason `openaiCompat` was invisible until it was
+ * added (#70), reached again by Atlas.
+ */
+export const AtlasSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    baseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Node URL",
+        description:
+          "The atlas-host this lens drives. Atlas owns the runs, turns and workspaces; " +
+          "this app renders them and issues commands.",
+        providerSettingsForm: {
+          placeholder: "http://127.0.0.1:3010",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    accessToken: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Access token",
+        description:
+          "Machine token or user JWT for the node, sent as a Bearer header. A node that " +
+          "answers 401 is reachable but unauthorised — it reports unavailable rather than ready.",
+        providerSettingsForm: {
+          placeholder: "atlas fleet token",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+  },
+  {
+    order: ["baseUrl", "accessToken"],
+  },
+);
+export type AtlasSettings = typeof AtlasSettings.Type;
+
 export const ObservabilitySettings = Schema.Struct({
   otlpTracesUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   otlpMetricsUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),

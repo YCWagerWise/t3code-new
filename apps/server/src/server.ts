@@ -392,7 +392,16 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  // `ProviderSessionDirectoryLayerLive` is provided DIRECTLY here, not inherited from
+  // `ProviderRuntimeLayerLive` above: in this pipe each `provideMerge` supplies the layers
+  // accumulated BEFORE it, so the directory merged earlier flows the wrong way and is not
+  // visible to driver construction. The Atlas driver requires it to persist reader cursors,
+  // and without this the registry builds it into an "unavailable" shadow with
+  // `Service not found: .../ProviderSessionDirectory` — which reads to a user as
+  // "No provider available" rather than as the wiring error it is.
+  Layer.provideMerge(
+    ProviderInstanceRegistryHydrationLive.pipe(Layer.provide(ProviderSessionDirectoryLayerLive)),
+  ),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).

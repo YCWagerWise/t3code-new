@@ -13,15 +13,21 @@
  * @module provider/builtInDrivers
  */
 import { AtlasDriver } from "./Drivers/AtlasDriver.ts";
+import type { ProviderSessionDirectory } from "./Services/ProviderSessionDirectory.ts";
 import { ClaudeDriver, type ClaudeDriverEnv } from "./Drivers/ClaudeDriver.ts";
 import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
 import type { AnyProviderDriver } from "./ProviderDriver.ts";
 
 /**
  * Union of infrastructure services required to construct any built-in driver.
- * (Both drivers share the same agent-sdk env.)
+ *
+ * The ACP-backed pair share the agent-sdk env. Atlas needs none of that but does need
+ * `ProviderSessionDirectory`, because it persists its reader position there rather than only
+ * at turn boundaries. Naming it here is what makes the runtime supply it — the `any` in
+ * `AnyProviderDriver` erases the per-driver requirement, so leaving it out typechecks green
+ * and fails at construction instead.
  */
-export type BuiltInDriversEnv = ClaudeDriverEnv | CodexDriverEnv;
+export type BuiltInDriversEnv = ClaudeDriverEnv | CodexDriverEnv | ProviderSessionDirectory;
 
 /**
  * Ordered list of built-in drivers. Order matters only for UI tie-breaking —
