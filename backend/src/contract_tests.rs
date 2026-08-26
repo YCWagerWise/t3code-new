@@ -3022,6 +3022,93 @@ async fn unreadable_kv_does_not_rotate_the_asset_signing_key() {
     );
 }
 
+/// PROOF (#356): a signing-key row that is PRESENT but malformed is an error, and the row
+/// SURVIVES.
+///
+/// The old code fell through both `if let`s, minted a fresh key, and `put_kv` overwrote the
+/// original — producing exactly the outcome the function's own comment forbids (every
+/// outstanding signed URL stops redeeming, with no error naming the cause) and destroying a
+/// secret that was corrupt-but-possibly-recoverable a moment earlier.
+///
+/// Asserting only that it errors is NOT enough; the durable row has to be shown to have
+/// survived, because the loss is the part with no rebuild path.
+#[tokio::test]
+async fn a_malformed_signing_key_errors_and_is_not_overwritten() {
+    for bad in ["not-hex-at-all", "abc", "zz", "", "€x"] {
+        let (state, _dir) = test_state().await;
+        state
+            .rt
+            .store()
+            .put_kv("assets:signing_key", bad)
+            .await
+            .unwrap();
+
+        let err = assets::signing_key(state.rt.store())
+            .await
+            .expect_err("a malformed signing key must not be silently replaced");
+        assert!(
+            err.contains("assets:signing_key") && err.contains("REFUSING"),
+            "the error must say what refusing costs, for {bad:?}: {err}"
+        );
+
+        // THE POINT: the original bytes are still there.
+        let after = state.rt.store().kv("assets:signing_key").await.unwrap();
+        assert_eq!(
+            after.as_deref(),
+            Some(bad),
+            "the corrupt row must survive verbatim so it can be repaired, for {bad:?}"
+        );
+    }
+}
+
+/// A VALID key is returned unchanged and is not rewritten — the guard must not have turned
+/// every read into a write.
+#[tokio::test]
+async fn a_valid_signing_key_is_returned_unchanged_and_not_rewritten() {
+    let (state, _dir) = test_state().await;
+    let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    state.rt.store().put_kv("assets:signing_key", hex).await.unwrap();
+
+    let key = assets::signing_key(state.rt.store()).await.unwrap();
+    assert_eq!(key.len(), 32);
+    assert_eq!(key[0], 0x00);
+    assert_eq!(key[1], 0x11);
+    assert_eq!(key[31], 0xff);
+    assert_eq!(
+        state.rt.store().kv("assets:signing_key").await.unwrap().as_deref(),
+        Some(hex),
+        "reading the key must not rewrite it"
+    );
+
+    // and it is stable across calls, which is the property the whole module exists for
+    let again = assets::signing_key(state.rt.store()).await.unwrap();
+    assert_eq!(again, key);
+}
+
+/// An ABSENT row is the one state where minting is correct, and it persists.
+#[tokio::test]
+async fn an_absent_signing_key_is_minted_once_and_persisted() {
+    let (state, _dir) = test_state().await;
+    assert!(
+        state.rt.store().kv("assets:signing_key").await.unwrap().is_none(),
+        "PRECONDITION: no key yet"
+    );
+
+    let first = assets::signing_key(state.rt.store()).await.unwrap();
+    assert_eq!(first.len(), 32);
+    let stored = state
+        .rt
+        .store()
+        .kv("assets:signing_key")
+        .await
+        .unwrap()
+        .expect("the minted key is persisted");
+    assert_eq!(stored.len(), 64, "32 bytes as hex");
+
+    let second = assets::signing_key(state.rt.store()).await.unwrap();
+    assert_eq!(second, first, "a second call must not mint a new one");
+}
+
 #[tokio::test]
 async fn unreadable_kv_fails_settings_and_keybinding_reads() {
     let (state, _dir) = test_state().await;

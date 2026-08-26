@@ -153,3 +153,18 @@ Full glossary with file links: `docs/internals/glossary.md`
 
 - Don't verify with browsers or computer use unless the user explicitly agrees or requests it.
 - Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
+
+## Running the Rust backend's tests
+
+    cd backend && cargo test-all        # NOT `cargo test`
+
+`cargo test` is fail-fast **across targets**, and `backend` has seven of them. One failing
+target stops the run, and every later target is then never built — its tests do not show up as
+failed or skipped, they are absent from the output entirely. A reader (or a test-count ratchet)
+sees a smaller suite and no indication that anything is missing. `cargo test-all` is an alias
+defined in `backend/.cargo/config.toml` that adds `--no-fail-fast`, so all seven targets always
+report (#378).
+
+On the shared build box, prefix it: `TMPDIR=~/builds/$CELL/tmp cargo test-all --release`.
+`/tmp` there is a tmpfs that runs full, and a suite using `std::env::temp_dir()` then dies with
+SIGBUS rather than a disk-full error.

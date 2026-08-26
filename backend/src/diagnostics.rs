@@ -94,10 +94,18 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
     let ppid = field(&mut rest)?.parse::<i64>().ok()?;
     let pgid = field(&mut rest)?.parse::<i64>().unwrap_or(0);
     let status = field(&mut rest)?;
-    let cpu_percent = field(&mut rest)?.parse::<f64>().unwrap_or(0.0);
+    // %cpu AND rss ARE THE MEASUREMENT (#294). `unwrap_or(0.0)`/`unwrap_or(0)` did not drop
+    // an unreadable row — it REPORTED the process with fabricated zeros, which is the
+    // strictly worse half of this defect: the row is present, looks fine, and silently
+    // under-reports `totalRssBytes`/`totalCpuPercent`, the two numbers the panel exists to
+    // show. A row whose numbers cannot be read is an unreadable row and is counted as one.
+    let cpu_percent = field(&mut rest)?.parse::<f64>().ok()?;
     // `ps` reports RSS in kibibytes; the contract wants bytes.
-    let rss_kib = field(&mut rest)?.parse::<i64>().unwrap_or(0);
+    let rss_kib = field(&mut rest)?.parse::<i64>().ok()?;
     let elapsed_raw = field(&mut rest)?;
+    // `startTimeMs` is derived from this; zeroing it dates every unreadable process to
+    // "started just now", which is indistinguishable from a genuinely fresh process.
+    let elapsed_secs = parse_etime(&elapsed_raw)?;
     let command = rest.trim().to_string();
     if pid <= 0 {
         return None;
@@ -105,18 +113,84 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
     Some(Proc {
         pid,
         ppid,
+        // `pgid` STAYS lenient, deliberately: the wire contract already has an explicit
+        // convention for it ("0 stands for `ps` did not report one", see process_diagnostics),
+        // so an absent pgid is a representable state rather than fabricated data.
         pgid,
         status,
         cpu_percent,
         rss_bytes: rss_kib.saturating_mul(1024),
-        elapsed_secs: parse_etime(&elapsed_raw).unwrap_or(0),
+        elapsed_secs,
         elapsed: elapsed_raw,
         command,
     })
 }
 
-/// Every process on the box, as `ps` sees it.
-pub async fn ps_all() -> Result<Vec<Proc>, String> {
+/// One `ps` read: the rows that parsed, and how many did NOT (#294).
+///
+/// A partial read used to be indistinguishable from a complete one. A FAILED read was always
+/// honest — `process_diagnostics` and `resource_telemetry_snapshot` both return an explicit
+/// `error`/`unavailable` — but `filter_map(parse_ps_line)` dropped an unparseable ROW in
+/// silence, and `descendants` walks parent→child, so losing one intermediate process also
+/// orphans its whole subtree out of the view. The result was an authoritative-looking tree
+/// that under-reported `totalRssBytes`/`totalCpuPercent` and could omit the runaway
+/// subprocess the panel exists to find, with `error: null`.
+///
+/// So the count travels WITH the rows. A caller cannot render this without deciding what to
+/// do about `unparsed`.
+#[derive(Debug, Clone, Default)]
+pub struct PsRead {
+    pub procs: Vec<Proc>,
+    /// Rows `ps` printed that `parse_ps_line` refused.
+    pub unparsed: usize,
+    /// A bounded sample of those rows, so the failure is diagnosable rather than just
+    /// countable. Capped because this reaches a wire payload.
+    pub unparsed_samples: Vec<String>,
+}
+
+impl PsRead {
+    /// The human-facing sentence for a partial read, or `None` when the read was complete.
+    pub fn partial_error(&self) -> Option<String> {
+        if self.unparsed == 0 {
+            return None;
+        }
+        Some(format!(
+            "partial process read: {} of {} `ps` row(s) could not be parsed, so this tree is \
+             INCOMPLETE — a dropped parent also hides its children. Unparsed sample: {:?}",
+            self.unparsed,
+            self.unparsed + self.procs.len(),
+            self.unparsed_samples
+        ))
+    }
+}
+
+/// Split `ps` stdout into parsed rows and a count of the ones that were refused.
+///
+/// Pure, so the partial-read behaviour is provable from a fixture without spawning `ps` —
+/// which matters because the interesting input is one this box will not produce on demand.
+pub fn parse_ps_output(stdout: &str) -> PsRead {
+    const MAX_SAMPLES: usize = 5;
+    let mut read = PsRead::default();
+    for line in stdout.lines() {
+        // A blank line is not a dropped process; `ps` output ends with one.
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_ps_line(line) {
+            Some(p) => read.procs.push(p),
+            None => {
+                read.unparsed += 1;
+                if read.unparsed_samples.len() < MAX_SAMPLES {
+                    read.unparsed_samples.push(line.chars().take(200).collect());
+                }
+            }
+        }
+    }
+    read
+}
+
+/// Every process on the box, as `ps` sees it — with the count of rows it refused.
+pub async fn ps_all() -> Result<PsRead, String> {
     let out = tokio::process::Command::new("ps")
         .args(["-Ao", "pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args="])
         .output()
@@ -125,10 +199,7 @@ pub async fn ps_all() -> Result<Vec<Proc>, String> {
     if !out.status.success() {
         return Err(format!("ps exited {}", out.status));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect())
+    Ok(parse_ps_output(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// The server process and everything under it, with each row's depth from the
@@ -183,7 +254,14 @@ fn iso(ms: i64) -> String {
 
 /// Take one sample of the server's process tree.
 pub async fn sample(root: i64) -> Result<Sample, String> {
-    let all = ps_all().await?;
+    let read = ps_all().await?;
+    // A partial read is a failed sample for HISTORY purposes: a recorded row that silently
+    // omits a subtree becomes a permanent wrong data point nobody can later distinguish from
+    // a quiet moment (#294).
+    if let Some(e) = read.partial_error() {
+        return Err(e);
+    }
+    let all = read.procs;
     let at_ms = chrono::Utc::now().timestamp_millis();
     let procs = descendants(&all, root)
         .into_iter()
@@ -195,7 +273,7 @@ pub async fn sample(root: i64) -> Result<Sample, String> {
 /// `ServerProcessDiagnosticsResult`.
 pub async fn process_diagnostics(root: i64) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let read = match ps_all().await {
         Ok(a) => a,
         // A failed read is reported AS a failed read. The alternative — an empty
         // process list — renders as "nothing is running", which is a lie the
@@ -208,6 +286,10 @@ pub async fn process_diagnostics(root: i64) -> Value {
             })
         }
     };
+    // …and a PARTIAL read is reported too, through the same field (#294). An incomplete tree
+    // with `error: null` is the more dangerous of the two: it looks authoritative.
+    let partial = read.partial_error();
+    let all = read.procs;
     let rows = descendants(&all, root);
     let total_rss: i64 = rows.iter().map(|(p, _, _)| p.rss_bytes).sum();
     let total_cpu: f64 = rows.iter().map(|(p, _, _)| p.cpu_percent).sum();
@@ -241,7 +323,10 @@ pub async fn process_diagnostics(root: i64) -> Value {
         "totalRssBytes": total_rss.max(0),
         "totalCpuPercent": total_cpu,
         "processes": processes,
-        "error": none(),
+        "error": match partial {
+            Some(e) => some(json!({"message": e})),
+            None => none(),
+        },
     })
 }
 
@@ -570,6 +655,84 @@ mod tests {
         (dir, agent_sdk_metrics::ResourceHistory::open(db, 24 * 60 * 60 * 1000).await.unwrap())
     }
 
+    // ─────────────────── #294: a partial `ps` read cannot look complete ───────────────────
+
+    /// The real shape of one `ps -Ao pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args=` row.
+    fn ps_row(pid: i64, ppid: i64, cmd: &str) -> String {
+        format!("{pid:>6} {ppid:>6} {pid:>6} S     0.5  10240    01:23 {cmd}")
+    }
+
+    /// A row `parse_ps_line` refuses must be COUNTED, not dropped.
+    #[test]
+    fn an_unparseable_ps_row_is_counted_rather_than_dropped() {
+        let stdout = format!(
+            "{}\n{}\n{}\n",
+            ps_row(100, 1, "/usr/bin/server"),
+            // `%cpu` is not a number — one field wrong is all it takes, and this is the
+            // shape a locale, a truncated pipe, or a platform variant actually produces.
+            "   200    100    200 S     n/a  10240    01:23 /usr/bin/agent",
+            ps_row(300, 200, "/usr/bin/child"),
+        );
+        let read = parse_ps_output(&stdout);
+        assert_eq!(read.procs.len(), 2, "the two valid rows still parse");
+        assert_eq!(read.unparsed, 1, "the malformed row is counted");
+        let msg = read.partial_error().expect("a partial read reports itself");
+        assert!(msg.contains("INCOMPLETE"), "{msg}");
+        assert!(msg.contains("/usr/bin/agent"), "the sample names the row: {msg}");
+    }
+
+    /// A COMPLETE read must not report a partial one — otherwise the signal is noise and the
+    /// panel learns to ignore it.
+    #[test]
+    fn a_clean_ps_read_reports_no_partiality() {
+        let stdout = format!("{}\n{}\n\n", ps_row(100, 1, "/usr/bin/server"), ps_row(300, 100, "/usr/bin/child"));
+        let read = parse_ps_output(&stdout);
+        assert_eq!(read.procs.len(), 2);
+        assert_eq!(read.unparsed, 0, "a trailing blank line is not a dropped process");
+        assert!(read.partial_error().is_none());
+    }
+
+    /// The failure the finding actually cares about: `descendants` walks parent→child, so a
+    /// dropped INTERMEDIATE process takes its whole subtree out of the rendered tree. This
+    /// pins the consequence, not just the counter — the runaway subprocess vanishes from the
+    /// one screen built to find it.
+    #[test]
+    fn dropping_an_intermediate_row_orphans_its_subtree_which_is_why_the_count_must_surface() {
+        let complete = format!(
+            "{}\n{}\n{}\n",
+            ps_row(100, 1, "/usr/bin/server"),
+            ps_row(200, 100, "/usr/bin/agent"),
+            ps_row(300, 200, "/usr/bin/runaway"),
+        );
+        let full = parse_ps_output(&complete);
+        assert_eq!(full.unparsed, 0);
+        assert_eq!(
+            descendants(&full.procs, 100).len(),
+            3,
+            "PRECONDITION: the whole tree is visible when every row parses"
+        );
+
+        let partial = format!(
+            "{}\n{}\n{}\n",
+            ps_row(100, 1, "/usr/bin/server"),
+            "   200    100    200 S     n/a  10240    01:23 /usr/bin/agent",
+            ps_row(300, 200, "/usr/bin/runaway"),
+        );
+        let read = parse_ps_output(&partial);
+        assert_eq!(read.unparsed, 1);
+        let tree = descendants(&read.procs, 100);
+        assert_eq!(
+            tree.len(),
+            1,
+            "ONE unparsed row hid TWO processes — the agent and the runaway under it: {:?}",
+            tree.iter().map(|(p, _, _)| p.pid).collect::<Vec<_>>()
+        );
+        assert!(
+            read.partial_error().is_some(),
+            "which is exactly why the tree may not be rendered as complete"
+        );
+    }
+
     /// The property the ring could not have: history OUTLIVES the process that
     /// recorded it. This is the whole finding — the panel used to be empty
     /// after a restart, which reads as "nothing happened".
@@ -767,7 +930,7 @@ fn empty_aggregate() -> Value {
 /// pending a per-source sampler.
 pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let read = match ps_all().await {
         Ok(v) => v,
         Err(e) => {
             return json!({
@@ -797,6 +960,13 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
             });
         }
     };
+    // A partial read degrades the health block instead of being invisible (#294). The
+    // contract already has the field for it — `inaccessibleProcessCount` — and it was
+    // hard-coded to 0 on every path, so a number that exists precisely to say "the tree you
+    // are looking at is not everything" always said "it is".
+    let partial = read.partial_error();
+    let inaccessible = read.unparsed as i64;
+    let all = read.procs;
     let rows = descendants(&all, root);
     let mut total_cpu = 0.0;
     let mut total_rss: i64 = 0;
@@ -852,15 +1022,25 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
         "speedLimitPercent": none(),
         "attribution": { "readAt": iso(now_ms), "entries": [] },
         "health": {
-            "native": { "status": "healthy", "lastSampleAt": some(json!(iso(now_ms))), "lastError": none() },
+            "native": {
+                "status": if partial.is_some() { "degraded" } else { "healthy" },
+                "lastSampleAt": some(json!(iso(now_ms))),
+                "lastError": match &partial {
+                    Some(e) => some(json!(e)),
+                    None => none(),
+                },
+            },
             "desktop": { "status": "unavailable", "lastSampleAt": none(), "lastError": none() },
             "sidecarVersion": none(),
             "sidecarPid": none(),
             "restartCount": 0,
             "collectionDurationMicros": 0,
-            "scannedProcessCount": rows.len() as i64,
+            // scanned counts what `ps` PRINTED, retained what survived parsing — the two
+            // differing is the signal, and they were previously the same number by
+            // construction.
+            "scannedProcessCount": rows.len() as i64 + inaccessible,
             "retainedProcessCount": rows.len() as i64,
-            "inaccessibleProcessCount": 0,
+            "inaccessibleProcessCount": inaccessible,
         },
     })
 }

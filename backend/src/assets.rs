@@ -48,16 +48,39 @@ type Hmac256 = SimpleHmac<Sha256>;
 pub async fn signing_key(store: &OrchStore) -> Result<Vec<u8>, String> {
     // A store that cannot be read must not mint a NEW signing key: that would
     // silently invalidate every URL a client is holding.
-    if let Some(hex) = store.kv(SIGNING_KEY).await? {
-        if let Some(bytes) = from_hex(&hex) {
-            return Ok(bytes);
+    //
+    // ABSENT and MALFORMED-PRESENT ARE DIFFERENT (#356). The `?` above already handles a
+    // store that cannot be READ. What fell through was a row that reads fine and does not
+    // DECODE — an odd-length value, a non-hex character, a truncated write. It skipped both
+    // `if let`s, minted a fresh key, and `put_kv` overwrote the original.
+    //
+    // That is the outcome this comment exists to forbid, arrived at from the side: every
+    // outstanding signed URL stops redeeming at once, with no error naming the cause, so the
+    // operator sees broken images rather than "the signing key was replaced". And it adds a
+    // worse one — before the call the old key was corrupt-but-present and possibly
+    // recoverable (a partial write may be repairable, a hand-edit reversible); after it, it
+    // is gone under 32 fresh random bytes.
+    //
+    // So minting happens ONLY for a genuinely absent row, which is the one state where it is
+    // correct, and the `Some`/`None` binding already distinguishes it.
+    match store.kv(SIGNING_KEY).await? {
+        Some(hex) => from_hex(&hex).ok_or_else(|| {
+            format!(
+                "{SIGNING_KEY} is present but is not valid hex ({} byte(s)). REFUSING to mint a \
+                 replacement: minting would silently invalidate every outstanding asset URL and \
+                 would overwrite this row, destroying a secret that may still be recoverable. \
+                 Repair the row, or delete it deliberately to accept re-minting.",
+                hex.len()
+            )
+        }),
+        None => {
+            let mut key = [0u8; 32];
+            getrandom(&mut key)?;
+            let hex = to_hex(&key);
+            store.put_kv(SIGNING_KEY, &hex).await?;
+            Ok(key.to_vec())
         }
     }
-    let mut key = [0u8; 32];
-    getrandom(&mut key)?;
-    let hex = to_hex(&key);
-    store.put_kv(SIGNING_KEY, &hex).await?;
-    Ok(key.to_vec())
 }
 
 fn getrandom(buf: &mut [u8]) -> Result<(), String> {
@@ -71,13 +94,31 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Decode hex, over BYTES rather than over a `str` (#356).
+///
+/// `&hex[i..i + 2]` slices a `str` by byte index while the even-length guard also counts
+/// bytes, so a value like "€x" — 4 bytes, passes the guard — panicked with "byte index 2 is
+/// not a char boundary" instead of returning `None`. A durable row is foreign input; it must
+/// not be able to panic the reader.
+///
+/// Deliberately NOT more permissive: no trimming, no skipping bad pairs, no padding an odd
+/// length. A half-recovered signing key verifies nothing consistently and turns a clean
+/// break into intermittent signature mismatches, which is strictly harder to diagnose.
 fn from_hex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 || hex.is_empty() {
+    let b = hex.as_bytes();
+    if b.is_empty() || b.len() % 2 != 0 {
         return None;
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    b.chunks_exact(2)
+        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
         .collect()
 }
 
