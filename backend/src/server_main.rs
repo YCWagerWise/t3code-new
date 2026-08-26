@@ -766,14 +766,14 @@ fn now_iso() -> String {
 
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
-async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
+async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(), String> {
     let thread_id = command
         .get("threadId")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
     if thread_id.is_empty() {
-        return;
+        return Err("thread.turn.start has no threadId; refusing to announce an anonymous thread".into());
     }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
@@ -821,13 +821,14 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
-                    return;
+                    return Err(
+                        "project store has no seed project; refusing to invent a thread project id"
+                            .into(),
+                    );
                 }
             },
             Err(e) => {
-                tracing::error!(%e, "ensure_thread_on_shell: project store unreadable");
-                return;
+                return Err(format!("project store unreadable while bootstrapping thread: {e}"));
             }
         },
     };
@@ -901,9 +902,10 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // process-local rollback to do — the store IS the state.
     if let Err(e) = state.rt.save_thread(&thread).await {
         tracing::error!(%e, %thread_id, "persist thread failed — not announcing on shell");
-        return;
+        return Err(format!("thread store rejected bootstrap for {thread_id}: {e}"));
     }
     upsert_thread_on_shell(state, thread).await;
+    Ok(())
 }
 
 /// Refresh the shell projection for one thread and announce it to every shell
@@ -4379,13 +4381,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // So: accepted-ack for the async lane, applied-ack for the rest.
             let async_lane =
                 command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            if async_lane {
-                exit_success(tx, &id, json!({ "sequence": seq }));
-            }
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
                     if let Some(model) = model {
-                        ensure_thread_on_shell(&state, &command).await;
+                        if let Err(e) = ensure_thread_on_shell(&state, &command).await {
+                            exit_failure(tx, &id, &format!("cannot bootstrap thread: {e}"));
+                            return;
+                        }
+                        exit_success(tx, &id, json!({ "sequence": seq }));
                         run_turn(command, model, state.clone());
                     }
                 }
