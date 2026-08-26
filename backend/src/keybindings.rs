@@ -36,6 +36,19 @@ const MAX_KEYBINDINGS_COUNT: usize = 256;
 /// string, so a deeply nested `when` cannot blow the stack.
 const MAX_WHEN_EXPRESSION_DEPTH: usize = 64;
 
+/// Name a JSON value's type for an error message, so "must be a string" says
+/// what it actually got instead of making the user guess.
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// One user-authored rule, pre-compilation. `when` absent = always active.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
@@ -45,11 +58,32 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn from_wire(v: &Value) -> Option<Self> {
-        let key = v.get("key")?.as_str()?.trim().to_string();
-        let command = v.get("command")?.as_str()?.trim().to_string();
-        if key.is_empty() || command.is_empty() {
-            return None;
+    /// Decode one stored rule, or say why it could not be decoded.
+    ///
+    /// The reason is the whole point. This used to return `Option`, and
+    /// `load_custom` collected it with `filter_map`, so a rule the user had
+    /// authored simply stopped existing on the next load with nothing anywhere
+    /// saying so — the settings page rendered the remaining bindings and looked
+    /// correct. An absent rule is a lie the caller cannot detect, which is why
+    /// the message travels back out to the UI as an issue.
+    fn from_wire(v: &Value) -> Result<Self, String> {
+        let field = |name: &str| -> Result<String, String> {
+            match v.get(name) {
+                None => Err(format!("missing `{name}`")),
+                Some(Value::String(raw)) => Ok(raw.trim().to_string()),
+                Some(other) => Err(format!(
+                    "`{name}` must be a string, got {}",
+                    kind_of(other)
+                )),
+            }
+        };
+        let key = field("key")?;
+        let command = field("command")?;
+        if key.is_empty() {
+            return Err("`key` is empty".into());
+        }
+        if command.is_empty() {
+            return Err("`command` is empty".into());
         }
         // `when` is optional; an explicit null is the same as absent. An empty
         // string is NOT a valid `when` (the contract requires min length 1), so
@@ -61,7 +95,7 @@ impl Rule {
             .map(str::trim)
             .filter(|w| !w.is_empty())
             .map(str::to_string);
-        Some(Rule { key, command, when })
+        Ok(Rule { key, command, when })
     }
 
     fn to_wire(&self) -> Value {
@@ -417,22 +451,106 @@ fn same_rule(a: &Rule, b: &Rule) -> bool {
     a.command == b.command && a.key == b.key && a.when == b.when
 }
 
-/// Load the user's custom rules.
+/// What a load produced: the rules that decoded, AND what did not.
 ///
-/// A store that cannot be READ is an error: serving defaults there would tell
-/// the user their bindings are gone. A stored blob that no longer DECODES is
-/// also an error, and both reach the settings page as a message rather than as
-/// a silently empty custom set.
-pub async fn load_custom(store: &OrchStore) -> Result<Vec<Rule>, String> {
-    let Some(raw) = store.kv(KEYBINDINGS_KEY).await? else {
-        return Ok(Vec::new());
+/// Two fields rather than one because they answer different questions, and
+/// collapsing them is the defect. `rules` is what the keyboard should do;
+/// `issues` is what the user has to be TOLD. A load that returns only `rules`
+/// forces every caller to present a partial set as if it were the whole set.
+#[derive(Debug, Default, Clone)]
+pub struct Loaded {
+    pub rules: Vec<Rule>,
+    /// `ServerConfigIssue` wire values — `keybindings.malformed-config` or
+    /// `keybindings.invalid-entry`. Shapes come from
+    /// `packages/contracts/src/server.ts`; the settings toast picks them up by
+    /// the `keybindings.` kind prefix.
+    pub issues: Vec<Value>,
+}
+
+fn malformed_config_issue(detail: impl std::fmt::Display) -> Value {
+    json!({ "kind": "keybindings.malformed-config", "message": issue_message(detail) })
+}
+
+fn invalid_entry_issue(index: usize, detail: impl std::fmt::Display) -> Value {
+    json!({
+        "kind": "keybindings.invalid-entry",
+        "index": index,
+        "message": issue_message(detail),
+    })
+}
+
+/// The contract types `message` as a trimmed NON-EMPTY string, so an empty
+/// detail would make the issue itself undecodable by the client — the failure
+/// would then be invisible for the second time, which is the whole bug.
+fn issue_message(detail: impl std::fmt::Display) -> String {
+    let text = detail.to_string();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "Invalid keybindings configuration.".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Load the user's custom rules, and everything wrong with them.
+///
+/// Only a genuinely ABSENT key means "this user has no custom bindings". Every
+/// other outcome is reported:
+///
+/// * The store cannot be read — `Err`. There is no honest answer here: serving
+///   defaults would tell the user their bindings are gone, and reporting an
+///   empty custom set would be the same lie with extra steps.
+/// * The blob does not parse, or is not an array — no rules, plus a
+///   `keybindings.malformed-config` issue. Deliberately NOT an `Err`: failing
+///   the whole `server.getConfig` over this blanks the settings page, which is
+///   the one screen that could show the user what went wrong. This matches
+///   `apps/server/src/keybindings.ts`, which the frontend was written against.
+/// * A single rule does not decode — that rule is skipped, and a
+///   `keybindings.invalid-entry` issue naming its INDEX and the reason goes out
+///   with it. The index is what lets the settings page point at the offending
+///   entry instead of saying "something is wrong".
+pub async fn load_custom(store: &OrchStore) -> Result<Loaded, String> {
+    match store.kv(KEYBINDINGS_KEY).await? {
+        // The ONLY silent empty. Nobody has ever written bindings here.
+        None => Ok(Loaded::default()),
+        Some(raw) => Ok(decode_blob(&raw)),
+    }
+}
+
+/// The decode half of [`load_custom`], with the store read lifted out.
+///
+/// Split so the corruption behaviour is testable without standing up a durable
+/// store — the reason the old corrupt-blob test asserted on `default_resolved()`
+/// instead of on the loader is that the loader could not be called at all.
+pub fn decode_blob(raw: &str) -> Loaded {
+    let parsed = match serde_json::from_str::<Value>(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return Loaded {
+                rules: Vec::new(),
+                issues: vec![malformed_config_issue(format!(
+                    "{KEYBINDINGS_KEY} is malformed: {e}"
+                ))],
+            }
+        }
     };
-    let Value::Array(items) = serde_json::from_str::<Value>(&raw)
-        .map_err(|e| format!("{KEYBINDINGS_KEY} is malformed: {e}"))?
-    else {
-        return Err(format!("{KEYBINDINGS_KEY} is malformed: expected an array"));
+    let Value::Array(items) = parsed else {
+        return Loaded {
+            issues: vec![malformed_config_issue(format!(
+                "{KEYBINDINGS_KEY} is malformed: expected an array, got {}",
+                kind_of(&parsed)
+            ))],
+            rules: Vec::new(),
+        };
     };
-    Ok(items.iter().filter_map(Rule::from_wire).collect())
+    let mut loaded = Loaded::default();
+    for (index, item) in items.iter().enumerate() {
+        match Rule::from_wire(item) {
+            Ok(rule) => loaded.rules.push(rule),
+            Err(why) => loaded.issues.push(invalid_entry_issue(index, why)),
+        }
+    }
+    loaded
 }
 
 pub async fn save_custom(store: &OrchStore, rules: &[Rule]) -> Result<(), String> {
@@ -448,7 +566,9 @@ pub async fn save_custom(store: &OrchStore, rules: &[Rule]) -> Result<(), String
 /// rule are filtered out before appending, so re-saving an unchanged rule is
 /// idempotent instead of accumulating duplicates.
 pub fn upsert(custom: &[Rule], input: &Value) -> Result<Vec<Rule>, String> {
-    let rule = Rule::from_wire(input).ok_or("keybinding requires key and command")?;
+    // The decoder's own reason, not a generic one: the settings page shows this
+    // string straight back to the user who just typed the rule.
+    let rule = Rule::from_wire(input).map_err(|why| format!("invalid keybinding: {why}"))?;
     // Refuse a rule that cannot compile INSTEAD of storing it: a stored rule
     // that never compiles is invisible in the resolved set, so the settings page
     // would show the save succeeding and the shortcut simply never working.
@@ -462,7 +582,17 @@ pub fn upsert(custom: &[Rule], input: &Value) -> Result<Vec<Rule>, String> {
                 .unwrap_or_default()
         ));
     }
-    let replace = input.get("replace").and_then(Rule::from_wire);
+    // `replace` is OPTIONAL — absent means "this is a new binding". But a
+    // present-and-undecodable `replace` is the same defect one scope smaller:
+    // `and_then` swallowed it, so the rename the user asked for silently became
+    // an add and their old binding stayed behind. Absent is None; present and
+    // broken is an error.
+    let replace = match input.get("replace") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            Rule::from_wire(v).map_err(|why| format!("invalid `replace` keybinding: {why}"))?,
+        ),
+    };
     let mut next: Vec<Rule> = custom
         .iter()
         .filter(|e| {
@@ -481,7 +611,7 @@ pub fn upsert(custom: &[Rule], input: &Value) -> Result<Vec<Rule>, String> {
 /// Drop a rule from the custom set. Removing a rule that is not there is a
 /// no-op, not an error — the resulting state is what the caller asked for.
 pub fn remove(custom: &[Rule], input: &Value) -> Result<Vec<Rule>, String> {
-    let target = Rule::from_wire(input).ok_or("keybinding requires key and command")?;
+    let target = Rule::from_wire(input).map_err(|why| format!("invalid keybinding: {why}"))?;
     Ok(custom.iter().filter(|e| !same_rule(e, &target)).cloned().collect())
 }
 
@@ -493,8 +623,8 @@ pub fn resolved(custom: &[Rule]) -> Vec<Value> {
 
 /// `{keybindings, issues}` — the payload shared by both mutation results and the
 /// `keybindingsUpdated` stream event.
-pub fn result_wire(custom: &[Rule]) -> Value {
-    json!({ "keybindings": resolved(custom), "issues": [] })
+pub fn result_wire(custom: &[Rule], issues: &[Value]) -> Value {
+    json!({ "keybindings": resolved(custom), "issues": issues })
 }
 
 /// Where the rules live, for `server.getConfig`'s `keybindingsConfigPath`.
@@ -527,15 +657,25 @@ pub fn input_of(payload: &Value) -> Value {
 }
 
 /// Merge the resolved keybindings into a `server.getConfig` body.
-pub fn apply_to_config(config: &mut Map<String, Value>, custom: &[Rule]) {
+/// `issues` is a PARAMETER, not a constant. It was `json!([])` here, which meant
+/// the config body structurally could not report a keybinding problem no matter
+/// what the loader found — the field existed, the client read it, and it was
+/// always empty.
+pub fn apply_to_config(config: &mut Map<String, Value>, custom: &[Rule], issues: &[Value]) {
     config.insert("keybindings".into(), Value::Array(resolved(custom)));
     config.insert("keybindingsConfigPath".into(), Value::String(config_path()));
-    config.insert("issues".into(), json!([]));
+    config.insert("issues".into(), Value::Array(issues.to_vec()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loader, minus the store read — same code path `load_custom` takes
+    /// once it has the bytes.
+    fn load_blob(raw: &str) -> Loaded {
+        decode_blob(raw)
+    }
 
     fn rule(key: &str, command: &str, when: Option<&str>) -> Rule {
         Rule { key: key.into(), command: command.into(), when: when.map(str::to_string) }
@@ -750,13 +890,106 @@ mod tests {
         assert_eq!(last.when.as_deref(), Some(format!("ctx{}", MAX_KEYBINDINGS_COUNT + 9).as_str()));
     }
 
-    /// A corrupt stored blob must not take out the settings page: fall back to
-    /// the working default keyboard.
+    /// REPLACES `a_corrupt_stored_blob_falls_back_to_defaults`, which was wrong
+    /// twice over and is deliberately not kept.
+    ///
+    /// Its name asserted the defect as the contract — falling back to defaults
+    /// is exactly what #204 filed, because the user cannot tell it apart from
+    /// having authored nothing. And its body never called `load_custom` at all;
+    /// it asserted `!default_resolved().is_empty()`, which is true no matter
+    /// what the loader does, so it could not have failed if the loader had
+    /// deleted every rule. A test that cannot fail is not coverage.
+    ///
+    /// What is actually required: a corrupt blob still must not blank the
+    /// settings page, so the defaults still ship — but it now arrives WITH a
+    /// `keybindings.malformed-config` issue saying so.
     #[test]
-    fn a_corrupt_stored_blob_falls_back_to_defaults() {
-        // `load_custom` decodes exactly this shape; the non-array/garbage paths
-        // return an empty custom set, which `resolved` turns into the defaults.
-        assert!(!default_resolved().is_empty());
+    fn a_corrupt_stored_blob_ships_defaults_and_says_why() {
+        for (blob, why) in [
+            ("{not json", "unparseable"),
+            ("{\"key\": \"mod+b\"}", "an object, not an array"),
+            ("\"just a string\"", "a string, not an array"),
+            ("42", "a number, not an array"),
+        ] {
+            let loaded = load_blob(blob);
+            assert!(loaded.rules.is_empty(), "{why}: no rules can be trusted from this");
+            assert_eq!(loaded.issues.len(), 1, "{why}: exactly one config-level issue");
+            assert_eq!(loaded.issues[0]["kind"], "keybindings.malformed-config", "{why}");
+            // The contract types `message` as a trimmed NON-EMPTY string; an
+            // empty one would make the issue itself undecodable client-side.
+            let msg = loaded.issues[0]["message"].as_str().expect("message is a string");
+            assert!(!msg.trim().is_empty(), "{why}: message must be non-empty");
+
+            // Still a working keyboard — the fallback half of the old test was
+            // the half that was right.
+            let mut cfg: Map<String, Value> = Map::new();
+            apply_to_config(&mut cfg, &loaded.rules, &loaded.issues);
+            assert!(cfg["keybindings"].as_array().unwrap().len() > 30, "{why}");
+            assert_eq!(cfg["issues"].as_array().unwrap().len(), 1, "{why}: and it is REPORTED");
+        }
+    }
+
+    /// The live half of #204. One unusable entry must not silently evaporate:
+    /// the `filter_map` meant a rule the user authored stopped existing on the
+    /// next load, with the remaining bindings rendering perfectly so nothing
+    /// looked wrong.
+    #[test]
+    fn one_bad_entry_is_dropped_with_an_issue_naming_its_index() {
+        let loaded = load_blob(
+            r#"[
+                {"key": "mod+b", "command": "sidebar.toggle"},
+                {"command": "no.key.at.all"},
+                {"key": "mod+k", "command": "palette.open"},
+                {"key": 7, "command": "wrong.type"},
+                {"key": "  ", "command": "blank.key"}
+            ]"#,
+        );
+
+        // The good rules survive — one bad entry does not cost the user their
+        // whole keyboard.
+        assert_eq!(loaded.rules.len(), 2, "got {:?}", loaded.rules);
+        assert_eq!(loaded.rules[0].command, "sidebar.toggle");
+        assert_eq!(loaded.rules[1].command, "palette.open");
+
+        // And every casualty is reported, at the index the settings page needs
+        // in order to point at the offending entry.
+        assert_eq!(loaded.issues.len(), 3, "got {:?}", loaded.issues);
+        let indices: Vec<i64> =
+            loaded.issues.iter().map(|i| i["index"].as_i64().expect("index")).collect();
+        assert_eq!(indices, vec![1, 3, 4]);
+        for issue in &loaded.issues {
+            assert_eq!(issue["kind"], "keybindings.invalid-entry");
+            assert!(!issue["message"].as_str().expect("message").trim().is_empty());
+        }
+        // The reason is specific enough to act on, not just "invalid".
+        assert!(loaded.issues[0]["message"].as_str().unwrap().contains("key"));
+        assert!(loaded.issues[1]["message"].as_str().unwrap().contains("string"));
+
+        // The config body carries all three out to the client.
+        let mut cfg: Map<String, Value> = Map::new();
+        apply_to_config(&mut cfg, &loaded.rules, &loaded.issues);
+        assert_eq!(cfg["issues"].as_array().unwrap().len(), 3);
+    }
+
+    /// The one case that legitimately means "this user has no custom bindings".
+    /// It has to stay distinguishable from all of the above, or the fix just
+    /// moves the lie somewhere else.
+    #[test]
+    fn a_genuinely_absent_key_is_the_only_silent_empty() {
+        let loaded = Loaded::default();
+        assert!(loaded.rules.is_empty());
+        assert!(loaded.issues.is_empty(), "absence is not an issue");
+
+        let mut cfg: Map<String, Value> = Map::new();
+        apply_to_config(&mut cfg, &loaded.rules, &loaded.issues);
+        assert!(cfg["issues"].as_array().unwrap().is_empty());
+        assert!(cfg["keybindings"].as_array().unwrap().len() > 30);
+
+        // An empty stored array is the same thing: the user removed every
+        // override. Not an error, not an issue.
+        let empty = load_blob("[]");
+        assert!(empty.rules.is_empty());
+        assert!(empty.issues.is_empty());
     }
 
     #[test]
@@ -775,7 +1008,7 @@ mod tests {
             json!({"keybindings": [], "keybindingsConfigPath": "/dev/null"}),
         )
         .unwrap();
-        apply_to_config(&mut cfg, &[]);
+        apply_to_config(&mut cfg, &[], &[]);
         assert_ne!(cfg["keybindingsConfigPath"], "/dev/null");
         assert!(cfg["keybindings"].as_array().unwrap().len() > 30);
     }

@@ -116,7 +116,23 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
 }
 
 /// Every process on the box, as `ps` sees it.
-pub async fn ps_all() -> Result<Vec<Proc>, String> {
+/// One `ps` read: the rows that parsed, and how many did not.
+///
+/// The second number is the point. A FAILED read was already honest — the
+/// callers below return an explicit error rather than an empty list, and say
+/// why. A PARTIAL read was not: `filter_map` dropped unparseable rows and the
+/// result rendered as a complete process tree with `error: null`. That
+/// understates total RSS and CPU, and — worse — a dropped row orphans its whole
+/// subtree out of `descendants()`, because the tree is rebuilt by matching ppid
+/// to pid and a missing link breaks the chain. The user reads a tree that is
+/// missing processes and has nothing telling them to doubt it.
+pub struct PsRead {
+    pub procs: Vec<Proc>,
+    /// Non-empty `ps` lines that did not parse. Zero on a clean read.
+    pub unparsed: usize,
+}
+
+pub async fn ps_all() -> Result<PsRead, String> {
     let out = tokio::process::Command::new("ps")
         .args(["-Ao", "pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args="])
         .output()
@@ -125,10 +141,40 @@ pub async fn ps_all() -> Result<Vec<Proc>, String> {
     if !out.status.success() {
         return Err(format!("ps exited {}", out.status));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect())
+    Ok(tally_ps_output(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Split `ps` output into the rows that parsed and a count of those that did
+/// not.
+///
+/// A separate function so the partial-read behaviour is REACHABLE from a test.
+/// Inline in `ps_all` it is not: `ps` on a healthy box emits nothing this parser
+/// refuses, so a test that shells out can only ever observe the clean case — and
+/// a regression written against a hand-rolled copy of this loop passes whether
+/// or not `ps_all` actually counts anything. (Measured: the first version of the
+/// #376 test did exactly that and passed against the defect.)
+pub fn tally_ps_output(text: &str) -> PsRead {
+    let mut procs = Vec::new();
+    let mut unparsed = 0usize;
+    for line in text.lines() {
+        // A blank line is not a dropped process; only count real content.
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_ps_line(line) {
+            Some(p) => procs.push(p),
+            None => unparsed += 1,
+        }
+    }
+    PsRead { procs, unparsed }
+}
+
+/// The sentence a partial read puts in front of the user.
+fn partial_read_message(unparsed: usize) -> String {
+    format!(
+        "{unparsed} process row(s) from `ps` could not be parsed and are missing from this \
+         tree; totals are understated and any child of a dropped row is not shown"
+    )
 }
 
 /// The server process and everything under it, with each row's depth from the
@@ -183,7 +229,14 @@ fn iso(ms: i64) -> String {
 
 /// Take one sample of the server's process tree.
 pub async fn sample(root: i64) -> Result<Sample, String> {
-    let all = ps_all().await?;
+    // `sample` feeds the internal sampler, which has no field to carry a
+    // partial-read warning. A partial read there would silently understate the
+    // series, so it is refused outright rather than sampled.
+    let read = ps_all().await?;
+    if read.unparsed > 0 {
+        return Err(partial_read_message(read.unparsed));
+    }
+    let all = read.procs;
     let at_ms = chrono::Utc::now().timestamp_millis();
     let procs = descendants(&all, root)
         .into_iter()
@@ -195,8 +248,8 @@ pub async fn sample(root: i64) -> Result<Sample, String> {
 /// `ServerProcessDiagnosticsResult`.
 pub async fn process_diagnostics(root: i64) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
-        Ok(a) => a,
+    let (all, unparsed) = match ps_all().await {
+        Ok(r) => (r.procs, r.unparsed),
         // A failed read is reported AS a failed read. The alternative — an empty
         // process list — renders as "nothing is running", which is a lie the
         // user would act on.
@@ -241,7 +294,14 @@ pub async fn process_diagnostics(root: i64) -> Value {
         "totalRssBytes": total_rss.max(0),
         "totalCpuPercent": total_cpu,
         "processes": processes,
-        "error": none(),
+        // A PARTIAL read is reported too, not just a failed one. Leaving this
+        // `none()` while rows were silently dropped is what made an incomplete
+        // tree indistinguishable from a complete one.
+        "error": if unparsed > 0 {
+            some(json!({"message": partial_read_message(unparsed)}))
+        } else {
+            none()
+        },
     })
 }
 
@@ -490,6 +550,70 @@ mod tests {
         assert_eq!(parse_etime("05:10"), Some(310));
         assert_eq!(parse_etime("01:05:10"), Some(3910));
         assert_eq!(parse_etime("2-01:05:10"), Some(2 * 86_400 + 3910));
+    }
+
+    /// #376/#294. A FAILED `ps` read was always honest — the callers return an
+    /// explicit error rather than an empty list. A PARTIAL read was not: the old
+    /// `filter_map(parse_ps_line)` dropped unparseable rows and the result
+    /// rendered as a complete tree with `error: null`.
+    ///
+    /// Two things go wrong, and the second is the one that misleads: the totals
+    /// are understated, and a dropped row ORPHANS ITS WHOLE SUBTREE, because
+    /// `descendants` rebuilds the tree by matching ppid to pid and a missing
+    /// link breaks the chain. So the user sees fewer processes than exist with
+    /// nothing telling them to doubt the number.
+    #[test]
+    fn a_partial_ps_read_is_counted_rather_than_silently_dropped() {
+        // Rows this parser genuinely refuses — chosen by reading what
+        // `parse_ps_line` actually rejects (missing fields, or a pid that is not
+        // a positive integer) rather than by assuming. A garbage ELAPSED does
+        // NOT reject, so using one here would have tested nothing; it took a
+        // failing run to notice.
+        let lines = [
+            "  100     1   100 Ss    1.0   1024 01:00 /sbin/launchd",
+            "  200   100   100 S     2.0   2048 00:30 node server.js",
+            // truncated mid-row: `ps` output cut by a pipe or a short read.
+            "  300   200",
+            "  400   200   100 S     4.0   8192 00:10 node other.js",
+            // pid 500's parent is 300, which did not parse.
+            "  500   300   100 S     5.0   1024 00:05 node grandchild.js",
+        ];
+        // Through the REAL code path `ps_all` uses, not a copy of its loop.
+        let PsRead { procs, unparsed } = tally_ps_output(&lines.join("\n"));
+        assert_eq!(procs.len(), 4, "the well-formed rows still parse");
+        assert_eq!(unparsed, 1, "and the unusable one is COUNTED, not discarded");
+
+        // THE ORPHANING, demonstrated. pid 300 did not parse, so pid 500 —
+        // which parsed perfectly — is unreachable from the root, because
+        // `descendants` walks ppid->pid and the chain is broken. A silent drop
+        // therefore costs more processes than it dropped, which is why an
+        // understated count with `error: null` is the wrong shape.
+        let tree = descendants(&procs, 100);
+        let pids: Vec<i64> = tree.iter().map(|(p, _, _)| p.pid).collect();
+        assert!(pids.contains(&200) && pids.contains(&400), "{pids:?}");
+        assert!(!pids.contains(&300), "the unparsed row is absent: {pids:?}");
+        assert!(
+            !pids.contains(&500),
+            "and its child is orphaned too, though its own row was fine: {pids:?}"
+        );
+
+        // And the message a user actually reads says what happened to it.
+        let msg = partial_read_message(unparsed);
+        assert!(msg.contains("1 process row(s)"), "{msg}");
+        assert!(msg.contains("understated"), "{msg}");
+    }
+
+    /// A CLEAN read must not be flagged. Without this the fix could "pass" by
+    /// marking every read degraded, which is the same lie pointed the other way.
+    #[test]
+    fn a_clean_ps_read_reports_nothing_wrong() {
+        let lines = [
+            "  100     1   100 Ss    1.0   1024 01:00 /sbin/launchd",
+            "  200   100   100 S     2.0   2048 00:30 node server.js",
+        ];
+        let read = tally_ps_output(&lines.join("\n"));
+        assert_eq!(read.unparsed, 0, "these rows are all well-formed");
+        assert_eq!(read.procs.len(), 2);
     }
 
     /// An unparseable elapsed must not become 0 — start time is `now - elapsed`,
@@ -767,8 +891,8 @@ fn empty_aggregate() -> Value {
 /// pending a per-source sampler.
 pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
-        Ok(v) => v,
+    let (all, unparsed) = match ps_all().await {
+        Ok(r) => (r.procs, r.unparsed),
         Err(e) => {
             return json!({
                 "readAt": iso(now_ms),
@@ -852,15 +976,29 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
         "speedLimitPercent": none(),
         "attribution": { "readAt": iso(now_ms), "entries": [] },
         "health": {
-            "native": { "status": "healthy", "lastSampleAt": some(json!(iso(now_ms))), "lastError": none() },
+            // `degraded`, not `healthy`, when `ps` gave us rows we could not
+            // parse: the numbers below are real but incomplete, and the
+            // contract has a state for exactly that.
+            "native": {
+                "status": if unparsed > 0 { "degraded" } else { "healthy" },
+                "lastSampleAt": some(json!(iso(now_ms))),
+                "lastError": if unparsed > 0 {
+                    some(json!(partial_read_message(unparsed)))
+                } else {
+                    none()
+                },
+            },
             "desktop": { "status": "unavailable", "lastSampleAt": none(), "lastError": none() },
             "sidecarVersion": none(),
             "sidecarPid": none(),
             "restartCount": 0,
             "collectionDurationMicros": 0,
-            "scannedProcessCount": rows.len() as i64,
+            // scanned counts every row `ps` produced, including the ones that
+            // did not parse — otherwise scanned == retained always, and the
+            // field can never show a shortfall.
+            "scannedProcessCount": (rows.len() + unparsed) as i64,
             "retainedProcessCount": rows.len() as i64,
-            "inaccessibleProcessCount": 0,
+            "inaccessibleProcessCount": unparsed as i64,
         },
     })
 }
