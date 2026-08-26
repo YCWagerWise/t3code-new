@@ -1259,10 +1259,45 @@ fn spawn_vcs_watcher(state: AppState) {
                     tokio::spawn(watch_one_tree(state.clone(), cwd, seen, None)),
                 );
             }
-            // Wait for the subscriber set to move. This is the only thing this
-            // task does now — the per-tree tasks own the actual change edges.
-            if subs.changed().await.is_err() {
-                return;
+            // Wait for the subscriber set to move, OR for the sweep tick.
+            //
+            // #247: the event-driven wake alone cannot reclaim a claim whose
+            // holder died, because a dead process never sends the event. A
+            // SIGKILLed backend leaves its `watch_claim` row behind forever, so
+            // `watchers()` never reaches 0, `watch_release` never runs, and the
+            // tree is watched on behalf of a subscriber that will never read
+            // it. `watch_unclaim_retrying` cannot help — it is on the close
+            // path, and a crash does not take it.
+            //
+            // The sweep is the other half: live subscribers renew their lease
+            // (see the renewal task in subscribeVcsStatus), so anything past
+            // the stale window has no holder left.
+            let swept = tokio::select! {
+                r = subs.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    false
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(
+                    (agent_sdk_shell::thread::WATCH_LEASE_STALE_MS as u64) / 2,
+                )) => true,
+            };
+            if swept {
+                match state
+                    .rt
+                    .reap_orphan_claims("vcs", agent_sdk_shell::thread::WATCH_LEASE_STALE_MS)
+                    .await
+                {
+                    Ok(keys) if !keys.is_empty() => tracing::info!(
+                        reclaimed = keys.len(),
+                        "reclaimed vcs watches whose subscribers never came back: {keys:?}"
+                    ),
+                    Ok(_) => {}
+                    // A failed sweep is not a reason to stop watching anything
+                    // — same fail-closed direction as the registry read above.
+                    Err(e) => tracing::error!(%e, "vcs orphan-claim sweep failed"),
+                }
             }
         }
     });
@@ -3429,6 +3464,49 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                 return;
                             }
                         }
+                        // KEEP THE CLAIM ALIVE WHILE THIS SOCKET IS (#247).
+                        //
+                        // `watch_claim` stamps `claimed_ms` once, so age alone
+                        // cannot distinguish a crashed subscriber from a healthy
+                        // long-lived one — a VCS panel held open for an hour is
+                        // ordinary. Renewing turns the claim into a LEASE, which
+                        // is what lets `reap_orphan_claims` below reclaim the
+                        // watches of processes that were SIGKILLed, lost their
+                        // host, or were OOM'd and never ran the polite close
+                        // path at all.
+                        //
+                        // This task is aborted by the cleanup closure, so the
+                        // renewal cannot outlive the subscription it speaks for
+                        // — which is the whole property the lease depends on.
+                        let renew = {
+                            let state_renew = state.clone();
+                            let cwd_renew = cwd.clone();
+                            let sub_renew = sub_id.clone();
+                            tokio::spawn(async move {
+                                let period = std::time::Duration::from_millis(
+                                    (agent_sdk_shell::thread::WATCH_LEASE_STALE_MS as u64) / 3,
+                                );
+                                loop {
+                                    tokio::time::sleep(period).await;
+                                    match state_renew
+                                        .rt
+                                        .watch_renew("vcs", &cwd_renew, &sub_renew)
+                                        .await
+                                    {
+                                        // The row is gone: a sweep already
+                                        // reclaimed us. Stop renewing rather
+                                        // than silently re-creating a claim the
+                                        // supervisor has stopped watching for.
+                                        Ok(false) => return,
+                                        Ok(true) => {}
+                                        Err(e) => tracing::warn!(
+                                            %e, cwd = %cwd_renew,
+                                            "vcs watch lease renewal failed; the claim may be reaped"
+                                        ),
+                                    }
+                                }
+                            })
+                        };
                         let state_close = state.clone();
                         let cwd_close = cwd.clone();
                         spawn_thread_tail_with_cleanup(
@@ -3437,6 +3515,10 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             id.clone(),
                             format!("vcs:{cwd}"),
                             async move {
+                                // Stop renewing BEFORE unclaiming, or the two
+                                // race and a renewal can resurrect the row this
+                                // close is trying to remove.
+                                renew.abort();
                                 // `watch_unclaim` drops THIS subscriber's claim
                                 // and reports whether it was the last one
                                 // anywhere; it releases the mark itself in that
