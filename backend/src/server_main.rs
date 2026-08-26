@@ -1774,37 +1774,30 @@ async fn stop_thread_checked(
     thread_id: &str,
     kind: &str,
 ) -> Result<Vec<String>, String> {
-    // A stop has TWO legs — hearth's foreground interrupt and the SDK's durable
-    // cancel — and they fail independently. Short-circuiting on the first one
-    // let a dead PTY mask an unwritten durable cancel: the user saw "stop
-    // failed" for the shell while the turn kept running with nothing recorded.
-    // So attempt both, and report every leg that failed.
-    let shell = terminal::interrupt(&state.terminal)
-        .await
-        .map_err(|e| format!("terminal interrupt failed: {e}"));
-    let runtime = if kind == "thread.session.stop" {
+    // A stop has TWO legs — the SDK's durable cancel and hearth's foreground
+    // interrupt — and the ORDER between them is the contract (#267).
+    //
+    // DURABLE FIRST, AND NOTHING IRREVERSIBLE UNTIL IT LANDS. Ctrl-C into the
+    // shared PTY cannot be taken back: it kills whatever bash command is in the
+    // foreground, which may be nothing to do with this turn. Firing that before
+    // the cancel is recorded means a failed cancel leaves the user with a dead
+    // command AND a turn still running with nothing durable to show for it.
+    // So a failed cancel returns here, having touched no process.
+    let sessions = if kind == "thread.session.stop" {
         state.rt.stop(thread_id).await
     } else {
         state.rt.interrupt(thread_id).await
     }
-    .map_err(|e| format!("runtime cancel failed: {e}"));
+    .map_err(|e| format!("runtime cancel failed: {e}"))?;
 
-    let (shell_out, sessions) = match (shell, runtime) {
-        (Ok(out), Ok(sessions)) => (out, sessions),
-        (shell, runtime) => {
-            let mut legs = Vec::new();
-            if let Err(e) = shell {
-                legs.push(e);
-            }
-            if let Err(e) = runtime {
-                legs.push(e);
-            }
-            return Err(legs.join("; "));
-        }
-    };
-    if shell_out.starts_with("ERROR:") {
-        return Err(format!("terminal interrupt failed: {shell_out}"));
-    }
+    // Authority is recorded; now the side effect. A failure HERE is still
+    // reported rather than swallowed — that was #112's lesson and it stands: a
+    // dead PTY must not read as a clean stop. What changed is only that it can
+    // no longer mask, or precede, the durable leg.
+    let shell_out = interrupt_foreground_terminal(&state.terminal)
+        .await
+        .map_err(|e| format!("terminal interrupt failed: {e}"))?;
+    tracing::debug!(%thread_id, %kind, %shell_out, "foreground interrupt sent after durable cancel");
     Ok(sessions)
 }
 
@@ -4422,15 +4415,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             return;
                         }
                     };
-                    let shell_out = match interrupt_foreground_terminal(&state.terminal).await {
-                        Ok(out) => out,
-                        Err(e) => {
-                            tracing::error!(%thread_id, %kind, %e, "terminal interrupt failed");
-                            exit_failure(tx, &id, &format!("{kind} terminal interrupt failed: {e}"));
-                            return;
-                        }
-                    };
-                    tracing::info!(%thread_id, %kind, %shell_out, "stop dispatched");
+                    // #267: the foreground interrupt is NOT repeated here.
+                    // `stop_thread_checked` now owns both legs in the required
+                    // order, so a second `interrupt_foreground_terminal` sent a
+                    // second Ctrl-C to the shared PTY — one for the turn being
+                    // stopped and one for whatever had since reached the
+                    // foreground. Its failure is already reported through the
+                    // Err arm above.
                 }
                 // #65: the destructive revert the diff panel offers. Acking it
                 // and doing nothing was the worst available behaviour — the UI

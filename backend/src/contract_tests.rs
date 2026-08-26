@@ -3370,6 +3370,69 @@ async fn stop_command_fails_when_sdk_interrupt_state_is_unreadable() {
     );
 }
 
+/// #267: WHEN THE DURABLE CANCEL FAILS, NO CTRL-C IS SENT.
+///
+/// The ordering is the contract, not a style preference. `stop_thread_checked`
+/// used to interrupt the shared PTY FIRST and only then attempt the SDK's
+/// durable cancel. Ctrl-C into a shared PTY cannot be taken back — it kills
+/// whatever bash command happens to be in the foreground, which may have
+/// nothing to do with this turn. So a failed cancel left the user with a dead
+/// command AND a turn still running with nothing durable recorded.
+///
+/// The proof is a real `sleep` in the shared shell, faulted SDK state, and the
+/// assertion that the command RAN TO COMPLETION — the inverse of
+/// `stop_interrupts_the_hearth_foreground_and_cancels_the_turn`, which proves
+/// the same shell IS interrupted when the cancel succeeds. Both are needed:
+/// either alone is satisfiable by a stop that never interrupts anything.
+#[tokio::test]
+async fn a_failed_durable_cancel_sends_no_interrupt_to_the_shared_shell() {
+    let (state, dir) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-stop-no-ctrlc")).await.unwrap();
+
+    // A live shell with a real foreground command in it.
+    let runner = state.terminal.clone();
+    let running = tokio::spawn(async move { runner.run("sleep 3", false, Some(25), false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Now break ONLY the SDK's durable side.
+    drop_thread_session_table(&dir).await;
+
+    let started = std::time::Instant::now();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.turn.interrupt", "threadId": "t-stop-no-ctrlc",
+    }})).await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a failed durable cancel must fail the RPC: {exit}"
+    );
+
+    // THE POINT: the foreground command was never interrupted. It ran its full
+    // ~3s and reported a clean exit, because no Ctrl-C was ever sent.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), running)
+        .await
+        .expect("the foreground command finished on its own")
+        .expect("join");
+    assert!(
+        !outcome.interrupted,
+        "a Ctrl-C reached the shared PTY even though the durable cancel failed — \
+         that is the irreversible side effect #267 is about: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.exit_code, 0,
+        "the untouched command exits cleanly: {outcome:?}"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(2),
+        "it ran to completion rather than being cut short: {:?}",
+        started.elapsed()
+    );
+}
+
 /// #108: a stop command whose Hearth foreground interrupt cannot be delivered
 /// must fail the RPC before the generic synchronous-command Success ack.
 #[tokio::test]
