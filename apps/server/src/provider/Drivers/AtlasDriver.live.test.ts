@@ -19,7 +19,8 @@
  */
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { ThreadId } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
 
 import { makeAtlasDriver, probeAtlasHost } from "./AtlasDriver.ts";
 import {
@@ -54,6 +55,19 @@ const instance = (config: Record<string, unknown>) =>
       config: { baseUrl: BASE_URL, accessToken: TOKEN, ...config } as never,
     } as never),
   );
+
+/** Wait for a specific event to reach the lens, on real time. */
+const waitForEvent = async (
+  sink: ReadonlyArray<Record<string, unknown>>,
+  match: (event: Record<string, unknown>) => boolean,
+): Promise<Record<string, unknown>> => {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    const found = sink.find(match);
+    if (found !== undefined) return found;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("timed out waiting for the expected runtime event");
+};
 
 describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
   it("reports readiness from what the node actually said, in both directions", async () => {
@@ -256,6 +270,108 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
     await Effect.runPromise(restarted.adapter.stopSession(threadId));
     await Effect.runPromise(Fiber.interrupt(fiber2));
   });
+
+  /**
+   * The whole approval path, continuously, against a live node.
+   *
+   * Everything here is real except the decision to call a tool: the feed, the `await_approval`
+   * gate, the WebSocket, the `ToolGate` outcome. Only the tool call itself is scripted, via the
+   * node's `/_test/gate` fixture — because whether a model emits a tool call is its own
+   * stochastic choice and has nothing to do with the transport under test. A local 7B asked
+   * twice to call a tool answered in prose instead, and the models that would comply are
+   * exactly the paid ones this work may not spend.
+   */
+  it("runs the whole approval path: gate opens, T3 is asked, answers, and the gate releases", async () => {
+    const created = await instance({});
+    const adapter = created.adapter;
+    const threadId = ThreadId.make(`live-gate-${Date.now()}`);
+    const seen: Array<Record<string, unknown>> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => seen.push(event as unknown as Record<string, unknown>)),
+      ),
+    );
+
+    // 1. Readiness means ATTACHED. Without a console present the node denies the call outright
+    //    — verified against this same fixture: "and no console is attached to approve it".
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+
+    // 2. A real gate opens on the node and BLOCKS. Not awaited yet: it does not return until a
+    //    decision arrives, which is the point.
+    const gate = fetch(`${BASE_URL}/_test/gate`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        run_id: String(threadId),
+        call_id: "call-7",
+        tool: "mcp__triage__nodes",
+      }),
+    });
+
+    // 3. T3 is asked — the request reaches the lens through the feed it is already reading.
+    const opened = await waitForEvent(seen, (event) => event["type"] === "request.opened");
+    const requestId = String(opened["requestId"]);
+    // Atlas's own `{run_id}:{call_id}`, carried intact rather than re-minted by the lens.
+    expect(requestId).toEqual(`${String(threadId)}:call-7`);
+
+    // 4/5. The decision goes back over the console socket, and `respondToRequest` resolves only
+    //      once Atlas has durably recorded it.
+    await Effect.runPromise(
+      adapter.respondToRequest(threadId, requestId as never, "accept" as never),
+    );
+    const recorded = await readConsoleFrames(endpoint(), String(threadId));
+    expect(
+      recorded.some(
+        (frame) => frame.kind === "approve" && frame.payload["request_id"] === requestId,
+      ),
+    ).toBe(true);
+
+    // 6. The REAL gate releases on the strength of that frame.
+    const outcome = (await (await gate).json()) as { outcome: string; detail: unknown };
+    expect(outcome.outcome).toEqual("allow");
+
+    // 7. The resulting tool lifecycle reaches the lens and correlates: one item id, start to end.
+    const completed = await waitForEvent(seen, (event) => event["type"] === "item.completed");
+    const started = seen.find((event) => event["type"] === "item.started");
+    expect(started?.["itemId"]).toBeDefined();
+    expect(completed["itemId"]).toEqual(started?.["itemId"]);
+
+    // And every event the lens emitted survives T3's own decoder.
+    const decode = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+    for (const event of seen) expect(() => decode(event)).not.toThrow();
+
+    await Effect.runPromise(adapter.stopSession(threadId));
+    await Effect.runPromise(Fiber.interrupt(fiber));
+  }, 120_000);
+
+  it("refuses the call when the lens declines, rather than letting it run", async () => {
+    const created = await instance({});
+    const adapter = created.adapter;
+    const threadId = ThreadId.make(`live-deny-${Date.now()}`);
+    const seen: Array<Record<string, unknown>> = [];
+    const fiber = Effect.runFork(
+      Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => seen.push(event as unknown as Record<string, unknown>)),
+      ),
+    );
+    await Effect.runPromise(adapter.startSession({ threadId, runtimeMode: "local" } as never));
+    const gate = fetch(`${BASE_URL}/_test/gate`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: String(threadId), call_id: "call-9" }),
+    });
+    const opened = await waitForEvent(seen, (event) => event["type"] === "request.opened");
+    await Effect.runPromise(
+      adapter.respondToRequest(threadId, String(opened["requestId"]) as never, "decline" as never),
+    );
+    const outcome = (await (await gate).json()) as { outcome: string };
+    // A decline must stop the tool, not merely fail to start it by timing out.
+    expect(outcome.outcome).toEqual("deny");
+    // And no result frame was produced, so nothing ran.
+    expect(seen.some((event) => event["type"] === "item.completed")).toBe(false);
+    await Effect.runPromise(adapter.stopSession(threadId));
+    await Effect.runPromise(Fiber.interrupt(fiber));
+  }, 120_000);
 
   it("renders what a real model actually said, not just that a turn ended", async () => {
     const created = await instance({});
