@@ -2624,7 +2624,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "first", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .expect("first turn bootstrap persists");
     // The prompt itself is written by `run_turn_with_prompt_id`, not by
     // thread bootstrap, so a test that never runs a turn seeds it the way
     // the runtime would. What is under test here is the SWITCH, and the
@@ -2638,7 +2639,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "second", "messageId": "m2"},
         }),
     )
-    .await;
+    .await
+    .expect("model switch bootstrap persists");
     seed_prompt(&state, "t-switch", "m2", "second").await;
 
     // the DURABLE thread row carries the new selection
@@ -2896,6 +2898,61 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
     assert_eq!(
         exit["exit"]["_tag"], "Success",
         "a routable selection dispatches: {exit}"
+    );
+}
+
+/// #362: `thread.turn.start` is an async command, but its Success ack still
+/// means the turn was admitted. A first turn is not admitted until its bootstrap
+/// thread row is durable; otherwise reload loses the thread the client was told
+/// exists.
+#[tokio::test]
+async fn first_turn_bootstrap_persist_failure_fails_before_success_ack() {
+    let (state, _d) = test_state().await;
+    state
+        .rt
+        .store()
+        .db()
+        .clone()
+        .execute("DROP TABLE threads", vec![])
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.start",
+            "threadId": "t-bootstrap-fails",
+            "modelSelection": {"instanceId": "codex", "model": "codex-default"},
+            "message": {"text": "hi", "messageId": "m1"},
+            "bootstrap": { "createThread": {
+                "projectId": "p-workspace",
+                "title": "will not persist",
+                "runtimeMode": "approval-required",
+                "interactionMode": "plan",
+            }},
+        }}),
+    )
+    .await;
+    let frames = drain(&mut rx);
+    let exits: Vec<&Value> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
+    assert_eq!(exits.len(), 1, "one terminal frame only: {frames:?}");
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "bootstrap persistence failure must fail before accepted Success: {frames:?}"
+    );
+    assert!(
+        exits[0]["exit"]["cause"][0]["defect"]
+            .as_str()
+            .unwrap_or("")
+            .contains("thread bootstrap failed"),
+        "failure names the admission seam: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|f| f["exit"]["_tag"] != "Success"),
+        "no accepted ack may be emitted before durable bootstrap: {frames:?}"
     );
 }
 
@@ -4545,7 +4602,7 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
     ensure_thread_on_shell(&state, &json!({
         "threadId": "t-meta", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
         "message": {"text": "hi", "messageId": "m1"},
-    })).await;
+    })).await.expect("thread bootstrap persists");
 
     // change the mode + title OUTSIDE a turn
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5593,7 +5650,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .expect("default model bootstrap persists");
 
     let t = state
         .rt
@@ -5641,7 +5699,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .expect("explicit model bootstrap persists");
     let t = state
         .rt
         .threads()
@@ -5910,10 +5969,14 @@ async fn model_switch_persists_in_thread_snapshot() {
         })
     };
     // First turn creates the thread on instance A.
-    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await;
+    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-a", "hi").await;
     // Second turn SWITCHES to instance B on the same thread.
-    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again")).await;
+    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-b", "again").await;
 
     // The snapshot must reflect the switched selection, and keep both msgs.
@@ -6456,7 +6519,7 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
             "worktreePath": wt.to_string_lossy(),
         }},
     });
-    ensure_thread_on_shell(&state, &command).await;
+    ensure_thread_on_shell(&state, &command).await.unwrap();
 
     // the thread the shell announced carries what the user picked
     let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
@@ -6838,17 +6901,44 @@ async fn events_published_inside_subscribe_thread_are_never_skipped() {
                 })
                 .unwrap_or(false)
         };
-        let seen = drain_until(&mut rx, std::time::Duration::from_secs(15), |v| {
-            carries(v, last)
-        })
-        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut seen = Vec::new();
+        let mut saw_last = false;
+        let mut saw_snapshot_mark = label == "resume";
+        while tokio::time::Instant::now() < deadline && !(saw_last && saw_snapshot_mark) {
+            seen.extend(drain(&mut rx));
+            saw_last = seen.iter().any(|v| carries(v, last));
+            saw_snapshot_mark |= seen
+                .iter()
+                .any(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64().is_some());
+            if saw_last && saw_snapshot_mark {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        seen.extend(drain(&mut rx));
+        saw_last = seen.iter().any(|v| carries(v, last));
+        saw_snapshot_mark |= seen
+            .iter()
+            .any(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64().is_some());
+        assert!(
+            saw_last,
+            "[{label}] timed out waiting for last published event {last}; collected {seen:#?}"
+        );
+        assert!(
+            saw_snapshot_mark,
+            "[{label}] the snapshot path must advertise snapshotSequence; collected {seen:#?}"
+        );
         // The mark the client was told it holds through. The resume path
         // sends no snapshot, so it is the `afterSequence` the client asked
         // from — 0 here, i.e. every event is owed.
-        let mark = seen
-            .iter()
-            .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
-            .unwrap_or(0);
+        let mark = if label == "resume" {
+            0
+        } else {
+            seen.iter()
+                .find_map(|v| v["values"][0]["snapshot"]["snapshotSequence"].as_i64())
+                .expect("the snapshot path must advertise snapshotSequence")
+        };
         let missing: Vec<i64> = seqs
             .iter()
             .copied()

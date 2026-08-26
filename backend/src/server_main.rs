@@ -761,14 +761,14 @@ fn now_iso() -> String {
 
 /// Announce a thread on the shell stream the first time a turn targets it, so
 /// the UI promotes its draft to a real thread and subscribes to it.
-async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
+async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(), String> {
     let thread_id = command
         .get("threadId")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
     if thread_id.is_empty() {
-        return;
+        return Err("threadId is required".into());
     }
     let sel = match command.get("modelSelection").cloned() {
         Some(s) if !s.is_null() => s,
@@ -816,14 +816,13 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
             {
                 Some(id) => id.to_string(),
                 None => {
-                    tracing::error!("ensure_thread_on_shell: no seed project in store; refusing to invent an id");
-                    return;
+                    return Err(
+                        "ensure_thread_on_shell: no seed project in store; refusing to invent an id"
+                            .into(),
+                    );
                 }
             },
-            Err(e) => {
-                tracing::error!(%e, "ensure_thread_on_shell: project store unreadable");
-                return;
-            }
+            Err(e) => return Err(format!("ensure_thread_on_shell: project store unreadable: {e}")),
         },
     };
     // A worktree the client prepared (or asked us to prepare) is where this
@@ -892,9 +891,10 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) {
     // process-local rollback to do — the store IS the state.
     if let Err(e) = state.rt.save_thread(&thread).await {
         tracing::error!(%e, %thread_id, "persist thread failed — not announcing on shell");
-        return;
+        return Err(format!("persist thread failed: {e}"));
     }
     upsert_thread_on_shell(state, thread).await;
+    Ok(())
 }
 
 /// Refresh the shell projection for one thread and announce it to every shell
@@ -4263,6 +4263,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             } else {
                 None
             };
+            if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start")
+                && model.is_some()
+            {
+                // The accepted ACK means the turn is admitted. For a first
+                // turn, admission includes committing the bootstrap thread row
+                // durably; otherwise a save failure reports Success to the
+                // reducer while reload loses the thread and no turn can be
+                // resumed (#362).
+                if let Err(e) = ensure_thread_on_shell(&state, &command).await {
+                    exit_failure(tx, &id, &format!("thread bootstrap failed: {e}"));
+                    return;
+                }
+            }
             // DispatchResult is { sequence } — an ACK, not an event. It is
             // durable (a client that remembers the last dispatch number must
             // not see it rewind after a restart, #299) but it comes from the
@@ -4304,7 +4317,6 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             match command.get("type").and_then(|t| t.as_str()) {
                 Some("thread.turn.start") => {
                     if let Some(model) = model {
-                        ensure_thread_on_shell(&state, &command).await;
                         run_turn(command, model, state.clone());
                     }
                 }
