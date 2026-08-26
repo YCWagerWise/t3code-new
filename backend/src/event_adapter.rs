@@ -189,6 +189,25 @@ pub(super) fn approval_requested_activity(
     })
 }
 
+pub(super) fn pending_approval_activity(thread_id: &str, row: &Value) -> Result<Value, String> {
+    let approval = agent_sdk_shell::PendingApproval::decode(thread_id, row)?;
+    let mut activity = approval_requested_activity(
+        &approval.session_id,
+        approval.turn,
+        &approval.call_id,
+        &approval.tool,
+        &approval.args,
+        None,
+        approval.requested_at.as_deref().unwrap_or(""),
+    );
+    if approval.requested_at.is_none() {
+        if let Some(o) = activity.as_object_mut() {
+            o.remove("createdAt");
+        }
+    }
+    Ok(activity)
+}
+
 pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(String, Value)>) {
     let now = now.to_string();
     let now = now.as_str();
@@ -302,65 +321,100 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
                     }),
                 )],
             ),
-            Lifecycle::ApprovalResolved { thread_id, request_id, decision, allowed } => {
-                let decision =
-                    if decision.is_empty() { if *allowed { "accept" } else { "decline" } } else { decision };
+            Lifecycle::ApprovalResolved {
+                thread_id,
+                request_id,
+                decision,
+                allowed,
+            } => {
+                let decision = if decision.is_empty() {
+                    if *allowed {
+                        "accept"
+                    } else {
+                        "decline"
+                    }
+                } else {
+                    decision
+                };
                 (
                     thread_id.clone(),
-                    vec![("thread.activity-appended", json!({
+                    vec![(
+                        "thread.activity-appended",
+                        json!({
+                            "threadId": thread_id,
+                            "activity": {
+                                "id": format!("approval:{request_id}"),
+                                "tone": "approval",
+                                "kind": "approval.resolved",
+                                "summary": format!("Approval {decision}"),
+                                "payload": { "requestId": request_id, "decision": decision },
+                                "createdAt": now,
+                            },
+                        }),
+                    )],
+                )
+            }
+            Lifecycle::ApprovalFailed {
+                thread_id,
+                request_id,
+                detail,
+            } => (
+                thread_id.clone(),
+                vec![(
+                    "thread.activity-appended",
+                    json!({
                         "threadId": thread_id,
                         "activity": {
                             "id": format!("approval:{request_id}"),
-                            "tone": "approval",
-                            "kind": "approval.resolved",
-                            "summary": format!("Approval {decision}"),
-                            "payload": { "requestId": request_id, "decision": decision },
+                            "tone": "error",
+                            "kind": "approval.requested",
+                            "summary": detail,
+                            "payload": { "requestId": request_id, "error": detail },
                             "createdAt": now,
                         },
-                    }))],
-                )
-            }
-            Lifecycle::ApprovalFailed { thread_id, request_id, detail } => (
-                thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        "id": format!("approval:{request_id}"),
-                        "tone": "error",
-                        "kind": "approval.requested",
-                        "summary": detail,
-                        "payload": { "requestId": request_id, "error": detail },
-                        "createdAt": now,
-                    },
-                }))],
+                    }),
+                )],
             ),
-            Lifecycle::UserInputResolved { thread_id, session_id } => (
+            Lifecycle::UserInputResolved {
+                thread_id,
+                session_id,
+            } => (
                 thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        "id": format!("user-input:{session_id}"),
-                        "tone": "approval",
-                        "kind": "user-input.resolved",
-                        "summary": "Answer sent",
-                        "payload": { "requestId": session_id },
-                        "createdAt": now,
-                    },
-                }))],
+                vec![(
+                    "thread.activity-appended",
+                    json!({
+                        "threadId": thread_id,
+                        "activity": {
+                            "id": format!("user-input:{session_id}"),
+                            "tone": "approval",
+                            "kind": "user-input.resolved",
+                            "summary": "Answer sent",
+                            "payload": { "requestId": session_id },
+                            "createdAt": now,
+                        },
+                    }),
+                )],
             ),
-            Lifecycle::UserInputFailed { thread_id, session_id, detail } => (
+            Lifecycle::UserInputFailed {
+                thread_id,
+                session_id,
+                detail,
+            } => (
                 thread_id.clone(),
-                vec![("thread.activity-appended", json!({
-                    "threadId": thread_id,
-                    "activity": {
-                        "id": format!("user-input:{session_id}"),
-                        "tone": "error",
-                        "kind": "user-input.requested",
-                        "summary": detail,
-                        "payload": { "requestId": session_id, "error": detail },
-                        "createdAt": now,
-                    },
-                }))],
+                vec![(
+                    "thread.activity-appended",
+                    json!({
+                        "threadId": thread_id,
+                        "activity": {
+                            "id": format!("user-input:{session_id}"),
+                            "tone": "error",
+                            "kind": "user-input.requested",
+                            "summary": detail,
+                            "payload": { "requestId": session_id, "error": detail },
+                            "createdAt": now,
+                        },
+                    }),
+                )],
             ),
             // Tool work becomes a durable ACTIVITY row: the thing a user can
             // see running, click into, and pair with its result. `id` is the
