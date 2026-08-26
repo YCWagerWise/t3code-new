@@ -472,7 +472,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let pool = do_storage::DbPool::new(dir.join(".t3code-agent"));
+        let pool = do_storage::DbPool::new(crate::paths::agent_data_for_workspace(&dir));
         assert!(write_file(
             &pool,
             cwd,
@@ -512,7 +512,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         cairn::init_repository(&dir).await.unwrap();
         let cwd = dir.to_str().unwrap();
-        let pool = do_storage::DbPool::new(dir.join(".t3code-agent"));
+        let pool = do_storage::DbPool::new(crate::paths::agent_data_for_workspace(&dir));
 
         write_file(
             &pool,

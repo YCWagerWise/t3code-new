@@ -5,8 +5,9 @@
 pub mod assets;
 pub mod diagnostics;
 pub mod keybindings;
-pub mod providers;
+pub mod paths;
 pub mod projects;
+pub mod providers;
 pub mod review;
 pub mod settings;
 pub mod sourcecontrol;

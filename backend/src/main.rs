@@ -15,7 +15,7 @@
 //!   loadSession        → session/load  ("open this thread elsewhere")
 //!
 //! Config via env (t3code sets these when spawning):
-//!   T3CODE_AGENT_DATA   session store root (default: ./.t3code-agent)
+//!   T3CODE_AGENT_DATA   session store root (default: <workspace>/.t3code-agent)
 //!   T3CODE_AGENT_MODEL  the PREFERRED default, resolved through the provider
 //!                       catalog (`providers::default_model`) — the same catalog
 //!                       `server.getConfig` advertises, so this child and the
@@ -32,30 +32,15 @@ use std::sync::Arc;
 use agent_sdk_acp::serve;
 use agent_sdk_shell::{AgentDefinition, Shell, ShellAcp};
 
-use t3code_agent::{providers, tools};
-
-/// The tool set every session gets. THIS is the product's wiring point:
-/// register cairn (file tools) and hearth (durable PTY shell) here so the
-/// agent — and any subagent it spawns — can actually do coding work. Empty
-/// for now; add the tool crates as path deps and register their Actions.
-/// Where the agent works, and where its durable state lives.
-fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::var("T3CODE_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    let data = std::env::var("T3CODE_AGENT_DATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".t3code-agent"));
-    (root, data)
-}
+use t3code_agent::{paths, providers, tools};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let data = std::env::var("T3CODE_AGENT_DATA").unwrap_or_else(|_| ".t3code-agent".into());
     // ONE Hearth PTY per workspace, opened before any session exists and shared
     // by every session and subagent — `cd`/env persist across tool calls and a
     // client can attach to the same screen.
-    let (root, agent_data) = workspace_paths();
+    let (root, agent_data) = paths::workspace_paths();
+    let data = agent_data.to_string_lossy().into_owned();
     let registry = tools::coding_registry(root, agent_data)
         .await
         .expect("open the workspace shell");
