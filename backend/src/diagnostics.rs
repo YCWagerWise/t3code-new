@@ -648,8 +648,8 @@ mod tests {
     /// because that is now the only source. The ring these replaced could be
     /// tested synchronously; the point of deleting it is that this one cannot
     /// forget after a restart, so the tests open a real isolate.
-    async fn history(tag: &str) -> (std::path::PathBuf, agent_sdk_metrics::ResourceHistory) {
-        let dir = std::env::temp_dir().join(format!("t3-diag-{tag}-{}", uuid::Uuid::new_v4()));
+    async fn history(tag: &str) -> (crate::testtmp::TempRoot, agent_sdk_metrics::ResourceHistory) {
+        let dir = crate::testtmp::temp_root(format!("t3-diag-{tag}-{}", uuid::Uuid::new_v4()));
         let pool = do_storage::DbPool::new(dir.join("diagnostics"));
         let db = pool.object_db("diagnostics", "main").await.unwrap();
         (dir, agent_sdk_metrics::ResourceHistory::open(db, 24 * 60 * 60 * 1000).await.unwrap())

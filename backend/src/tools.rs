@@ -692,8 +692,8 @@ mod fail_closed_tests {
     impl Ctx for TestCtx {}
 
     /// A directory whose `.git` git cannot read → `Discovery::Unavailable`.
-    fn broken_repo() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("t3-failclosed-{}", uuid::Uuid::new_v4()));
+    fn broken_repo() -> crate::testtmp::TempRoot {
+        let dir = crate::testtmp::temp_root(format!("t3-failclosed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         // a `.git` entry that exists but points nowhere git can resolve: git
         // reports "not a repository", but the `.git` above proves one is meant to
@@ -706,7 +706,7 @@ mod fail_closed_tests {
     async fn write_file_fails_closed_and_leaves_the_file_unchanged() {
         let dir = broken_repo();
         let pool = DbPool::new(dir.join(".checkpoints"));
-        let wf = WriteFile { root: dir.clone(), pool,
+        let wf = WriteFile { root: dir.to_path_buf(), pool,
             desc: ActionDesc::new::<WriteIn, WriteOut>(StepType::Tool, "write_file") };
         let res = wf.call(&TestCtx, WriteIn { path: "hello.txt".into(), content: "hi".into() }).await;
         assert!(res.is_err(), "write must be refused when the checkpoint substrate is unavailable");
@@ -720,7 +720,7 @@ mod fail_closed_tests {
         // a pre-existing file the edit would have mutated
         std::fs::write(dir.join("a.txt"), "before").unwrap();
         let pool = DbPool::new(dir.join(".checkpoints"));
-        let ef = EditFile { root: dir.clone(), pool,
+        let ef = EditFile { root: dir.to_path_buf(), pool,
             desc: ActionDesc::new::<EditIn, EditOut>(StepType::Tool, "edit_file") };
         let res = ef.call(&TestCtx, EditIn { path: "a.txt".into(), old: "before".into(), new: "after".into() }).await;
         assert!(res.is_err(), "edit must be refused when the checkpoint substrate is unavailable");
@@ -753,7 +753,7 @@ mod cold_registry_tests {
     impl Ctx for TestCtx {}
 
     fn dirs(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("t3-cold-{tag}-{}", uuid::Uuid::new_v4()));
+        let base = crate::testtmp::temp_root(format!("t3-cold-{tag}-{}", uuid::Uuid::new_v4()));
         let work = base.join("work");
         let data = base.join("data");
         std::fs::create_dir_all(&work).unwrap();
@@ -834,7 +834,7 @@ mod cold_registry_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unadmitted_root_fails_instead_of_inheriting_the_workspace_shell() {
         let (work, data) = dirs("admit");
-        let outside = std::env::temp_dir().join(format!("t3-outside-{}", uuid::Uuid::new_v4()));
+        let outside = crate::testtmp::temp_root(format!("t3-outside-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&outside).unwrap();
 
         let r = roots(&work, &data).await;

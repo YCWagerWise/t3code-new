@@ -218,8 +218,8 @@ pub async fn diff_file_contents(cwd: &str, input: &Value) -> Result<Value, Strin
 mod tests {
     use super::*;
 
-    async fn repo_with_a_commit() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("t3-review-{}", uuid::Uuid::new_v4()));
+    async fn repo_with_a_commit() -> crate::testtmp::TempRoot {
+        let dir = crate::testtmp::temp_root(format!("t3-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         cairn::init_repository(&dir).await.unwrap();
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
@@ -285,7 +285,7 @@ mod tests {
     /// there is genuinely nothing to review, and that is a state, not a failure.
     #[tokio::test]
     async fn a_plain_directory_is_an_empty_preview_not_an_error() {
-        let dir = std::env::temp_dir().join(format!("review-plain-{}", std::process::id()));
+        let dir = crate::testtmp::temp_root(format!("review-plain-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let out = diff_preview(dir.to_str().unwrap(), &json!({}), "2026-08-19T00:00:00.000Z")
