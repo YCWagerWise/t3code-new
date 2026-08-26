@@ -1221,6 +1221,14 @@ fn spawn_vcs_watcher(state: AppState) {
         let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut subs = state.vcs_watch_changed.subscribe();
         loop {
+            match state.rt.watch_sweep("vcs").await {
+                Ok(keys) if !keys.is_empty() => tracing::info!(
+                    reclaimed = keys.len(),
+                    "reclaimed vcs watches whose durable subscriptions are gone: {keys:?}"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(%e, "vcs orphan-claim sweep failed"),
+            }
             // Each watched tree, paired with the fingerprint its FIRST (oldest)
             // subscriber was given. Publishing against the oldest is the safe
             // direction: a newer subscriber has already seen everything the
@@ -1259,10 +1267,17 @@ fn spawn_vcs_watcher(state: AppState) {
                     tokio::spawn(watch_one_tree(state.clone(), cwd, seen, None)),
                 );
             }
-            // Wait for the subscriber set to move. This is the only thing this
-            // task does now — the per-tree tasks own the actual change edges.
-            if subs.changed().await.is_err() {
-                return;
+            // Wait for the subscriber set to move, or for an orphan sweep tick.
+            // A dead backend never sends the wake, so the periodic arm is what
+            // makes an abandoned durable claim finite without moving authority
+            // back into this process.
+            tokio::select! {
+                r = subs.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(45)) => {}
             }
         }
     });
@@ -2801,18 +2816,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 match state.rt.pending_user_inputs(thread_id).await {
                     Ok(asks) => {
                         for ask in asks {
-                            let session_id = ask["sessionId"].as_str().unwrap_or("");
+                            let session_id = ask.session_id;
+                            let prompt = ask.prompt;
                             activities.push(json!({
                                 "id": format!("user-input:{session_id}"),
                                 "tone": "approval",
                                 "kind": "user-input.requested",
-                                "summary": ask["prompt"].as_str().unwrap_or("The agent has a question"),
+                                "summary": prompt,
                                 "payload": {
                                     "requestId": session_id,
-                                    "prompt": ask["prompt"].clone(),
-                                    "questions": ask["questions"].clone(),
+                                    "prompt": prompt,
+                                    "questions": ask.questions,
                                 },
-                                "createdAt": ask["requestedAt"].as_str().unwrap_or(now.as_str()),
+                                "createdAt": ask.requested_at,
                             }));
                         }
                     }
