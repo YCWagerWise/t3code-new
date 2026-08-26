@@ -1,0 +1,54 @@
+# THE SIX-REPO COMBINATION THAT WAS ACTUALLY BUILT AND PASSED TOGETHER.
+#
+# #309 said there is no integration build: every green on this channel was a
+# green against a six-repo combination that existed in one directory on one
+# machine and would never exist again. Thirty distinct revisions across four
+# cells, not one column repeating. This file is the first combination that was
+# built and tested as a set, written down so it can be reproduced.
+#
+# It is a RECORD, not a pin. Nothing reads it at build time — backend/Cargo.toml
+# still points at ../../<repo> and takes whatever is checked out there. Pinning
+# would freeze the substrate under a product that is meant to track it. What
+# this buys is the ability to answer "did these six ever pass together, and at
+# which revisions", which nobody could answer before.
+#
+# Verified on woodbine, 2026-08-26, one worktree per repo under a common root
+# with a single CARGO_TARGET_DIR per repo (never an ad-hoc target-<name> dir).
+#
+#   repo          revision      suite                                  result
+#   ------------  ------------  -------------------------------------  ----------------
+#   turso         16993abc4     cargo test -p turso_core --lib         2485 passed, 0 failed, 17 ignored
+#   do-rs         6a217a2       cargo test --workspace                 537 passed, 0 failed
+#   agent-sdk-rs  ac2765f       cargo test --workspace                 535 passed, 0 failed
+#   cairn         4016967       cargo test                             212 passed, 0 failed
+#   hearth        2df1d0d       cargo test                             85 passed, 0 failed
+#   t3code-new    210e8b2c0     cargo test (backend)                   281 passed, 0 failed
+#
+# git-forks/rust-mcp must also be present as a sibling: agent-sdk-mcp depends on
+# rmcp by path, and its absence fails the workspace manifest load before a
+# single crate compiles.
+#
+# To reproduce: check out each revision into <root>/<repo>, then run each suite
+# from its own directory. The layout matters — backend/Cargo.toml resolves
+# ../../agent-sdk-rs, ../../hearth, ../../cairn, ../../do-rs and
+# ../../turso/bindings/rust, and do-rs [patch]es turso to
+# ../turso/bindings/rust, so all six plus rust-mcp must be siblings.
+#
+# Four failures were fixed to reach this state, and all four were one layer
+# below where they showed up:
+#   - do-presence sent ad-hoc BEGIN/COMMIT/ROLLBACK; moved onto
+#     ObjectDb::transaction so the isolate's shared writer connection cannot
+#     enrol another task's writes.
+#   - turso treated a zero-length .tshm as Corrupt instead of as a file another
+#     process is mid-creation of.
+#   - turso's DATABASE_MANAGER skipped its reserve-and-serialize block on cold
+#     open, because the block was keyed by an inode the file did not have yet.
+#   - t3code-new folded the SDK's now-fallible option decode into
+#     unwrap_or_default(), making an unreadable payload look like "no options".
+
+turso         16993abc4
+do-rs         6a217a2
+agent-sdk-rs  ac2765f
+cairn         4016967
+hearth        2df1d0d
+t3code-new    210e8b2c0
