@@ -843,9 +843,26 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
         .or_else(|| str_of(command.pointer("/bootstrap/prepareWorktree/projectCwd")));
     let branch = str_of(boot.and_then(|b| b.get("branch")))
         .or_else(|| str_of(command.pointer("/bootstrap/prepareWorktree/branch")));
-    let runtime_mode = str_of(command.get("runtimeMode"))
-        .or_else(|| str_of(boot.and_then(|b| b.get("runtimeMode"))))
-        .unwrap_or_else(|| "full-access".into());
+    // "Is this thread already in the durable store?" — answered by asking
+    // the store, not a process-local HashSet (#320). A second backend
+    // process (or this one after restart) sees the same answer.
+    let existing_row = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(thread_id.as_str()));
+    // ONE precedence order for the launch modes (#337), owned by the SDK:
+    // command -> bootstrap.createThread -> durable record, and NO permissive
+    // default when none of the three names an access mode. Reading only some
+    // of those sources is what let a draft thread's chosen mode be dropped
+    // between admission and bootstrap.
+    let stored_record = existing_row
+        .as_ref()
+        .map(agent_sdk_shell::ThreadRecord::from_row)
+        .transpose()?;
+    let launch = agent_sdk_shell::TurnLaunch::resolve(command, stored_record.as_ref())?;
+    let runtime_mode = launch.runtime_mode.as_str().to_string();
     // The durable row is built by the SDK record, not by hand (#2/#5): the
     // create path and the reconnect snapshot now agree by construction, because
     // both go through `ThreadRecord`. The keys below the record does not own are
@@ -859,6 +876,7 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
         now.clone(),
     )
     .on_worktree(worktree_path.clone(), branch.clone())
+    .with_interaction_mode(launch.interaction_mode.clone())
     .project(json!({
         "latestUserMessageAt": now,
         "hasPendingApprovals": false,
@@ -873,15 +891,6 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // than running against a transcript that does not exist. A second write here
     // — under an id the runtime cannot see — is what put every prompt in the
     // transcript twice, once bare and once bound to its turn.
-    // "Is this thread already in the durable store?" — answered by asking
-    // the store, not a process-local HashSet (#320). A second backend
-    // process (or this one after restart) sees the same answer.
-    let existing_row = state
-        .rt
-        .threads()
-        .await
-        .into_iter()
-        .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(thread_id.as_str()));
     // For an EXISTING thread, the turn may carry a SWITCHED model selection. That
     // switch must persist durably (#37): otherwise a reload shows the old model
     // and the next turn can silently drift back to it. Update the thread's
@@ -894,6 +903,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
                 o.insert("modelSelection".into(), sel.clone());
                 o.insert("latestUserMessageAt".into(), json!(now));
                 o.insert("updatedAt".into(), json!(now));
+                // The modes travel with the turn too (#337): a switch the user
+                // just made must land durably, or the next turn reads back the
+                // old gate.
+                o.insert("runtimeMode".into(), json!(runtime_mode));
+                o.insert("interactionMode".into(), json!(launch.interaction_mode));
             }
             existing
         }

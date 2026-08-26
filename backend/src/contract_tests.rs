@@ -1903,6 +1903,7 @@ async fn a_whitespace_only_turn_is_refused_before_anything_mutates() {
             "type": "thread.turn.start",
             "commandId": "c-ok",
             "threadId": "t-ws",
+            "runtimeMode": "full-access",
             "message": { "messageId": "m-ok", "role": "user", "text": "actually do something", "attachments": [] },
             "createdAt": now_iso(),
         }}),
@@ -2675,6 +2676,7 @@ async fn a_model_switch_persists_and_keeps_history() {
         &state,
         &json!({
             "threadId": "t-switch", "modelSelection": claude,
+            "runtimeMode": "full-access",
             "message": {"text": "first", "messageId": "m1"},
         }),
     )
@@ -2690,6 +2692,7 @@ async fn a_model_switch_persists_and_keeps_history() {
         &state,
         &json!({
             "threadId": "t-switch", "modelSelection": codex,
+            "runtimeMode": "full-access",
             "message": {"text": "second", "messageId": "m2"},
         }),
     )
@@ -2940,6 +2943,7 @@ async fn an_unroutable_selection_fails_the_dispatch_and_starts_no_turn() {
         "orchestration.dispatchCommand",
         json!({"input": {
             "type": "thread.turn.start", "threadId": "t-ok",
+            "runtimeMode": "full-access",
             "modelSelection": {"instanceId": "codex", "model": "codex-default"},
             "message": {"text": "hi", "messageId": "m1"},
         }}),
@@ -4678,7 +4682,7 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
     let (state, _d) = test_state().await;
     // create the thread via a turn bootstrap
     ensure_thread_on_shell(&state, &json!({
-        "threadId": "t-meta", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
+        "threadId": "t-meta", "runtimeMode": "full-access", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
         "message": {"text": "hi", "messageId": "m1"},
     })).await.unwrap();
 
@@ -5805,7 +5809,7 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
     ensure_thread_on_shell(
         &state,
         &json!({
-            "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
+            "threadId": "t-default", "runtimeMode": "full-access", "message": {"text": "hi", "messageId": "m1"},
         }),
     )
     .await
@@ -5853,6 +5857,7 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
         &state,
         &json!({
             "threadId": "t-explicit",
+            "runtimeMode": "full-access",
             "modelSelection": {"instanceId": "codex", "model": "codex-default"},
             "message": {"text": "hi", "messageId": "m1"},
         }),
@@ -6134,6 +6139,7 @@ async fn model_switch_persists_in_thread_snapshot() {
     let cmd = |inst: &str, model: &str, text: &str| {
         json!({
             "type": "thread.turn.start", "threadId": tid,
+            "runtimeMode": "full-access",
             "modelSelection": { "instanceId": inst, "model": model },
             "message": { "text": text }
         })
@@ -6884,9 +6890,8 @@ async fn first_turn_launch_refuses_success_ack_when_thread_bootstrap_cannot_pers
         "bootstrap persistence failure must be visible before the async ACK: {frames:#?}"
     );
     assert!(
-        exit["exit"]["cause"]
-            .to_string()
-            .contains("cannot bootstrap thread"),
+        exit["exit"]["cause"].to_string().contains("thread.turn.start")
+            && exit["exit"]["cause"].to_string().contains("persisting thread"),
         "failure names the durable bootstrap seam: {exit}"
     );
 

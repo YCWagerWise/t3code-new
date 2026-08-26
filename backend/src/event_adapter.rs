@@ -469,6 +469,45 @@ pub(super) fn project_items(event: &Lifecycle, now: &str) -> (String, Vec<(Strin
                     }),
                 )],
             ),
+            // #237: the turn never STARTED. There is no turn id to clear and
+            // no partial output to keep, so this is not a `TurnEnded` with a
+            // failed outcome — treating it as one would leave the client
+            // reconciling against a turn that never existed. Two items,
+            // because the client needs both halves: the session goes back to
+            // idle (clearing the optimistic "sending" composer that would
+            // otherwise spin forever on a turn nobody launched), and the
+            // refusal becomes a VISIBLE activity carrying the SDK's `detail`.
+            // Silently idling would reproduce the defect the variant exists to
+            // prevent — a refusal indistinguishable from a turn that ran and
+            // produced nothing.
+            Lifecycle::TurnLaunchFailed { thread_id, detail } => (
+                thread_id.clone(),
+                vec![
+                    (
+                        "thread.activity-appended",
+                        json!({
+                            "threadId": thread_id,
+                            "activity": {
+                                // Each refusal is its own row: a user who
+                                // retries and is refused again must see two
+                                // rows, not one that silently overwrites.
+                                "id": format!("turn-launch-failed:{thread_id}:{now}"),
+                                "tone": "error",
+                                "kind": "turn.launch-failed",
+                                "summary": detail,
+                                "payload": { "error": detail },
+                                "createdAt": now,
+                            },
+                        }),
+                    ),
+                    (
+                        "thread.session-set",
+                        json!({ "threadId": thread_id, "session": {
+                        "threadId": thread_id, "status": "idle", "providerName": null,
+                        "activeTurnId": null, "lastError": detail, "updatedAt": now } }),
+                    ),
+                ],
+            ),
             Lifecycle::TurnEnded {
                 thread_id, outcome, ..
             } => {
