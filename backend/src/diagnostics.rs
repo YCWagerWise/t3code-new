@@ -46,6 +46,13 @@ pub struct Sample {
     pub procs: Vec<Proc>,
 }
 
+/// One `ps` read, including rows that were present but could not be parsed.
+#[derive(Clone, Debug)]
+pub struct PsRead {
+    pub procs: Vec<Proc>,
+    pub dropped_lines: usize,
+}
+
 /// `ps` elapsed time — `[[dd-]hh:]mm:ss` — as seconds.
 ///
 /// Returns `None` rather than 0 on an unparseable value: the start time is
@@ -115,8 +122,23 @@ pub fn parse_ps_line(line: &str) -> Option<Proc> {
     })
 }
 
+pub fn parse_ps_output(raw: &[u8]) -> PsRead {
+    let mut procs = Vec::new();
+    let mut dropped_lines = 0usize;
+    for line in String::from_utf8_lossy(raw).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_ps_line(line) {
+            Some(p) => procs.push(p),
+            None => dropped_lines += 1,
+        }
+    }
+    PsRead { procs, dropped_lines }
+}
+
 /// Every process on the box, as `ps` sees it.
-pub async fn ps_all() -> Result<Vec<Proc>, String> {
+pub async fn ps_all() -> Result<PsRead, String> {
     let out = tokio::process::Command::new("ps")
         .args(["-Ao", "pid=,ppid=,pgid=,stat=,%cpu=,rss=,etime=,args="])
         .output()
@@ -125,10 +147,7 @@ pub async fn ps_all() -> Result<Vec<Proc>, String> {
     if !out.status.success() {
         return Err(format!("ps exited {}", out.status));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect())
+    Ok(parse_ps_output(&out.stdout))
 }
 
 /// The server process and everything under it, with each row's depth from the
@@ -183,9 +202,9 @@ fn iso(ms: i64) -> String {
 
 /// Take one sample of the server's process tree.
 pub async fn sample(root: i64) -> Result<Sample, String> {
-    let all = ps_all().await?;
+    let read = ps_all().await?;
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let procs = descendants(&all, root)
+    let procs = descendants(&read.procs, root)
         .into_iter()
         .map(|(p, _, _)| p)
         .collect();
@@ -195,7 +214,7 @@ pub async fn sample(root: i64) -> Result<Sample, String> {
 /// `ServerProcessDiagnosticsResult`.
 pub async fn process_diagnostics(root: i64) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let read = match ps_all().await {
         Ok(a) => a,
         // A failed read is reported AS a failed read. The alternative — an empty
         // process list — renders as "nothing is running", which is a lie the
@@ -208,7 +227,7 @@ pub async fn process_diagnostics(root: i64) -> Value {
             })
         }
     };
-    let rows = descendants(&all, root);
+    let rows = descendants(&read.procs, root);
     let total_rss: i64 = rows.iter().map(|(p, _, _)| p.rss_bytes).sum();
     let total_cpu: f64 = rows.iter().map(|(p, _, _)| p.cpu_percent).sum();
     let processes: Vec<Value> = rows
@@ -234,6 +253,11 @@ pub async fn process_diagnostics(root: i64) -> Value {
             })
         })
         .collect();
+    let partial_error = if read.dropped_lines > 0 {
+        some(json!({"message": format!("ps read dropped {} unparseable row(s)", read.dropped_lines)}))
+    } else {
+        none()
+    };
     json!({
         "serverPid": root.max(1),
         "readAt": iso(now),
@@ -241,7 +265,7 @@ pub async fn process_diagnostics(root: i64) -> Value {
         "totalRssBytes": total_rss.max(0),
         "totalCpuPercent": total_cpu,
         "processes": processes,
-        "error": none(),
+        "error": partial_error,
     })
 }
 
@@ -521,6 +545,18 @@ mod tests {
         assert!(parse_ps_line("").is_none());
     }
 
+    #[test]
+    fn ps_output_reports_unparseable_rows() {
+        let read = parse_ps_output(
+            b"  100  1  100 Ss  1.0  10 00:01 server\n\
+              malformed row\n\
+              101  100  100 S  2.5  20 00:02 worker --arg\n",
+        );
+        assert_eq!(read.procs.len(), 2, "valid rows still parse");
+        assert_eq!(read.dropped_lines, 1, "a partial ps read must be reported, not filter_map'd away");
+        assert_eq!(read.procs[1].command, "worker --arg");
+    }
+
     fn p(pid: i64, ppid: i64) -> Proc {
         Proc {
             pid, ppid, pgid: pid, status: "S".into(), cpu_percent: 1.0,
@@ -767,7 +803,7 @@ fn empty_aggregate() -> Value {
 /// pending a per-source sampler.
 pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> Value {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let all = match ps_all().await {
+    let read = match ps_all().await {
         Ok(v) => v,
         Err(e) => {
             return json!({
@@ -797,7 +833,7 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
             });
         }
     };
-    let rows = descendants(&all, root);
+    let rows = descendants(&read.procs, root);
     let mut total_cpu = 0.0;
     let mut total_rss: i64 = 0;
     let processes: Vec<Value> = rows
@@ -838,6 +874,12 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
         "ioReadBytesPerSecond": 0.0, "ioWriteBytesPerSecond": 0.0,
         "processStarts": 0, "processExits": 0,
     });
+    let native_status = if read.dropped_lines > 0 { "degraded" } else { "healthy" };
+    let native_error = if read.dropped_lines > 0 {
+        some(json!(format!("ps read dropped {} unparseable row(s)", read.dropped_lines)))
+    } else {
+        none()
+    };
     json!({
         "readAt": iso(now_ms),
         "sampleIntervalMs": sample_interval_ms.max(0),
@@ -852,7 +894,7 @@ pub async fn resource_telemetry_snapshot(root: i64, sample_interval_ms: i64) -> 
         "speedLimitPercent": none(),
         "attribution": { "readAt": iso(now_ms), "entries": [] },
         "health": {
-            "native": { "status": "healthy", "lastSampleAt": some(json!(iso(now_ms))), "lastError": none() },
+            "native": { "status": native_status, "lastSampleAt": some(json!(iso(now_ms))), "lastError": native_error },
             "desktop": { "status": "unavailable", "lastSampleAt": none(), "lastError": none() },
             "sidecarVersion": none(),
             "sidecarPid": none(),
