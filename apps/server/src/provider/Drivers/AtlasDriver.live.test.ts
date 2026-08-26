@@ -443,10 +443,16 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
    * fast the model happened to be, so it passed on a slow one and failed on a fast one — and a
    * lost race read as a green tick, which is worse than having no test.
    *
-   * `/_test/hold` commits a real run through the supervisor's own `/command` and `/observation`
-   * seams and never reports a provider outcome. The attempt is genuinely `running` with nothing
-   * behind it, so the ONLY way it can leave that state is the cancellation path under test.
-   * The oracle is therefore strict: `completed` here is counter-evidence, not an alternative.
+   * `/_test/hold` commits a real run through the supervisor's own seams AND registers a real
+   * cancellable future behind it, in the same switch table a live drive uses. So an accepted
+   * cancel reaches this attempt exactly as it reaches a turn and resolves it as
+   * `Driven::Cancelled`; the fixture then reports `provider.stopped`, which is what terminalizes
+   * it. The body pends forever, so `completed` is unreachable by construction.
+   *
+   * That distinction is the point of the finding. An attempt with NOTHING behind it would also
+   * end up cancelled — but only after CANCEL_TIMEOUT_MS swept it, which proves the supervisor's
+   * bookkeeping rather than that cancellation stopped active work. The window below is 15s
+   * against a 30s deadline precisely so a sweep cannot pass this test.
    */
   it("cancels an attempt that cannot finish on its own, and the lens sees it end", async () => {
     const created = await instance({});
@@ -485,17 +491,27 @@ describe.skipIf(!BASE_URL)("the Atlas driver against a live node", () => {
       return ((await response.json()) as { run?: Record<string, unknown> }).run ?? {};
     };
 
+    // Deliberately WELL under CANCEL_TIMEOUT_MS (30s). If the cancel had merely been accepted
+    // and left to the supervisor's deadline to sweep, this window would expire and the test
+    // would fail — which is the difference between proving actuation and proving bookkeeping.
+    const deadline = Date.now() + 15_000;
     let run: Record<string, unknown> = {};
-    for (let attempt = 0; attempt < 60; attempt += 1) {
+    while (Date.now() < deadline) {
       run = await readRun();
       if (String(run["state"]) === "cancelled") break;
-      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
     }
-    // Strict: the intended attempt stopped, and it stopped BECAUSE it was cancelled.
+
+    // Strict: the intended attempt stopped, and it stopped BECAUSE the cancel reached the work.
     expect(String(run["state"])).toEqual("cancelled");
     expect(String((run["attempt"] as Record<string, unknown>)?.["attempt_id"])).toEqual(
       held.attempt_id,
     );
+    // The PROVIDER reported the cancellation. `cancel_timeout` here would mean the signal never
+    // arrived and the deadline cleaned up after it.
+    const terminal = run["terminal"] as Record<string, unknown> | undefined;
+    expect(String(terminal?.["reason"])).toEqual("cancelled_by_fixture");
+    expect(String(terminal?.["state"])).toEqual("cancelled");
 
     // And the lens is told the turn ended — the projection gap that made a cancelled turn spin
     // in the composer forever.
