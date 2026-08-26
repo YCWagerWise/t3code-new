@@ -67,6 +67,12 @@ async fn drop_runtime_kv(state: &AppState) {
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
 }
 
+async fn drop_threads_table(state: &AppState) {
+    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let db = pool.object_db("threadruntime", "main").await.unwrap();
+    db.execute("DROP TABLE threads", vec![]).await.unwrap();
+}
+
 /// #202: break the broker's subscriber table so every `topic_publish` fails.
 ///
 /// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
@@ -2672,7 +2678,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "first", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     // The prompt itself is written by `run_turn_with_prompt_id`, not by
     // thread bootstrap, so a test that never runs a turn seeds it the way
     // the runtime would. What is under test here is the SWITCH, and the
@@ -2686,7 +2693,8 @@ async fn a_model_switch_persists_and_keeps_history() {
             "message": {"text": "second", "messageId": "m2"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     seed_prompt(&state, "t-switch", "m2", "second").await;
 
     // the DURABLE thread row carries the new selection
@@ -3275,9 +3283,25 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
     // a real long-running foreground command in the SHARED pty — the same
     // one run_bash uses, which is why a stop has to reach it
     let runner = state.terminal.clone();
-    let running = tokio::spawn(async move { runner.run("sleep 30", false, Some(25), false).await });
-    // let the command actually reach the shell before interrupting
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let running = tokio::spawn(async move {
+        runner
+            .run("printf STOP_TEST_RUNNING; sleep 30", false, Some(25), false)
+            .await
+    });
+    // Prove the command reached the PTY foreground before interrupting it. A
+    // fixed sleep raced the shell on loaded release runs and sometimes tested
+    // only that Stop was accepted, not that it interrupted a live foreground.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if state.terminal.read_screen().await.contains("STOP_TEST_RUNNING") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "foreground command never became visible before stop"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     let started = std::time::Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4656,7 +4680,7 @@ async fn thread_meta_updates_persist_and_reach_the_next_turn() {
     ensure_thread_on_shell(&state, &json!({
         "threadId": "t-meta", "modelSelection": {"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"},
         "message": {"text": "hi", "messageId": "m1"},
-    })).await;
+    })).await.unwrap();
 
     // change the mode + title OUTSIDE a turn
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5784,7 +5808,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "threadId": "t-default", "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
 
     let t = state
         .rt
@@ -5832,7 +5857,8 @@ async fn thread_metadata_names_the_provider_the_runtime_would_actually_run() {
             "message": {"text": "hi", "messageId": "m1"},
         }),
     )
-    .await;
+    .await
+    .unwrap();
     let t = state
         .rt
         .threads()
@@ -6113,10 +6139,14 @@ async fn model_switch_persists_in_thread_snapshot() {
         })
     };
     // First turn creates the thread on instance A.
-    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi")).await;
+    ensure_thread_on_shell(&state, &cmd("claudeAgent", "model-a", "hi"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-a", "hi").await;
     // Second turn SWITCHES to instance B on the same thread.
-    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again")).await;
+    ensure_thread_on_shell(&state, &cmd("codex", "model-b", "again"))
+        .await
+        .unwrap();
     seed_prompt(&state, tid, "m-b", "again").await;
 
     // The snapshot must reflect the switched selection, and keep both msgs.
@@ -6659,7 +6689,7 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
             "worktreePath": wt.to_string_lossy(),
         }},
     });
-    ensure_thread_on_shell(&state, &command).await;
+    ensure_thread_on_shell(&state, &command).await.unwrap();
 
     // the thread the shell announced carries what the user picked
     let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
@@ -6715,6 +6745,166 @@ async fn the_first_turns_project_worktree_and_mode_reach_the_thread() {
         "plan mode reaches the agent's instructions: {instructions}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #337: the real dispatch route must read first-turn lifecycle metadata from
+/// `bootstrap.createThread`, not only from top-level fields or an already
+/// persisted row. A draft thread has no durable row yet; rejecting this shape
+/// before `ensure_thread_on_shell` runs strands the composer draft.
+#[tokio::test]
+async fn first_turn_launch_reads_runtime_metadata_from_bootstrap_create_thread() {
+    let (state, dir) = test_state().await;
+    let wt = dir.join("wt-dispatch");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    let (shell_tx, mut shell_rx) = mpsc::unbounded_channel();
+    request(&state, &shell_tx, "orchestration.subscribeShell", json!({})).await;
+    let _ = drain(&mut shell_rx);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.start",
+            "commandId": "c-bootstrap-mode",
+            "threadId": "t-bootstrap-mode",
+            "message": {
+                "messageId": "m-bootstrap-mode",
+                "role": "user",
+                "text": "start with the selected mode",
+                "attachments": []
+            },
+            "modelSelection": {
+                "instanceId": "claudeAgent",
+                "model": "claude-haiku-4-5-20251001"
+            },
+            "bootstrap": { "createThread": {
+                "projectId": "p-bootstrap",
+                "title": "Bootstrap mode",
+                "runtimeMode": "approval-required",
+                "interactionMode": "plan",
+                "branch": "feature/bootstrap-mode",
+                "worktreePath": wt.to_string_lossy(),
+            }},
+        }}),
+    )
+    .await;
+
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("dispatch exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Success",
+        "bootstrap runtimeMode under createThread must pass dispatch admission: {exit}"
+    );
+
+    let saved = state
+        .rt
+        .threads()
+        .await
+        .into_iter()
+        .find(|t| t["id"] == "t-bootstrap-mode")
+        .expect("dispatch persisted the draft thread");
+    assert_eq!(saved["runtimeMode"], "approval-required");
+    assert_eq!(saved["interactionMode"], "plan");
+    assert_eq!(saved["worktreePath"], wt.to_string_lossy().as_ref());
+    assert_eq!(saved["branch"], "feature/bootstrap-mode");
+
+    let announced = drain_until(&mut shell_rx, std::time::Duration::from_secs(2), |f| {
+        f.get("values")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| arr.iter().any(|x| x["kind"] == "thread-upserted"))
+    })
+    .await;
+    let thread = announced
+        .iter()
+        .flat_map(|f| f["values"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["kind"] == "thread-upserted" && v["thread"]["id"] == "t-bootstrap-mode")
+        .map(|v| v["thread"].clone())
+        .unwrap_or_else(|| panic!("no bootstrap thread-upserted in {announced:#?}"));
+    assert_eq!(thread["runtimeMode"], "approval-required");
+    assert_eq!(thread["interactionMode"], "plan");
+}
+
+/// #362: a dispatch ACK means the async turn was accepted. For a draft thread
+/// that acceptance is not true until the bootstrap thread row has committed;
+/// otherwise a reload has no thread even though the client saw Success.
+#[tokio::test]
+async fn first_turn_launch_refuses_success_ack_when_thread_bootstrap_cannot_persist() {
+    let (state, dir) = test_state().await;
+    let wt = dir.join("wt-dispatch-fail");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    let (shell_tx, mut shell_rx) = mpsc::unbounded_channel();
+    request(&state, &shell_tx, "orchestration.subscribeShell", json!({})).await;
+    let _ = drain(&mut shell_rx);
+    drop_threads_table(&state).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.turn.start",
+            "commandId": "c-bootstrap-fail",
+            "threadId": "t-bootstrap-fail",
+            "message": {
+                "messageId": "m-bootstrap-fail",
+                "role": "user",
+                "text": "do not ack this",
+                "attachments": []
+            },
+            "modelSelection": {
+                "instanceId": "claudeAgent",
+                "model": "claude-haiku-4-5-20251001"
+            },
+            "bootstrap": { "createThread": {
+                "projectId": "p-bootstrap",
+                "title": "Bootstrap fail",
+                "runtimeMode": "approval-required",
+                "interactionMode": "plan",
+                "branch": "feature/bootstrap-fail",
+                "worktreePath": wt.to_string_lossy(),
+            }},
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("dispatch exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "bootstrap persistence failure must be visible before the async ACK: {frames:#?}"
+    );
+    assert!(
+        exit["exit"]["cause"]
+            .to_string()
+            .contains("cannot bootstrap thread"),
+        "failure names the durable bootstrap seam: {exit}"
+    );
+
+    let shell_frames = drain(&mut shell_rx);
+    assert!(
+        shell_frames.iter().all(|f| {
+            f.get("values")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter().all(|x| {
+                        x["kind"] != "thread-upserted"
+                            || x["thread"]["id"] != "t-bootstrap-fail"
+                    })
+                })
+                .unwrap_or(true)
+        }),
+        "a failed bootstrap must not announce a non-durable draft thread: {shell_frames:#?}"
+    );
 }
 
 /// #72: the path picker and open-in-editor are implemented, and their
@@ -8298,6 +8488,77 @@ async fn approval_failure_projection_failure_is_not_reported_as_applied() {
     assert!(
         msg.contains("projection") || msg.contains("thread_event"),
         "failure names the lifecycle projection/storage failure: {exit}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #261: `respond_to_approval` returning `Ok(false)` means no durable pending
+/// approval row was answered. The product must not publish `approval.resolved`
+/// or send the applied success ACK for a stale request id.
+#[tokio::test]
+async fn an_approval_that_matched_no_pending_request_fails_the_rpc() {
+    let (state, dir) = test_state().await;
+    state
+        .rt
+        .save_thread(&json!({
+            "runtimeMode": "full-access",
+            "id": "t-appr-stale",
+            "projectId": "p-workspace",
+            "title": "approval stale",
+            "createdAt": now_iso(),
+            "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    let before = state.rt.current_sequence().await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({ "input": {
+            "type": "thread.approval.respond",
+            "threadId": "t-appr-stale",
+            "requestId": "missing-session|7|missing-call",
+            "decision": "accept",
+        }}),
+    )
+    .await;
+
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
+    assert_eq!(
+        exit["exit"]["_tag"], "Failure",
+        "a stale approval request must not be acknowledged as applied: {frames:#?}"
+    );
+    assert!(
+        exit["exit"]["cause"].to_string().contains("pending request"),
+        "failure names the missing durable pending approval: {exit}"
+    );
+
+    let replayed = state
+        .rt
+        .events_after("t-appr-stale", before, 100)
+        .await
+        .unwrap();
+    assert!(
+        replayed.iter().all(|e| {
+            e.pointer("/event/payload/activity/kind")
+                != Some(&json!("approval.resolved"))
+        }),
+        "a stale answer must not clear the pending banner via approval.resolved: {replayed:#?}"
+    );
+    assert!(
+        replayed.iter().any(|e| {
+            e.pointer("/event/payload/activity/kind")
+                == Some(&json!("approval.requested"))
+                && e.pointer("/event/payload/activity/tone") == Some(&json!("error"))
+        }),
+        "the failure mirror should keep the approval visible with an error: {replayed:#?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

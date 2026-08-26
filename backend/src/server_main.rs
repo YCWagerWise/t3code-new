@@ -2842,18 +2842,29 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 match state.rt.pending_user_inputs(thread_id).await {
                     Ok(asks) => {
                         for ask in asks {
-                            let session_id = ask["sessionId"].as_str().unwrap_or("");
+                            // The SDK hands back a decoded `PendingUserInput`
+                            // (agent-sdk-shell), not a `Value`: `session_id`
+                            // and `requested_at` are already known-present, so
+                            // there is no `unwrap_or` here to substitute `""`
+                            // for the id the answer routes on, or the server's
+                            // clock for the ask's real durable age.
+                            let session_id = ask.session_id;
+                            let summary = if ask.prompt.trim().is_empty() {
+                                "The agent has a question".to_string()
+                            } else {
+                                ask.prompt.clone()
+                            };
                             activities.push(json!({
                                 "id": format!("user-input:{session_id}"),
                                 "tone": "approval",
                                 "kind": "user-input.requested",
-                                "summary": ask["prompt"].as_str().unwrap_or("The agent has a question"),
+                                "summary": summary,
                                 "payload": {
                                     "requestId": session_id,
-                                    "prompt": ask["prompt"].clone(),
-                                    "questions": ask["questions"].clone(),
+                                    "prompt": ask.prompt,
+                                    "questions": ask.questions,
                                 },
-                                "createdAt": ask["requestedAt"].as_str().unwrap_or(now.as_str()),
+                                "createdAt": ask.requested_at,
                             }));
                         }
                     }
