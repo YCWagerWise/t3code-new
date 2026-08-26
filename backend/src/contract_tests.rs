@@ -8982,6 +8982,32 @@ async fn diff_and_revert_refuse_stale_thread_id_without_touching_workspace() {
     );
 }
 
+/// #107: the request marker is the pre-mutation half of checkpoint revert's
+/// durable lifecycle. If it cannot be recorded, dispatch must fail before the
+/// SDK/cairn revert touches the worktree.
+#[tokio::test]
+async fn checkpoint_revert_refuses_before_mutation_when_request_event_cannot_be_recorded() {
+    let (state, dir) = test_state().await;
+    let file = root_checkpointed_thread(&state, "t-request-event-fail", "request-event.txt").await;
+
+    drop_thread_event_table(&dir).await;
+
+    let reverted = revert_dispatch_exit(&state, "t-request-event-fail").await;
+    assert_eq!(
+        reverted["exit"]["_tag"], "Failure",
+        "request event write failure must fail dispatch: {reverted}"
+    );
+    assert!(
+        exit_defect(&reverted).contains("checkpoint revert refused before mutation: request event failed"),
+        "{reverted}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "after\n",
+        "revert must not mutate the worktree when the request event cannot be recorded"
+    );
+}
+
 /// #107: after the SDK/cairn revert mutates the thread/worktree, failure to
 /// durably record the completed lifecycle event must still be returned to the
 /// caller. Falling through to Success here is the exact split-brain the review
