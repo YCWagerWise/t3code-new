@@ -19,14 +19,157 @@ fn contract_test_fd_slots() -> &'static Arc<tokio::sync::Semaphore> {
     SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
 }
 
+fn process_env_slot() -> &'static tokio::sync::Mutex<()> {
+    static SLOT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SLOT.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn test_state() -> (AppState, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("t3ct-{}", uuid::Uuid::new_v4()));
     let state = state_at(&dir).await;
     (state, dir)
 }
 
+struct FailsSqlContaining {
+    inner: Arc<dyn agent_sdk_do::ObjectDb>,
+    needle: &'static str,
+}
+
+#[async_trait::async_trait]
+impl agent_sdk_do::ObjectDb for FailsSqlContaining {
+    async fn execute(&self, sql: &str, params: Vec<Value>) -> agent_sdk_do::do_rs::Result<u64> {
+        if sql.contains(self.needle) {
+            return Err(agent_sdk_do::do_rs::Error::Backend(format!(
+                "deliberate test fault on `{}`",
+                self.needle
+            )));
+        }
+        self.inner.execute(sql, params).await
+    }
+
+    async fn execute_typed(
+        &self,
+        sql: &str,
+        params: Vec<agent_sdk_do::do_rs::Param>,
+    ) -> agent_sdk_do::do_rs::Result<u64> {
+        if sql.contains(self.needle) {
+            return Err(agent_sdk_do::do_rs::Error::Backend(format!(
+                "deliberate test fault on `{}`",
+                self.needle
+            )));
+        }
+        self.inner.execute_typed(sql, params).await
+    }
+
+    async fn query_blob(
+        &self,
+        sql: &str,
+        params: Vec<agent_sdk_do::do_rs::Param>,
+    ) -> agent_sdk_do::do_rs::Result<Option<Vec<u8>>> {
+        self.inner.query_blob(sql, params).await
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> agent_sdk_do::do_rs::Result<Vec<Value>> {
+        self.inner.query(sql, params).await
+    }
+
+    async fn execute_batch(&self, sql: &str) -> agent_sdk_do::do_rs::Result<()> {
+        self.inner.execute_batch(sql).await
+    }
+
+    fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: Vec<Value>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = agent_sdk_do::do_rs::Result<Value>> + Send + 'a>,
+    > {
+        self.inner.query_stream(sql, params)
+    }
+}
+
+async fn state_at_with_bus_fault(dir: &std::path::Path, needle: &'static str) -> AppState {
+    let mut state = state_at(dir).await;
+    let data = dir.join("data");
+    let shell = state.rt.shell().clone();
+    state.rt = ThreadRuntime::open_wrapped_bus(shell, data.to_str().unwrap(), "main", move |db| {
+        Arc::new(FailsSqlContaining { inner: db, needle })
+    })
+    .await
+    .unwrap();
+    state
+}
+
+async fn runtime_for_paths(root: std::path::PathBuf, data: std::path::PathBuf) -> ThreadRuntime {
+    let runner = tools::open_workspace_shell(&root, data.clone())
+        .await
+        .unwrap();
+    let tool_roots = tools::ToolRoots::new(root, data.clone(), runner).await;
+    let shell = Arc::new(Shell::new(&data, tool_roots.registry_factory()));
+    ThreadRuntime::open(shell, data.to_str().unwrap(), "main")
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn default_agent_data_root_survives_launch_from_different_cwds() {
+    let _env = process_env_slot().lock().await;
+    let workspace = std::env::temp_dir().join(format!("t3-root-{}", uuid::Uuid::new_v4()));
+    let backend_cwd = workspace.join("backend");
+    let nested_cwd = workspace.join("tools").join("runner");
+    std::fs::create_dir_all(&backend_cwd).unwrap();
+    std::fs::create_dir_all(&nested_cwd).unwrap();
+
+    let saved_cwd = std::env::current_dir().unwrap();
+    let saved_workspace = std::env::var_os("T3CODE_WORKSPACE");
+    let saved_data = std::env::var_os("T3CODE_AGENT_DATA");
+    std::env::set_var("T3CODE_WORKSPACE", &workspace);
+    std::env::remove_var("T3CODE_AGENT_DATA");
+
+    std::env::set_current_dir(&backend_cwd).unwrap();
+    let (root_a, data_a) = paths::workspace_paths();
+    let rt_a = runtime_for_paths(root_a, data_a.clone()).await;
+    rt_a.save_thread(&thread_row_ck("t-cwd-stable"))
+        .await
+        .unwrap();
+    drop(rt_a);
+
+    std::env::set_current_dir(&nested_cwd).unwrap();
+    let (root_b, data_b) = paths::workspace_paths();
+    assert_eq!(
+        data_b, data_a,
+        "unset T3CODE_AGENT_DATA must resolve from the workspace root, not the launch cwd"
+    );
+    let rt_b = runtime_for_paths(root_b, data_b).await;
+    let threads = rt_b.threads().await;
+
+    std::env::set_current_dir(saved_cwd).unwrap();
+    match saved_workspace {
+        Some(v) => std::env::set_var("T3CODE_WORKSPACE", v),
+        None => std::env::remove_var("T3CODE_WORKSPACE"),
+    }
+    match saved_data {
+        Some(v) => std::env::set_var("T3CODE_AGENT_DATA", v),
+        None => std::env::remove_var("T3CODE_AGENT_DATA"),
+    }
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    assert!(
+        threads.iter().any(|t| t["id"] == "t-cwd-stable"),
+        "a thread created from one launch cwd must be visible after restart from another: {threads:?}"
+    );
+}
+
 async fn drop_runtime_kv(state: &AppState) {
-    let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data").join("threadruntime"));
+    let pool = do_storage::DbPool::new(
+        std::path::Path::new(&state.cwd)
+            .join("data")
+            .join("threadruntime"),
+    );
     let db = pool.object_db("threadruntime", "main").await.unwrap();
     db.execute("DROP TABLE kv", vec![]).await.unwrap();
 }
@@ -205,16 +348,24 @@ fn every_projected_event_type_is_in_the_contract() {
             questions: None,
         },
         Lifecycle::ApprovalResolved {
-            thread_id: v("t"), request_id: v("s|1|c"), decision: v("accept"), allowed: true,
+            thread_id: v("t"),
+            request_id: v("s|1|c"),
+            decision: v("accept"),
+            allowed: true,
         },
         Lifecycle::ApprovalFailed {
-            thread_id: v("t"), request_id: v("s|1|c"), detail: v("approval failed"),
+            thread_id: v("t"),
+            request_id: v("s|1|c"),
+            detail: v("approval failed"),
         },
         Lifecycle::UserInputResolved {
-            thread_id: v("t"), session_id: v("s"),
+            thread_id: v("t"),
+            session_id: v("s"),
         },
         Lifecycle::UserInputFailed {
-            thread_id: v("t"), session_id: v("s"), detail: v("answer failed"),
+            thread_id: v("t"),
+            session_id: v("s"),
+            detail: v("answer failed"),
         },
         Lifecycle::ToolStarted {
             thread_id: v("t"),
@@ -267,23 +418,35 @@ fn every_projected_event_type_is_in_the_contract() {
     assert_eq!(ask[0].1["activity"]["kind"], "user-input.requested");
     let (_, approval_resolved) = project_items(&events[5], "2026-01-01T00:00:00.000Z");
     assert_eq!(approval_resolved[0].0, "thread.activity-appended");
-    assert_eq!(approval_resolved[0].1["activity"]["kind"], "approval.resolved");
+    assert_eq!(
+        approval_resolved[0].1["activity"]["kind"],
+        "approval.resolved"
+    );
     let (_, approval_failed) = project_items(&events[6], "2026-01-01T00:00:00.000Z");
     assert_eq!(approval_failed[0].0, "thread.activity-appended");
-    assert_eq!(approval_failed[0].1["activity"]["kind"], "approval.requested");
+    assert_eq!(
+        approval_failed[0].1["activity"]["kind"],
+        "approval.requested"
+    );
     assert_eq!(approval_failed[0].1["activity"]["tone"], "error");
     let (_, input_resolved) = project_items(&events[7], "2026-01-01T00:00:00.000Z");
     assert_eq!(input_resolved[0].0, "thread.activity-appended");
-    assert_eq!(input_resolved[0].1["activity"]["kind"], "user-input.resolved");
+    assert_eq!(
+        input_resolved[0].1["activity"]["kind"],
+        "user-input.resolved"
+    );
     let (_, input_failed) = project_items(&events[8], "2026-01-01T00:00:00.000Z");
     assert_eq!(input_failed[0].0, "thread.activity-appended");
-    assert_eq!(input_failed[0].1["activity"]["kind"], "user-input.requested");
+    assert_eq!(
+        input_failed[0].1["activity"]["kind"],
+        "user-input.requested"
+    );
     assert_eq!(input_failed[0].1["activity"]["tone"], "error");
 }
 
-/// Build a backend over an EXISTING workspace/data directory — i.e. what a
-/// process restart produces. Every durable claim the backend makes is only
-/// worth testing across one of these.
+/// Build a backend over an EXISTING workspace/data directory. This proves a
+/// fresh in-process `AppState` can read durable state, not that a killed
+/// process recovers without running `Drop`.
 /// [`state_at`] with a MODEL behind the runtime's shell.
 ///
 /// `state_at` builds `Shell::new(..)` with no model override, so nothing in
@@ -1167,17 +1330,37 @@ async fn terminal_subscriptions_fail_when_durable_topic_tail_cannot_attach() {
 #[tokio::test]
 async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty() {
     let (state, _d) = test_state().await;
-    let empty_owner = terminal::TerminalOwner::Thread { thread_id: String::new() };
+    let empty_owner = terminal::TerminalOwner::Thread {
+        thread_id: String::new(),
+    };
 
     for (method, payload) in [
-        ("terminal.open", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
-        ("terminal.restart", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
-        ("terminal.attach", json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() })),
-        ("terminal.write", json!({ "terminalId": "term-missing", "data": "echo should-not-run\n" })),
-        ("terminal.resize", json!({ "terminalId": "term-missing", "cols": 100, "rows": 40 })),
+        (
+            "terminal.open",
+            json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() }),
+        ),
+        (
+            "terminal.restart",
+            json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() }),
+        ),
+        (
+            "terminal.attach",
+            json!({ "terminalId": "term-missing", "cwd": state.cwd.clone() }),
+        ),
+        (
+            "terminal.write",
+            json!({ "terminalId": "term-missing", "data": "echo should-not-run\n" }),
+        ),
+        (
+            "terminal.resize",
+            json!({ "terminalId": "term-missing", "cols": 100, "rows": 40 }),
+        ),
         ("terminal.clear", json!({ "terminalId": "term-missing" })),
         ("terminal.close", json!({ "terminalId": "term-missing" })),
-        ("subscribeTerminalEvents", json!({ "terminalId": "term-missing" })),
+        (
+            "subscribeTerminalEvents",
+            json!({ "terminalId": "term-missing" }),
+        ),
         ("subscribeTerminalMetadata", json!({})),
     ] {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1193,12 +1376,22 @@ async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty
             "{method} names the missing owner fields: {why}"
         );
         assert!(
-            state.terminals.get(&empty_owner, "term-missing").await.unwrap().is_none(),
+            state
+                .terminals
+                .get(&empty_owner, "term-missing")
+                .await
+                .unwrap()
+                .is_none(),
             "{method} created or mutated a pane under the shared thread: scope"
         );
     }
 
-    for method in ["terminal.open", "terminal.attach", "terminal.write", "subscribeTerminalEvents"] {
+    for method in [
+        "terminal.open",
+        "terminal.attach",
+        "terminal.write",
+        "subscribeTerminalEvents",
+    ] {
         let (tx, mut rx) = mpsc::unbounded_channel();
         request(
             &state,
@@ -1208,12 +1401,20 @@ async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty
         )
         .await;
         let frames = drain(&mut rx);
-        let exit = frames.iter().find(|f| f["_tag"] == "Exit").unwrap_or_else(|| {
-            panic!("{method} with a blank threadId must fail, not park: {frames:?}")
-        });
+        let exit = frames
+            .iter()
+            .find(|f| f["_tag"] == "Exit")
+            .unwrap_or_else(|| {
+                panic!("{method} with a blank threadId must fail, not park: {frames:?}")
+            });
         assert_eq!(exit["exit"]["_tag"], "Failure", "{method}: {exit}");
         assert!(
-            state.terminals.get(&empty_owner, "term-blank").await.unwrap().is_none(),
+            state
+                .terminals
+                .get(&empty_owner, "term-blank")
+                .await
+                .unwrap()
+                .is_none(),
             "{method} treated a blank threadId as thread:"
         );
     }
@@ -2345,8 +2546,9 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
     );
 
     // and it SURVIVES a reload: a fresh catalog built from the store still has it.
-    let reloaded =
-        settings::load_instances(state.rt.store(), providers::configured_instances()).await.unwrap();
+    let reloaded = settings::load_instances(state.rt.store(), providers::configured_instances())
+        .await
+        .unwrap();
     assert!(
         reloaded.iter().any(|c| c.instance_id == "ollama_local"),
         "ollama persisted across reload"
@@ -2365,7 +2567,9 @@ async fn update_settings_adds_a_provider_visible_in_get_config() {
             .is_none(),
         "ollama removed from settings"
     );
-    let gone = settings::load_instances(state.rt.store(), providers::configured_instances()).await.unwrap();
+    let gone = settings::load_instances(state.rt.store(), providers::configured_instances())
+        .await
+        .unwrap();
     assert!(
         !gone.iter().any(|c| c.instance_id == "ollama_local"),
         "ollama gone from durable store"
@@ -2968,10 +3172,19 @@ async fn asset_urls_are_minted_signed_and_confined() {
     assert_eq!(std::fs::read(served).unwrap(), b"\x89PNG");
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "assets.createUrl", json!({
-        "resource": {"_tag": "workspace-file", "path": "logo.png"},
-    })).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    request(
+        &state,
+        &tx,
+        "assets.createUrl",
+        json!({
+            "resource": {"_tag": "workspace-file", "path": "logo.png"},
+        }),
+    )
+    .await;
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         exit["exit"]["_tag"], "Failure",
         "a workspace-file asset without threadId must not fall back to cwd: {exit}"
@@ -2981,7 +3194,10 @@ async fn asset_urls_are_minted_signed_and_confined() {
     request(&state, &tx, "assets.createUrl", json!({
         "resource": {"_tag": "workspace-file", "threadId": "stale-or-other-thread", "path": "logo.png"},
     })).await;
-    let exit = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("exits");
+    let exit = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("exits");
     assert_eq!(
         exit["exit"]["_tag"], "Failure",
         "a workspace-file asset for an unknown thread must not fall back to cwd: {exit}"
@@ -3029,7 +3245,10 @@ async fn unreadable_kv_fails_settings_and_keybinding_reads() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getSettings", json!({})).await;
-    let settings = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("settings exits");
+    let settings = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("settings exits");
     assert_eq!(
         settings["exit"]["_tag"], "Failure",
         "settings must not fall back to defaults over unreadable kv: {settings}"
@@ -3037,7 +3256,10 @@ async fn unreadable_kv_fails_settings_and_keybinding_reads() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "server.getConfig", json!({})).await;
-    let config = drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("config exits");
+    let config = drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("config exits");
     assert_eq!(
         config["exit"]["_tag"], "Failure",
         "keybindings/config must not fall back to defaults over unreadable kv: {config}"
@@ -3213,8 +3435,17 @@ async fn an_unimplemented_subscription_fails_instead_of_hanging() {
 
     // and the implemented terminal streams answer for real
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "subscribeTerminalMetadata", json!({ "threadId": "t-implemented" })).await;
-    assert!(!drain(&mut rx).is_empty(), "terminal metadata is implemented and emits");
+    request(
+        &state,
+        &tx,
+        "subscribeTerminalMetadata",
+        json!({ "threadId": "t-implemented" }),
+    )
+    .await;
+    assert!(
+        !drain(&mut rx).is_empty(),
+        "terminal metadata is implemented and emits"
+    );
 }
 
 /// #52: the stop button reaches Hearth AND the SDK turn cancel. An ack with
@@ -3281,7 +3512,9 @@ async fn stop_interrupts_the_hearth_foreground_and_cancels_the_turn() {
 async fn drop_thread_session_table(dir: &std::path::Path) {
     let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
     let db = pool.object_db("threadruntime", "main").await.unwrap();
-    db.execute("DROP TABLE thread_session", vec![]).await.unwrap();
+    db.execute("DROP TABLE thread_session", vec![])
+        .await
+        .unwrap();
 }
 
 fn exit_is_success(frame: &Value) -> bool {
@@ -3298,19 +3531,39 @@ async fn stop_command_fails_when_sdk_interrupt_state_is_unreadable() {
 
     // Keep the shared Hearth shell live so this test faults only the SDK side.
     let opened = state.terminal.run("true", false, Some(5), false).await;
-    assert_eq!(opened.exit_code, 0, "precondition: terminal opened cleanly: {opened:?}");
+    assert_eq!(
+        opened.exit_code, 0,
+        "precondition: terminal opened cleanly: {opened:?}"
+    );
 
-    state.rt.save_thread(&thread_row_ck("t-stop-sdk-fail")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-stop-sdk-fail"))
+        .await
+        .unwrap();
     drop_thread_session_table(&dir).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.turn.interrupt", "threadId": "t-stop-sdk-fail",
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.interrupt", "threadId": "t-stop-sdk-fail",
+        }}),
+    )
+    .await;
     let frames = drain(&mut rx);
     let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
-    assert_eq!(exits.len(), 1, "a failed stop must produce exactly one terminal frame: {frames:?}");
-    assert_eq!(exits[0]["exit"]["_tag"], "Failure", "SDK stop failure must not ack success: {frames:?}");
+    assert_eq!(
+        exits.len(),
+        1,
+        "a failed stop must produce exactly one terminal frame: {frames:?}"
+    );
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "SDK stop failure must not ack success: {frames:?}"
+    );
     assert!(
         !frames.iter().any(|f| exit_is_success(f)),
         "SDK stop failure sent a success ack as well as failure: {frames:?}"
@@ -3327,19 +3580,39 @@ async fn stop_command_fails_when_sdk_interrupt_state_is_unreadable() {
 #[tokio::test]
 async fn stop_command_fails_when_hearth_foreground_interrupt_fails() {
     let (state, _d) = test_state().await;
-    state.rt.save_thread(&thread_row_ck("t-stop-hearth-fail")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-stop-hearth-fail"))
+        .await
+        .unwrap();
 
     let shutdown = state.terminal.shutdown().await;
-    assert!(shutdown.contains("shut down"), "precondition: shared shell shut down: {shutdown}");
+    assert!(
+        shutdown.contains("shut down"),
+        "precondition: shared shell shut down: {shutdown}"
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.turn.interrupt", "threadId": "t-stop-hearth-fail",
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.interrupt", "threadId": "t-stop-hearth-fail",
+        }}),
+    )
+    .await;
     let frames = drain(&mut rx);
     let exits: Vec<_> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
-    assert_eq!(exits.len(), 1, "a failed stop must produce exactly one terminal frame: {frames:?}");
-    assert_eq!(exits[0]["exit"]["_tag"], "Failure", "Hearth stop failure must not ack success: {frames:?}");
+    assert_eq!(
+        exits.len(),
+        1,
+        "a failed stop must produce exactly one terminal frame: {frames:?}"
+    );
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "Hearth stop failure must not ack success: {frames:?}"
+    );
     assert!(
         !frames.iter().any(|f| exit_is_success(f)),
         "Hearth stop failure sent a success ack as well as failure: {frames:?}"
@@ -3357,8 +3630,14 @@ async fn stop_command_fails_when_runtime_cancel_state_is_unreadable() {
     let (state, _d) = test_state().await;
     // Keep the Hearth half healthy so this specifically proves SDK/runtime
     // cancellation failure is not hidden behind a successful terminal interrupt.
-    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
-    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    let ready = state
+        .terminal
+        .run("echo ready", false, Some(10), false)
+        .await;
+    assert!(
+        ready.output.contains("ready"),
+        "precondition: live shell exists: {ready:?}"
+    );
 
     state
         .rt
@@ -3383,7 +3662,11 @@ async fn stop_command_fails_when_runtime_cancel_state_is_unreadable() {
         .into_iter()
         .filter(|f| f["_tag"] == "Exit")
         .collect();
-    assert_eq!(exits.len(), 1, "one terminal frame for failed stop: {exits:?}");
+    assert_eq!(
+        exits.len(),
+        1,
+        "one terminal frame for failed stop: {exits:?}"
+    );
     assert_eq!(
         exits[0]["exit"]["_tag"], "Failure",
         "runtime cancel failure must not be acked as Success: {exits:?}"
@@ -3413,7 +3696,11 @@ async fn stop_command_fails_when_terminal_interrupt_fails() {
         .into_iter()
         .filter(|f| f["_tag"] == "Exit")
         .collect();
-    assert_eq!(exits.len(), 1, "one terminal frame for failed stop: {exits:?}");
+    assert_eq!(
+        exits.len(),
+        1,
+        "one terminal frame for failed stop: {exits:?}"
+    );
     assert_eq!(
         exits[0]["exit"]["_tag"], "Failure",
         "terminal interrupt failure must not be acked as Success: {exits:?}"
@@ -3430,17 +3717,32 @@ async fn stop_command_fails_when_hearth_interrupt_fails() {
     let _ = state.terminal.shutdown().await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.turn.interrupt", "threadId": "t-stop-fail",
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.turn.interrupt", "threadId": "t-stop-fail",
+        }}),
+    )
+    .await;
 
-    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
-    assert_eq!(exits.len(), 1, "one request must produce exactly one terminal frame: {exits:?}");
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "one request must produce exactly one terminal frame: {exits:?}"
+    );
     assert_eq!(
         exits[0]["exit"]["_tag"], "Failure",
         "a failed Hearth foreground interrupt must not be acknowledged as success: {exits:?}"
     );
-    let defect = exits[0]["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    let defect = exits[0]["exit"]["cause"][0]["defect"]
+        .as_str()
+        .unwrap_or("");
     assert!(
         defect.contains("terminal interrupt failed"),
         "the failure should name the failed stop leg: {exits:?}"
@@ -3458,28 +3760,52 @@ async fn stop_command_fails_when_sdk_cancel_fails() {
     let def = AgentDefinition {
         name: "t3code".into(),
         instructions: String::new(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
-        tools: vec![], ask_tools: vec![], subagents: vec![], mcp_servers: vec![],
-        labels: Default::default(), options: vec![], cwd: Some(state.cwd.clone()),
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        tools: vec![],
+        ask_tools: vec![],
+        subagents: vec![],
+        mcp_servers: vec![],
+        labels: Default::default(),
+        options: vec![],
+        cwd: Some(state.cwd.clone()),
     };
     let sid = state.rt.session_for(&binding, def).await.unwrap();
 
     let pool = do_storage::DbPool::new(std::path::Path::new(&state.cwd).join("data"));
     let db = pool.object_db("ShellSession", &sid).await.unwrap();
-    db.execute("DROP TABLE agent_control", vec![]).await.unwrap();
+    db.execute("DROP TABLE agent_control", vec![])
+        .await
+        .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
-        "type": "thread.session.stop", "threadId": "t-sdk-stop-fail",
-    }})).await;
+    request(
+        &state,
+        &tx,
+        "orchestration.dispatchCommand",
+        json!({"input": {
+            "type": "thread.session.stop", "threadId": "t-sdk-stop-fail",
+        }}),
+    )
+    .await;
 
-    let exits: Vec<Value> = drain(&mut rx).into_iter().filter(|f| f["_tag"] == "Exit").collect();
-    assert_eq!(exits.len(), 1, "one request must produce exactly one terminal frame: {exits:?}");
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "one request must produce exactly one terminal frame: {exits:?}"
+    );
     assert_eq!(
         exits[0]["exit"]["_tag"], "Failure",
         "a failed SDK durable cancel must not be acknowledged as success: {exits:?}"
     );
-    let defect = exits[0]["exit"]["cause"][0]["defect"].as_str().unwrap_or("");
+    let defect = exits[0]["exit"]["cause"][0]["defect"]
+        .as_str()
+        .unwrap_or("");
     assert!(
         defect.contains("thread.session.stop failed") && defect.contains("agent_control"),
         "the failure should name the SDK stop leg and durable control table: {exits:?}"
@@ -3576,6 +3902,53 @@ async fn settings_writes_publish_on_the_config_stream() {
         ids.contains(&"ollama_local"),
         "the new provider is in the push: {ids:?}"
     );
+}
+
+/// #186: a settings mutation is not successful until the durable config topic
+/// accepts the frame passive subscribers rely on. Persisting the blob and then
+/// logging a failed publish lies to every other window: the caller sees Success
+/// while the config stream never advances.
+#[tokio::test]
+async fn settings_update_fails_when_config_publish_cannot_land() {
+    let dir = std::env::temp_dir().join(format!("t3ct-cfg-fault-{}", uuid::Uuid::new_v4()));
+    let state = state_at_with_bus_fault(&dir, "INSERT OR REPLACE INTO retained").await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "server.updateSettings",
+        json!({"patch": {"providerInstances": {
+            "ollama_local": {
+                "driver": "openaiCompat", "enabled": true, "displayName": "Ollama",
+                "config": {"baseUrl": "http://localhost:11434", "models": ["qwen2.5-coder"]},
+            }
+        }}}),
+    )
+    .await;
+
+    let exits: Vec<Value> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f["_tag"] == "Exit")
+        .collect();
+    assert_eq!(
+        exits.len(),
+        1,
+        "one request must produce one terminal frame: {exits:?}"
+    );
+    assert_eq!(
+        exits[0]["exit"]["_tag"], "Failure",
+        "config publish failure must fail the RPC, not hide behind Success: {exits:?}"
+    );
+    let defect = exits[0]["exit"]["cause"][0]["defect"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        defect.contains("config publish failed")
+            && defect.contains("INSERT OR REPLACE INTO retained"),
+        "failure should name the durable config publish leg: {exits:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// #67: the Diagnostics page's RPCs are implemented, not unsupported —
@@ -4892,15 +5265,27 @@ async fn vcs_snapshot_baseline_survives_a_mutation_before_watch_registration() {
     let cwd = dir.to_string_lossy().into_owned();
     let sh = |c: &str| {
         let out = std::process::Command::new("sh")
-            .arg("-c").arg(c).current_dir(&dir).output().expect("sh");
-        assert!(out.status.success(), "`{c}`: {}", String::from_utf8_lossy(&out.stderr));
+            .arg("-c")
+            .arg(c)
+            .current_dir(&dir)
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "`{c}`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     sh("git config user.email t@t && git config user.name t");
     std::fs::write(dir.join(".gitignore"), "data/\n").unwrap();
     std::fs::write(dir.join("a.txt"), "one\n").unwrap();
     sh("git add -A && git commit -qm base");
 
-    let tail = state.rt.vcs_tail_skip_retained(&cwd).await.expect("vcs tail");
+    let tail = state
+        .rt
+        .vcs_tail_skip_retained(&cwd)
+        .await
+        .expect("vcs tail");
     let (snapshot, baseline) = vcs::status_snapshot_and_fingerprint(&cwd).await;
     assert_eq!(snapshot["_tag"], "snapshot", "{snapshot}");
     assert_eq!(
@@ -4909,7 +5294,11 @@ async fn vcs_snapshot_baseline_survives_a_mutation_before_watch_registration() {
     );
 
     std::fs::write(dir.join("a.txt"), "two\n").unwrap();
-    state.rt.watch_begin("vcs", &cwd, &baseline).await.expect("watch begin");
+    state
+        .rt
+        .watch_begin("vcs", &cwd, &baseline)
+        .await
+        .expect("watch begin");
     let (watched, registered) = state
         .rt
         .watch_marks("vcs")
@@ -4918,14 +5307,24 @@ async fn vcs_snapshot_baseline_survives_a_mutation_before_watch_registration() {
         .into_iter()
         .next()
         .expect("the subscriber registered a watch");
-    assert_eq!(registered, baseline, "watch_begin uses the snapshot's baseline");
+    assert_eq!(
+        registered, baseline,
+        "watch_begin uses the snapshot's baseline"
+    );
 
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    let watcher =
-        tokio::spawn(watch_one_tree(state.clone(), watched, registered, Some(ready_tx)));
+    let watcher = tokio::spawn(watch_one_tree(
+        state.clone(),
+        watched,
+        registered,
+        Some(ready_tx),
+    ));
     ready.await.expect("the watch is placed");
 
-    let items = tail.next(std::time::Duration::from_secs(20)).await.expect("vcs tail read");
+    let items = tail
+        .next(std::time::Duration::from_secs(20))
+        .await
+        .expect("vcs tail read");
     tail.close().await;
     watcher.abort();
     let local = items
@@ -5208,9 +5607,12 @@ async fn cancel_stacked_action_fails_when_control_state_is_unreadable() {
     db.execute("DROP TABLE IF EXISTS agent_control", vec![])
         .await
         .unwrap();
-    db.execute("CREATE TABLE agent_control (run_id TEXT PRIMARY KEY)", vec![])
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE TABLE agent_control (run_id TEXT PRIMARY KEY)",
+        vec![],
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -5280,9 +5682,9 @@ async fn cancelling_an_unknown_stacked_action_id_does_not_poison_a_later_run() {
     .await;
     let frames = drain(&mut run_rx);
     assert!(
-        !frames.iter().any(|f| {
-            f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_cancelled"
-        }),
+        !frames
+            .iter()
+            .any(|f| { f["_tag"] == "Chunk" && f["values"][0]["kind"] == "action_cancelled" }),
         "stale cancel row poisoned the later action: {frames:?}"
     );
     let exit = frames
@@ -5693,7 +6095,9 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
         thread_id,
         "thread.message.assistant.delta",
         json!({ "text": "hello" }),
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
@@ -5702,7 +6106,8 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
     });
 
     let (frame, done) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await.expect("tail delivered a frame")
+        .await
+        .expect("tail delivered a frame")
         .expect("tail channel stayed open");
     let delivered: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(
@@ -5713,20 +6118,25 @@ async fn thread_tail_ack_failure_after_delivery_closes_the_subscription() {
     let pool = do_storage::DbPool::new(dir.join("data").join("threadruntime"));
     let db = pool.object_db("threadruntime", "main").await.unwrap();
     db.execute("DROP TABLE inbox", vec![]).await.unwrap();
-    done.expect("tail frames carry delivery confirmation").send(true)
+    done.expect("tail frames carry delivery confirmation")
+        .send(true)
         .expect("confirm delivery before ack fails");
 
     let (error_frame, _) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await.expect("ack failure is surfaced")
+        .await
+        .expect("ack failure is surfaced")
         .expect("error frame is sent before close");
     let error: Value = serde_json::from_str(&error_frame).unwrap();
-    let msg = error["values"][0]["error"]["message"].as_str().unwrap_or("");
+    let msg = error["values"][0]["error"]["message"]
+        .as_str()
+        .unwrap_or("");
     assert!(
         msg.contains("thread subscription failed"),
         "ack failure must be a visible stream error, not a hidden log: {error}"
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), closed_rx)
-        .await.expect("ack failure closes and runs cleanup")
+        .await
+        .expect("ack failure closes and runs cleanup")
         .expect("cleanup sender fires");
 }
 
@@ -5770,8 +6180,9 @@ async fn the_shell_sequence_continues_across_a_restart_instead_of_rewinding() {
     };
     assert!(mark > 0, "the first process actually advanced the sequence");
 
-    // Second process over the SAME data dir. Nothing is carried in memory —
-    // this is the restart the old counter could not survive.
+    // Fresh AppState over the SAME data dir. This proves durable read/reopen
+    // behavior, not crash recovery; the out-of-process SIGKILL case lives in
+    // `backend/tests/crash_recovery.rs`.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
@@ -5850,7 +6261,9 @@ async fn a_restarted_backend_serves_a_reconnecting_client_from_the_store() {
         }
     }
 
-    // Second process over the same directory — nothing carried in memory.
+    // Fresh AppState over the same directory. This proves durable read/reopen
+    // behavior, not crash recovery; the out-of-process SIGKILL case lives in
+    // `backend/tests/crash_recovery.rs`.
     let state = state_at(&dir).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
@@ -6131,8 +6544,24 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
     );
 
     // They list independently: a thread's drawer must not show a child's PTYs.
-    assert_eq!(state.terminals.list(&thread_owner).await.expect("pane store readable").len(), 1);
-    assert_eq!(state.terminals.list(&child_owner).await.expect("pane store readable").len(), 1);
+    assert_eq!(
+        state
+            .terminals
+            .list(&thread_owner)
+            .await
+            .expect("pane store readable")
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .terminals
+            .list(&child_owner)
+            .await
+            .expect("pane store readable")
+            .len(),
+        1
+    );
 
     // And closing the CHILD leaves the thread's pane alone.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6203,9 +6632,18 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .await
         .expect("pane store readable")
         .expect("registered");
-    let where_a = pane_a.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
-    assert!(where_a.output.contains("sub"), "the shell started in the requested cwd: {where_a:?}");
-    assert!(where_a.output.contains("[a]"), "the launch env reached the shell: {where_a:?}");
+    let where_a = pane_a
+        .runner
+        .run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_a.output.contains("sub"),
+        "the shell started in the requested cwd: {where_a:?}"
+    );
+    assert!(
+        where_a.output.contains("[a]"),
+        "the launch env reached the shell: {where_a:?}"
+    );
 
     // a SECOND pane is a different shell — not the first one's cursor
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6226,10 +6664,22 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .await
         .expect("pane store readable")
         .expect("registered");
-    let where_b = pane_b.runner.run("echo [$PANE]", false, Some(10), false).await;
-    assert!(where_b.output.contains("[b]"), "pane B has its OWN env: {where_b:?}");
-    let recheck_a = pane_a.runner.run("echo [$PANE]", false, Some(10), false).await;
-    assert!(recheck_a.output.contains("[a]"), "pane A is untouched by pane B: {recheck_a:?}");
+    let where_b = pane_b
+        .runner
+        .run("echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_b.output.contains("[b]"),
+        "pane B has its OWN env: {where_b:?}"
+    );
+    let recheck_a = pane_a
+        .runner
+        .run("echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        recheck_a.output.contains("[a]"),
+        "pane A is untouched by pane B: {recheck_a:?}"
+    );
 
     // metadata lists every pane for the thread, including the agent's shell
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -6286,7 +6736,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .await
         .expect("pane store readable")
         .expect("pane A remains registered");
-    let env_after = after.runner.run("echo [$PANE][$LEAKED]", false, Some(10), false).await;
+    let env_after = after
+        .runner
+        .run("echo [$PANE][$LEAKED]", false, Some(10), false)
+        .await;
     assert!(
         env_after.output.contains("[restarted][]"),
         "restart applied the new env and dropped the old exports: {env_after:?}"
@@ -6550,7 +7003,10 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
     }
     let joined = std::env::join_paths(paths).unwrap();
     std::env::set_var("PATH", &joined);
-    let _path_guard = EnvGuard { key: "PATH", old: old_path };
+    let _path_guard = EnvGuard {
+        key: "PATH",
+        old: old_path,
+    };
 
     let state = state_at(&dir).await;
     std::fs::create_dir_all(dir.join("alpha")).unwrap();
@@ -6646,15 +7102,23 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
     )
     .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Success", "fake textmate is installed: {f:?}");
-    let job_id = f[0]["exit"]["value"]["jobId"].as_str().expect("hearth job id");
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Success",
+        "fake textmate is installed: {f:?}"
+    );
+    let job_id = f[0]["exit"]["value"]["jobId"]
+        .as_str()
+        .expect("hearth job id");
     let jobs = state.terminal.list_jobs().await;
     assert!(
         jobs.contains(job_id) && jobs.contains("mate"),
         "editor launch is visible in hearth jobs: {jobs}"
     );
     let killed = state.terminal.kill_job(job_id).await;
-    assert!(killed.contains("killed job"), "editor job is cleanable through hearth: {killed}");
+    assert!(
+        killed.contains("killed job"),
+        "editor job is cleanable through hearth: {killed}"
+    );
 
     // an editor id the contract does not define is refused outright
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -7296,7 +7760,11 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
     )
     .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["exit"]["_tag"], "Failure", "a PTY obeys the same boundary: {:?}", f[0]);
+    assert_eq!(
+        f[0]["exit"]["_tag"], "Failure",
+        "a PTY obeys the same boundary: {:?}",
+        f[0]
+    );
     assert!(
         state
             .terminals
@@ -7391,7 +7859,10 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
     )
     .await;
     let f = drain(&mut rx);
-    assert_eq!(f[0]["values"][0]["type"], "snapshot", "attach opened: {f:?}");
+    assert_eq!(
+        f[0]["values"][0]["type"], "snapshot",
+        "attach opened: {f:?}"
+    );
     let pane = state
         .terminals
         .get(&terminal::TerminalOwner::thread("t-1"), terminal_id)
@@ -7483,9 +7954,18 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
         .await
         .expect("pane store readable")
         .expect("opened");
-    let where_x = pane.runner.run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false).await;
-    assert!(where_x.output.contains("wt"), "the pane landed in the requested worktree: {where_x:?}");
-    assert!(where_x.output.contains("[x]"), "the requested env reached the shell: {where_x:?}");
+    let where_x = pane
+        .runner
+        .run("basename \"$PWD\"; echo [$PANE]", false, Some(10), false)
+        .await;
+    assert!(
+        where_x.output.contains("wt"),
+        "the pane landed in the requested worktree: {where_x:?}"
+    );
+    assert!(
+        where_x.output.contains("[x]"),
+        "the requested env reached the shell: {where_x:?}"
+    );
 }
 
 /// PROOF (#225): a no-selection turn is admitted against the LIVE catalog.
@@ -7809,7 +8289,9 @@ async fn an_answered_question_is_a_replayable_resolved_activity() {
     state.rt.save_thread(&thread).await.unwrap();
     let before = state.rt.current_sequence().await.unwrap();
 
-    publish_user_input_resolved(&state, "t-ui", "sess-9").await.unwrap();
+    publish_user_input_resolved(&state, "t-ui", "sess-9")
+        .await
+        .unwrap();
 
     let replayed = state.rt.events_after("t-ui", before, 100).await.unwrap();
     let ev = replayed
@@ -7965,7 +8447,9 @@ async fn user_input_resolved_projection_failure_is_not_reported_as_applied() {
     let def = AgentDefinition {
         name: "t3code".into(),
         instructions: "".into(),
-        model: ModelRef::ClaudeResume { model: "test".into() },
+        model: ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
         tools: vec![],
         ask_tools: vec![],
         subagents: vec![],
@@ -8064,7 +8548,9 @@ async fn the_shell_snapshot_reads_threads_from_the_durable_store() {
     // counter can name a sequence whose frame is not written yet, and a
     // snapshot taken after that read does not contain it, so a tail
     // suppressing `<= mark` would swallow it.
-    let mark = snap["values"][0]["snapshot"]["snapshotSequence"].as_i64().unwrap();
+    let mark = snap["values"][0]["snapshot"]["snapshotSequence"]
+        .as_i64()
+        .unwrap();
     assert_eq!(
         mark,
         state.rt.shell_sequence().await.unwrap(),
@@ -8099,7 +8585,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         "the seeded project carries createdAt: {projects_a:#?}"
     );
 
-    // Second process over the SAME data dir. If projects were still a
+    // Fresh AppState over the SAME data dir. If projects were still a
     // boot-time constant on `Store`, this snapshot would carry a fresh
     // `createdAt` for the same id — the divergence the finding names.
     // Instead, the second process's boot check sees the row already
@@ -8451,7 +8937,11 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     let summaries = checkpoint_summaries(&state, &state.cwd)
         .await
         .expect("checkpoint summaries are readable");
-    assert_eq!(summaries.len(), 3, "three turns, three checkpoints: {summaries:#?}");
+    assert_eq!(
+        summaries.len(),
+        3,
+        "three turns, three checkpoints: {summaries:#?}"
+    );
 
     // ORDER: newest first, and turnCount counts from 1 at the newest.
     assert_eq!(
@@ -8468,7 +8958,11 @@ async fn turn_count_one_is_the_most_recent_turn_not_the_oldest() {
     // ROUND TRIP: reverting turnCount 1 restores what turn-3 started from —
     // "v2" — not "v0". Under the inversion this restored v0 and threw away
     // two turns of work.
-    state.rt.save_thread(&thread_row_ck("t-order")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-order"))
+        .await
+        .unwrap();
     revert_checkpoint(&state, "t-order", 1).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap().trim(),
@@ -8708,7 +9202,10 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     // OUT OF BAND: a real process edit, not a runtime write. Nothing told the
     // backend this happened.
     let out = std::process::Command::new("sh")
-        .args(["-c", "sed 's/before/after/' oob.txt > oob.txt.tmp && mv oob.txt.tmp oob.txt"])
+        .args([
+            "-c",
+            "sed 's/before/after/' oob.txt > oob.txt.tmp && mv oob.txt.tmp oob.txt",
+        ])
         .current_dir(&state.cwd)
         .output()
         .expect("out-of-band edit");
@@ -8720,12 +9217,23 @@ async fn an_out_of_band_edit_is_in_the_cairn_diff_and_restores_after_a_restart()
     let summaries = checkpoint_summaries(&state, &state.cwd)
         .await
         .expect("checkpoint summaries are readable");
-    let cp = summaries.iter().find(|c| c["turnId"] == "turn-oob").expect("the turn's checkpoint");
-    let named: Vec<&str> = cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
-    assert!(named.contains(&"oob.txt"), "an out-of-band edit must be reviewable: {named:?}");
+    let cp = summaries
+        .iter()
+        .find(|c| c["turnId"] == "turn-oob")
+        .expect("the turn's checkpoint");
+    let named: Vec<&str> = cp["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(
+        named.contains(&"oob.txt"),
+        "an out-of-band edit must be reviewable: {named:?}"
+    );
 
-    // RESTART: a second AppState over the same directory, as a new process
-    // would see it. The stack is in the repository, so it is still there.
+    // REOPEN: a second AppState over the same directory, exercising the
+    // durable read path. The stack is in the repository, so it is still there.
     drop(state);
     let state2 = state_at(&dir).await;
     let after_restart = checkpoint_summaries(&state2, &state2.cwd)
@@ -8810,10 +9318,20 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
     let summaries = checkpoint_summaries(&state, &state.cwd)
         .await
         .expect("checkpoint summaries are readable");
-    let cp = summaries.iter().find(|c| c["turnId"] == "turn-scope").expect("the checkpoint");
-    let named: Vec<&str> =
-        cp["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
-    assert!(named.contains(&"src.txt"), "the turn's real edit is reviewable: {named:?}");
+    let cp = summaries
+        .iter()
+        .find(|c| c["turnId"] == "turn-scope")
+        .expect("the checkpoint");
+    let named: Vec<&str> = cp["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(
+        named.contains(&"src.txt"),
+        "the turn's real edit is reviewable: {named:?}"
+    );
     assert!(
         !named.iter().any(|p| p.starts_with("data/")),
         "runtime state must not be in the review: {named:?}"
@@ -8855,7 +9373,11 @@ fn init_git_repo(cwd: &str) {
         vec!["config", "user.email", "t@t"],
         vec!["config", "user.name", "t"],
     ] {
-        std::process::Command::new("git").args(&args).current_dir(cwd).output().unwrap();
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
     }
 }
 
@@ -8867,7 +9389,11 @@ async fn root_checkpointed_thread(
     init_git_repo(&state.cwd);
     let file = std::path::Path::new(&state.cwd).join(filename);
     std::fs::write(&file, "before\n").unwrap();
-    state.rt.save_thread(&thread_row_ck(thread_id)).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck(thread_id))
+        .await
+        .unwrap();
     checkpoint_turn_start(state, &state.cwd, "turn-1").await;
     std::fs::write(&file, "after\n").unwrap();
     file
@@ -8882,7 +9408,10 @@ async fn get_turn_diff_exit(state: &AppState, thread_id: &str) -> Value {
         json!({ "input": { "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1 } }),
     )
     .await;
-    drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("getTurnDiff exit")
+    drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("getTurnDiff exit")
 }
 
 async fn revert_dispatch_exit(state: &AppState, thread_id: &str) -> Value {
@@ -8898,7 +9427,10 @@ async fn revert_dispatch_exit(state: &AppState, thread_id: &str) -> Value {
         }}),
     )
     .await;
-    drain(&mut rx).into_iter().find(|f| f["_tag"] == "Exit").expect("dispatch exit")
+    drain(&mut rx)
+        .into_iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("dispatch exit")
 }
 
 #[tokio::test]
@@ -8917,7 +9449,10 @@ async fn diff_and_revert_refuse_corrupt_thread_mapping_without_touching_workspac
         .unwrap();
 
     let diff = get_turn_diff_exit(&state, "t-corrupt-map").await;
-    assert_eq!(diff["exit"]["_tag"], "Failure", "corrupt mapping must fail diff: {diff}");
+    assert_eq!(
+        diff["exit"]["_tag"], "Failure",
+        "corrupt mapping must fail diff: {diff}"
+    );
     assert_eq!(
         diff["exit"]["cause"][0]["error"]["_tag"],
         "OrchestrationGetTurnDiffError"
@@ -8931,7 +9466,10 @@ async fn diff_and_revert_refuse_corrupt_thread_mapping_without_touching_workspac
     );
 
     let reverted = revert_dispatch_exit(&state, "t-corrupt-map").await;
-    assert_eq!(reverted["exit"]["_tag"], "Failure", "corrupt mapping must fail revert: {reverted}");
+    assert_eq!(
+        reverted["exit"]["_tag"], "Failure",
+        "corrupt mapping must fail revert: {reverted}"
+    );
     assert_eq!(
         reverted["exit"]["cause"][0]["error"]["_tag"],
         "OrchestrationDispatchCommandError"
@@ -8951,12 +9489,18 @@ async fn diff_and_revert_refuse_stale_thread_id_without_touching_workspace() {
         .rt
         .store()
         .db()
-        .execute("DELETE FROM threads WHERE id = ?", vec![json!("t-stale-map")])
+        .execute(
+            "DELETE FROM threads WHERE id = ?",
+            vec![json!("t-stale-map")],
+        )
         .await
         .unwrap();
 
     let diff = get_turn_diff_exit(&state, "t-stale-map").await;
-    assert_eq!(diff["exit"]["_tag"], "Failure", "stale thread must fail diff: {diff}");
+    assert_eq!(
+        diff["exit"]["_tag"], "Failure",
+        "stale thread must fail diff: {diff}"
+    );
     assert_eq!(
         diff["exit"]["cause"][0]["error"]["_tag"],
         "OrchestrationGetTurnDiffError"
@@ -8970,7 +9514,10 @@ async fn diff_and_revert_refuse_stale_thread_id_without_touching_workspace() {
     );
 
     let reverted = revert_dispatch_exit(&state, "t-stale-map").await;
-    assert_eq!(reverted["exit"]["_tag"], "Failure", "stale thread must fail revert: {reverted}");
+    assert_eq!(
+        reverted["exit"]["_tag"], "Failure",
+        "stale thread must fail revert: {reverted}"
+    );
     assert_eq!(
         reverted["exit"]["cause"][0]["error"]["_tag"],
         "OrchestrationDispatchCommandError"
@@ -8993,7 +9540,11 @@ async fn checkpoint_revert_reports_completed_event_failure_after_mutation() {
     let file = std::path::Path::new(&state.cwd).join("completed.txt");
     std::fs::write(&file, "before\n").unwrap();
 
-    state.rt.save_thread(&thread_row_ck("t-complete-fail")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-complete-fail"))
+        .await
+        .unwrap();
     checkpoint_turn_start(&state, &state.cwd.clone(), "turn-1").await;
     std::fs::write(&file, "after\n").unwrap();
 
@@ -9020,7 +9571,11 @@ async fn checkpoint_revert_reports_completed_event_failure_after_mutation() {
 async fn checkpoint_revert_reports_failed_event_write_failure() {
     let (state, dir) = test_state().await;
     init_git_repo(&state.cwd);
-    state.rt.save_thread(&thread_row_ck("t-failed-event")).await.unwrap();
+    state
+        .rt
+        .save_thread(&thread_row_ck("t-failed-event"))
+        .await
+        .unwrap();
     drop_thread_event_table(&dir).await;
 
     let err = revert_checkpoint(&state, "t-failed-event", 0)
@@ -9244,9 +9799,15 @@ async fn the_orchestration_query_rpcs_are_served_from_durable_state() {
     // A stale thread id is not permission to diff the environment root. The
     // root has a valid checkpoint above, so the old `thread_cwd` fallback would
     // have returned Success with t-stale attached to t-q's workspace diff.
-    let ex = call("orchestration.getTurnDiff",
-        json!({ "threadId": "t-stale", "fromTurnCount": 0, "toTurnCount": 1 })).await;
-    assert_eq!(ex["exit"]["_tag"], "Failure", "stale thread must fail before root diff: {ex}");
+    let ex = call(
+        "orchestration.getTurnDiff",
+        json!({ "threadId": "t-stale", "fromTurnCount": 0, "toTurnCount": 1 }),
+    )
+    .await;
+    assert_eq!(
+        ex["exit"]["_tag"], "Failure",
+        "stale thread must fail before root diff: {ex}"
+    );
     let stale_msg = ex["exit"]["cause"].to_string();
     assert!(
         stale_msg.contains("unknown thread") || stale_msg.contains("thread mapping"),
@@ -9416,6 +9977,75 @@ impl agent_sdk_core::Model for Spinner {
     }
 }
 
+/// #237: `run_turn` must not read the display/quarantine thread snapshot and
+/// then invent runtime defaults when the durable row is malformed. Launch
+/// records an explicit durable failure and never creates a provider session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_launch_with_malformed_durable_thread_row_fails_without_defaults() {
+    let dir = std::env::temp_dir().join(format!("t3ct-launch-fault-{}", uuid::Uuid::new_v4()));
+    let state = state_at_with_model(&dir, || Box::new(Spinner)).await;
+    state
+        .rt
+        .save_thread(&json!({
+            "id": "t-bad-row", "projectId": "p-workspace", "title": "bad row",
+            "modelSelection": {"instanceId": "claude_resume:test", "modelKey": "k"},
+            "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+
+    super::run_turn(
+        json!({
+            "threadId": "t-bad-row",
+            "message": {"text": "do not run", "messageId": "u-bad-row"},
+            "modelSelection": {"instanceId": "claude_resume:test", "modelKey": "k"}
+        }),
+        ModelRef::ClaudeResume {
+            model: "test".into(),
+        },
+        state.clone(),
+    );
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = state.rt.events_after("t-bad-row", 0, 100).await.unwrap();
+        if events.iter().any(|e| {
+            e["event"]["type"] == "thread.activity-appended"
+                && e["event"]["payload"]["activity"]["kind"] == "turn.launch-failed"
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let launch_failure = events
+        .iter()
+        .find(|e| {
+            e["event"]["type"] == "thread.activity-appended"
+                && e["event"]["payload"]["activity"]["kind"] == "turn.launch-failed"
+        })
+        .unwrap_or_else(|| panic!("no launch failure event: {events:#?}"));
+    let summary = launch_failure["event"]["payload"]["activity"]["summary"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        summary.contains("durable thread row unreadable")
+            && summary.contains("runtimeMode")
+            && !summary.contains("full-access"),
+        "the launch failure must name the durable authority gap: {launch_failure}"
+    );
+    assert!(
+        state
+            .rt
+            .sessions_for_thread("t-bad-row")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a guessed provider binding must not create a session"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// PROOF (#411): a WS `Interrupt` frame CANCELS A RUNNING TURN.
 ///
 /// The previous version of this test seeded a thread row and asserted that no
@@ -9477,7 +10107,12 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
     // the one the old test never created.
     state.rt.session_for(&binding, def.clone()).await.unwrap();
     assert!(
-        !state.rt.sessions_for_thread("t-int-live").await.unwrap().is_empty(),
+        !state
+            .rt
+            .sessions_for_thread("t-int-live")
+            .await
+            .unwrap()
+            .is_empty(),
         "PRECONDITION: the interrupt has a session to reach. Without this the \
          test passes against a no-op, which is exactly how the previous one did."
     );
@@ -9502,9 +10137,18 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert!(running, "the turn must be running before the interrupt is meaningful");
-    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
-    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    assert!(
+        running,
+        "the turn must be running before the interrupt is meaningful"
+    );
+    let ready = state
+        .terminal
+        .run("echo ready", false, Some(10), false)
+        .await;
+    assert!(
+        ready.output.contains("ready"),
+        "precondition: live shell exists: {ready:?}"
+    );
 
     // THE WIRE FRAME. Same shape the Effect RPC client sends on stop.
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -9789,9 +10433,18 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert!(running, "the turn must be running before the interrupt is meaningful");
-    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
-    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    assert!(
+        running,
+        "the turn must be running before the interrupt is meaningful"
+    );
+    let ready = state
+        .terminal
+        .run("echo ready", false, Some(10), false)
+        .await;
+    assert!(
+        ready.output.contains("ready"),
+        "precondition: live shell exists: {ready:?}"
+    );
 
     // THE MISROUTED FRAME: well-formed, known tag, but a thread that is not
     // the one running.
@@ -9832,13 +10485,23 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
     let (state, _d) = test_state().await;
     // Seed a thread so `state.rt.interrupt` has a real row to look up
     // (interrupt on an unknown thread is a no-op, not an error).
-    state.rt.save_thread(&json!({ "runtimeMode": "full-access",
-        "id": "t-int", "projectId": "p-workspace", "title": "int",
-        "modelSelection": null, "interactionMode": "default",
-        "createdAt": now_iso(), "updatedAt": now_iso(),
-    })).await.unwrap();
-    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
-    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    state
+        .rt
+        .save_thread(&json!({ "runtimeMode": "full-access",
+            "id": "t-int", "projectId": "p-workspace", "title": "int",
+            "modelSelection": null, "interactionMode": "default",
+            "createdAt": now_iso(), "updatedAt": now_iso(),
+        }))
+        .await
+        .unwrap();
+    let ready = state
+        .terminal
+        .run("echo ready", false, Some(10), false)
+        .await;
+    assert!(
+        ready.output.contains("ready"),
+        "precondition: live shell exists: {ready:?}"
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     // Effect RPC embeds the original payload alongside the request id;
@@ -9886,11 +10549,17 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
 /// instead of dropping the error while the UI already believes stop landed.
 #[tokio::test]
 async fn ws_interrupt_frame_reports_runtime_cancel_failure() {
-    use agent_sdk_do::ObjectDb;
     use super::dispatch_ws_frame;
+    use agent_sdk_do::ObjectDb;
     let (state, _d) = test_state().await;
-    let ready = state.terminal.run("echo ready", false, Some(10), false).await;
-    assert!(ready.output.contains("ready"), "precondition: live shell exists: {ready:?}");
+    let ready = state
+        .terminal
+        .run("echo ready", false, Some(10), false)
+        .await;
+    assert!(
+        ready.output.contains("ready"),
+        "precondition: live shell exists: {ready:?}"
+    );
     state
         .rt
         .store()
@@ -9913,7 +10582,11 @@ async fn ws_interrupt_frame_reports_runtime_cancel_failure() {
 
     let frames = drain(&mut rx);
     let exits: Vec<&Value> = frames.iter().filter(|f| f["_tag"] == "Exit").collect();
-    assert_eq!(exits.len(), 1, "raw Interrupt failure must be visible once: {frames:?}");
+    assert_eq!(
+        exits.len(),
+        1,
+        "raw Interrupt failure must be visible once: {frames:?}"
+    );
     assert_eq!(
         exits[0]["exit"]["_tag"], "Failure",
         "raw Interrupt runtime failure must not be silent: {frames:?}"
