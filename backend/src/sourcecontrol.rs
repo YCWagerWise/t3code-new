@@ -352,14 +352,21 @@ pub async fn lookup_repository(input: &Value) -> Result<Value, String> {
     // `ExecPolicy`, sandbox, timeout and output ceiling every other cairn
     // consumer gets, which is also what finally makes `ExecPolicy::git_only()`
     // mean something on this path.
-    let v: Value = cairn::gh_repo_view(repository, &cairn::Config::default())
+    // cairn returns a TYPED `GitHubRepository` now, not a `Value`. That is why the
+    // three `unwrap_or` defaults below are GONE rather than ported:
+    // `name_with_owner`, `url` and `ssh_url` are non-optional fields, so a gh
+    // response missing any of them fails cairn's own decode and never reaches
+    // this function. Re-adding the defaults would re-open a fail-OPEN path the
+    // engine just closed, and an empty `sshUrl` standing in for a real remote is
+    // how a clone ends up silently pointed at nothing.
+    let v = cairn::gh_repo_view(repository, &cairn::Config::default())
         .await
         .map_err(|e| e.to_string())?;
     Ok(json!({
         "provider": "github",
-        "nameWithOwner": v.get("nameWithOwner").cloned().unwrap_or(json!(repository)),
-        "url": v.get("url").cloned().unwrap_or(json!("")),
-        "sshUrl": v.get("sshUrl").cloned().unwrap_or(json!("")),
+        "nameWithOwner": v.name_with_owner,
+        "url": v.url,
+        "sshUrl": v.ssh_url,
     }))
 }
 
