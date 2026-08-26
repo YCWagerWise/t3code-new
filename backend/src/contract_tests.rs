@@ -73,6 +73,28 @@ async fn drop_threads_table(state: &AppState) {
     db.execute("DROP TABLE threads", vec![]).await.unwrap();
 }
 
+async fn create_empty_shell_approval_table(state: &AppState, session: &str) {
+    let pool = agent_sdk_shell::pool::pool_for(
+        std::path::Path::new(&state.cwd).join("data"),
+    )
+    .unwrap();
+    let db = pool.object_db("ShellSession", session).await.unwrap();
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS approval (
+            run_id TEXT NOT NULL,
+            turn INTEGER NOT NULL,
+            ext_call_id TEXT NOT NULL,
+            tool TEXT,
+            args TEXT,
+            status TEXT NOT NULL,
+            created_at INTEGER DEFAULT (unixepoch()),
+            resolved_at INTEGER
+        )",
+    )
+    .await
+    .unwrap();
+}
+
 /// #202: break the broker's subscriber table so every `topic_publish` fails.
 ///
 /// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
@@ -8446,6 +8468,7 @@ async fn an_approval_that_matched_no_pending_request_fails_the_rpc() {
         }))
         .await
         .unwrap();
+    create_empty_shell_approval_table(&state, "missing-session").await;
     let before = state.rt.current_sequence().await.unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();

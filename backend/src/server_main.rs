@@ -2735,7 +2735,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // no approvals when the store is damaged hides a parked run
                 // behind a UI that looks idle, so the subscription errors
                 // instead of quietly rendering a lie.
-                let pending = match state.rt.pending_approvals(thread_id).await {
+                let pending = match state.rt.pending_approvals_typed(thread_id).await {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::error!(%e, %thread_id, "pending approvals unreadable");
@@ -2760,17 +2760,15 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 let mut activities: Vec<Value> = pending
                     .iter()
                     .map(|a| {
+                        let created_at = a.created_at_secs.to_string();
                         approval_requested_activity(
-                            a["sessionId"].as_str().unwrap_or(""),
-                            a["turn"].as_i64().unwrap_or(0),
-                            a["call_id"]
-                                .as_str()
-                                .or_else(|| a["callId"].as_str())
-                                .unwrap_or(""),
-                            a["tool"].as_str().unwrap_or(""),
-                            a.get("args").unwrap_or(&Value::Null),
+                            &a.session_id,
+                            a.turn,
+                            &a.call_id,
+                            a.tool.as_deref().unwrap_or(""),
+                            &a.args,
                             None,
-                            &now,
+                            &created_at,
                         )
                     })
                     .collect();
