@@ -129,35 +129,58 @@ test.describe("preview.toggle (ungated, reachable today)", () => {
   });
 
   /**
-   * THIS ONE IS NOT BLOCKED AND IT IS THE REASON THIS FILE FOUND A DEFECT.
+   * THIS ONE IS NOT BLOCKED AND IT RUNS.
    *
-   * `preview.toggle` is advertised with NO `when` guard, so unlike the five
-   * above a user can actually reach it. It is the precondition for all of them,
-   * so if it silently does nothing they are unreachable by construction. That is
-   * a live product claim, testable today, and it runs.
+   * `preview.toggle` is advertised with NO `when` guard
+   * (backend/src/keybindings.rs:96), so unlike the five above a user can
+   * actually reach it. The client handles it at
+   * apps/web/src/routes/_chat.tsx:111:
+   *
+   *     if (command === "preview.toggle") {
+   *       event.preventDefault();
+   *       if (!routeThreadRef) return;                 // <- SILENT
+   *       if (!isPreviewSupportedInRuntime()) {
+   *         toastManager.add({ title: "Preview is desktop-only", ... });
+   *         return;
+   *       }
+   *       dispatchPreviewAction("toggle-panel");
+   *     }
+   *
+   * In a browser the honest outcomes are a desktop-only TOAST, or a preview
+   * PANEL on desktop. The one outcome a user must never get from an advertised,
+   * ungated keybinding is SILENCE.
+   *
+   * This asserts feedback-or-panel and WAITS for it. An earlier version of this
+   * test compared body innerText immediately before and after the keypress with
+   * no wait, and "reported" silence it had not actually observed — a toast that
+   * had not rendered yet is indistinguishable from no toast. That is the same
+   * racy-DOM defect this channel filed as #435, and it was mine.
    */
-  test("009b preview.toggle is advertised to the client and must not silently do nothing", async ({
-    page,
-  }) => {
-    const advertised = await page.evaluate(async () => {
-      // Read what the SERVER advertises, not what the client hardcodes.
-      const res = await fetch("/api/keybindings").catch(() => null);
-      return res && res.ok ? await res.json().catch(() => null) : null;
-    });
-    // The binding's existence is asserted from the backend source regardless of
-    // whether this route exists; see the header. What must hold at the glass is
-    // that pressing it either opens something or reports why it cannot.
-    const before = await page.locator("body").innerText();
+  test("009b preview.toggle must give the user feedback, never silence", async ({ page }) => {
+    const panel = page.locator('[data-preview-pane], iframe[title*="preview" i]').first();
+    // Match the toast by its own copy, not by a container class that other
+    // toasts share — otherwise an unrelated toast passes this test.
+    const desktopOnlyToast = page.getByText(/Preview is desktop-only/i).first();
+
     await page.keyboard.press("ControlOrMeta+Shift+J");
-    const after = await page.locator("body").innerText();
+
+    const outcome = await Promise.race([
+      panel.waitFor({ state: "visible", timeout: 15_000 }).then(() => "panel" as const),
+      desktopOnlyToast.waitFor({ state: "visible", timeout: 15_000 }).then(() => "toast" as const),
+    ]).catch(() => "silence" as const);
+
     expect(
-      after !== before,
-      "pressing the advertised, UNGATED preview.toggle (mod+shift+j) changed nothing " +
-        "in the UI. The backend advertises this keybinding (keybindings.rs:96) while " +
-        "implementing none of the ten preview.* RPCs the contract declares " +
-        "(rpc.ts:271-280), so the command is dead on arrival: no pane, no error, no " +
-        "feedback. Either implement the preview surface or stop advertising the " +
-        `binding. (advertised payload: ${JSON.stringify(advertised)?.slice(0, 200)})`,
-    ).toBe(true);
+      outcome,
+      "the backend advertises preview.toggle as an UNGATED keybinding " +
+        "(backend/src/keybindings.rs:96) while implementing NONE of the ten " +
+        "preview.* RPCs the contract declares (packages/contracts/src/rpc.ts:271-280). " +
+        "Pressing mod+shift+j produced neither a preview panel nor the desktop-only " +
+        "toast. The client returns silently when routeThreadRef is null " +
+        "(apps/web/src/routes/_chat.tsx:114), so on this route the command is dead " +
+        "on arrival: no pane, no toast, no error. Either give this path feedback or " +
+        "stop advertising the binding.",
+    ).not.toBe("silence");
+
+    console.log(`009b outcome: ${outcome}`);
   });
 });
