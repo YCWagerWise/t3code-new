@@ -196,6 +196,15 @@ struct AppState {
     /// transcripts, so the test either asserts nothing or asserts whatever
     /// happens to be on the machine (#328).
     usage_sources: Arc<Vec<agent_sdk_usage::SourceSpec>>,
+    /// How many spawned `Request` tasks are alive right now (#476).
+    ///
+    /// An OBSERVABLE, not a control: nothing reads it to make a decision, so it
+    /// cannot change behaviour. It exists because "the request task died with
+    /// its socket" is otherwise unfalsifiable — a detached task and an owned one
+    /// are byte-identical on the wire, and the difference only appears much
+    /// later as a leak. Decremented by a Drop guard so an ABORT still counts,
+    /// which is the whole case under test.
+    inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
     env: Value,
     cwd: String,
     project_name: String,
@@ -510,6 +519,7 @@ async fn main() {
         .await
         .expect("asset signing key");
     let state = AppState {
+        inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         rt,
         catalog,
         checkpoints,
@@ -1683,7 +1693,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
+    // #476: in-flight `Request` tasks, OWNED BY THIS SOCKET.
+    //
+    // A bare `tokio::spawn` fixes #432's starvation and opens a leak on the same
+    // line: the task is DETACHED, so a client that disconnects mid-stream leaves
+    // `orchestration.subscribeThread` attached to a durable tail, writing into a
+    // `tx` whose receiver is gone and holding an `AppState` clone forever.
+    // Reconnect and there are two. Serialization was the backpressure; removing
+    // it without putting ownership in its place trades a wedge for an unbounded
+    // leak on the exact path #27 is about.
+    //
+    // A `JoinSet` makes the lifetime structural instead of hoping the task ends:
+    // it is owned by this function, so it cannot outlive the connection. The
+    // design is claude-4e91's and it is better than the bare spawn I wrote.
+    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     while let Some(Ok(msg)) = stream.next().await {
+        // Reap finished tasks. A `JoinSet` keeps a completed task's slot until it
+        // is joined, so without this a long-lived socket grows one slot per
+        // request for its whole life — slower than the detached leak, still a leak.
+        while inflight.try_join_next().is_some() {}
         match msg {
             Message::Text(text) => {
                 let frame: Value = match serde_json::from_str(&text) {
@@ -1748,7 +1777,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if frame.get("_tag").and_then(|t| t.as_str()) == Some("Request") {
                     let tx = tx.clone();
                     let state = state.clone();
-                    tokio::spawn(async move {
+                    inflight.spawn(async move {
+                        // The counter is decremented by a GUARD, not by a
+                        // statement at the end of the block: a trailing statement
+                        // does not run when the task is ABORTED, and abort is
+                        // exactly the path #476 exists to observe.
+                        struct Inflight(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for Inflight {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        state
+                            .inflight_requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _guard = Inflight(state.inflight_requests.clone());
                         dispatch_ws_frame(frame, &tx, &state).await;
                     });
                 } else {
@@ -1766,6 +1809,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
     tracing::info!("ws: client closed");
+    // #476: take the in-flight requests down WITH the socket. Dropping the set
+    // aborts them anyway, but awaiting the shutdown means they are actually gone
+    // before this function returns, so the invariant is observable rather than
+    // merely eventual.
+    inflight.shutdown().await;
     writer.abort();
 }
 
