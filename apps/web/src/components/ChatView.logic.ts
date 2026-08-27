@@ -464,6 +464,29 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
+/**
+ * Whether an attempt is in flight right now.
+ *
+ * The provider binding is immutable WITHIN an attempt and free BETWEEN settled ones — that is
+ * the channel's headline contract. Keying the lock to whether the thread ever started instead
+ * made it permanent: a conversation that ran once could never move to another provider again,
+ * even with the turn long finished, which is the opposite of "switches only between settled
+ * turns".
+ *
+ * A turn that is waiting on an approval or on user input is still IN FLIGHT — the session is
+ * driving it and its binding must not move underneath it. That is why the session's active
+ * turn counts, not just `latestTurn.state`: those waits live inside a running turn rather than
+ * appearing as their own turn state.
+ */
+export function attemptInFlight(thread: Thread | null | undefined): boolean {
+  if (!thread) return false;
+  const session = thread.session;
+  if (session && session.status === "running" && session.activeTurnId !== null) {
+    return true;
+  }
+  return thread.latestTurn?.state === "running";
+}
+
 // `threadProvider` is the open branded driver kind carried by the session.
 // Unknown driver kinds degrade to `null` (i.e. "unlocked"), which is the safe
 // rollback / fork behavior — the routing layer is the right place to surface
@@ -482,6 +505,11 @@ export function deriveLockedProvider(input: {
   threadProvider: string | null;
 }): ProviderDriverKind | null {
   if (!threadHasStarted(input.thread)) {
+    return null;
+  }
+  // Settled attempts do not constrain the next one. Without this the lock was thread-lifetime,
+  // so a thread that had ever started stayed pinned to its first provider permanently.
+  if (!attemptInFlight(input.thread)) {
     return null;
   }
   const sessionProvider = input.thread?.session?.providerName ?? null;

@@ -17,7 +17,10 @@ import {
   buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
+  attemptInFlight,
   deriveComposerSendState,
+  deriveLockedProvider,
+  threadHasStarted,
   dismissBranchMismatchForSession,
   ENVIRONMENT_RECONNECT_WARNING_GRACE_MS,
   getStartedThreadModelChangeBlockReason,
@@ -939,5 +942,68 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingApproval: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingUserInput: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, threadError: "failed" })).toBe(true);
+  });
+});
+
+/**
+ * Finding #38. The provider lock was thread-lifetime: any thread that had ever started stayed
+ * pinned to its first provider forever, so "switches only between settled turns" was in
+ * practice "never switches again". These pin the boundary at attempt settlement instead.
+ */
+describe("deriveLockedProvider is attempt-scoped, not thread-scoped", () => {
+  const threadWith = (input: {
+    latestTurnState?: "running" | "interrupted" | "completed" | "error";
+    sessionStatus?: "starting" | "running" | "stopped" | "error";
+    activeTurnId?: string | null;
+  }) =>
+    ({
+      messages: [{ id: "m1" }],
+      latestTurn: input.latestTurnState === undefined ? null : { state: input.latestTurnState },
+      session:
+        input.sessionStatus === undefined
+          ? null
+          : {
+              status: input.sessionStatus,
+              activeTurnId: input.activeTurnId ?? null,
+              providerName: "claudeAgent",
+            },
+    }) as never;
+
+  const lockFor = (thread: never) =>
+    deriveLockedProvider({ thread, selectedProvider: null, threadProvider: "claudeAgent" });
+
+  it("locks while a turn is running, so a binding cannot move mid-attempt", () => {
+    expect(attemptInFlight(threadWith({ latestTurnState: "running" }))).toBe(true);
+    expect(lockFor(threadWith({ latestTurnState: "running" }))).toEqual("claudeAgent");
+  });
+
+  it("locks while the session drives a turn, which is where approval and input waits live", () => {
+    const waiting = threadWith({
+      latestTurnState: "running",
+      sessionStatus: "running",
+      activeTurnId: "turn-1",
+    });
+    expect(attemptInFlight(waiting)).toBe(true);
+    expect(lockFor(waiting)).toEqual("claudeAgent");
+  });
+
+  it("releases on every settled terminal state, so the next attempt may choose again", () => {
+    for (const state of ["completed", "interrupted", "error"] as const) {
+      const settled = threadWith({ latestTurnState: state });
+      expect(attemptInFlight(settled)).toBe(false);
+      // The thread HAS started — this is exactly the case the old rule locked forever.
+      expect(threadHasStarted(settled)).toBe(true);
+      expect(lockFor(settled)).toBeNull();
+    }
+  });
+
+  it("releases when a live session sits idle between turns", () => {
+    const idle = threadWith({
+      latestTurnState: "completed",
+      sessionStatus: "running",
+      activeTurnId: null,
+    });
+    expect(attemptInFlight(idle)).toBe(false);
+    expect(lockFor(idle)).toBeNull();
   });
 });
