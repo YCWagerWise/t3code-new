@@ -11788,3 +11788,130 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
         "the failure does not distinguish the close from the fanout: {closed:?}"
     );
 }
+
+/// PROOF (#432): the WS read loop keeps reading while a request is in flight.
+///
+/// THE FAILURE THIS PINS, and why nothing already in this file could see it.
+/// Every other WS test here drives `dispatch_ws_frame` (or `handle_request`)
+/// directly. That is a function call, so it *cannot* observe a defect that
+/// lives in the loop ABOVE it — and the read loop is where this one lives:
+///
+///     while let Some(msg) = reader.next().await {
+///         ...
+///         dispatch_ws_frame(frame, &tx, &state).await;   // <-- same task
+///     }
+///
+/// Reader and handler were one task, so nothing was read from the socket while
+/// a handler ran. The frames that exist *specifically* to arrive during a long
+/// request were therefore unreachable by construction:
+///
+///   * `Interrupt` (#411) — the stop button. Its only purpose is to reach a
+///     request that is still running. Serialized, the earliest it can be read
+///     is after the thing it was cancelling has already finished.
+///   * `Ack` — Effect RPC's per-chunk flow-control frame.
+///   * every later `Request` on that socket, which is why one wedged handler
+///     presents as "the entire app hung".
+///
+/// This is the same lesson as #404 ("87 backend tests were green against that
+/// exact binary because every one of them drives ONE request at a time"), one
+/// layer up, so this test binds the REAL router with `build_app` and speaks
+/// real WebSocket to it.
+///
+/// THE ASSERTION IS AN ORDERING, NOT A TIMING THRESHOLD. A "responded within
+/// N ms" test buys a flake on a loaded box and proves less. Here: three slow
+/// requests are pipelined, then a `Ping`. Under the old serialized loop the
+/// Pong CANNOT come back before the third Exit — the loop has not read the
+/// Ping yet. Concurrently, the Pong overtakes them, because Ping needs no
+/// state and the slow requests are still working. Overtaking is the property;
+/// how fast is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_read_loop_answers_a_ping_while_slow_requests_are_still_running() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (state, _dir) = test_state().await;
+    let app = super::build_app(state);
+
+    // Port 0: the OS picks, so concurrent cells do not collide on a constant.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut sock, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("the real router must accept a WS upgrade on /ws");
+
+    // `server.getProcessDiagnostics` forks `ps` and awaits it — a genuinely
+    // slow, genuinely real handler. Deliberately NOT a test-only sleep method:
+    // a backdoor added to make a transport test pass would prove the backdoor.
+    const SLOW: usize = 3;
+    for i in 0..SLOW {
+        let frame = json!({
+            "_tag": "Request",
+            "id": format!("slow-{i}"),
+            "tag": "server.getProcessDiagnostics",
+            "payload": {},
+        });
+        sock.send(tokio_tungstenite::tungstenite::Message::Text(
+            frame.to_string().into(),
+        ))
+        .await
+        .expect("send slow request");
+    }
+    // Pipelined immediately behind them, with no wait in between — the whole
+    // point is that this frame is sitting in the socket while the handlers run.
+    sock.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({ "_tag": "Ping" }).to_string().into(),
+    ))
+    .await
+    .expect("send ping");
+
+    // Read until the Pong, counting how many slow Exits landed first. Bounded:
+    // a wedge must fail this in seconds with a named culprit, never hang CI.
+    let mut exits_before_pong = 0usize;
+    let mut saw_pong = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let next = tokio::time::timeout_at(deadline, sock.next()).await;
+        let Ok(Some(Ok(msg))) = next else { break };
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match v.get("_tag").and_then(|t| t.as_str()) {
+            Some("Pong") => {
+                saw_pong = true;
+                break;
+            }
+            Some("Exit") => {
+                if v.get("requestId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r.starts_with("slow-"))
+                {
+                    exits_before_pong += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_pong,
+        "#432: the server never answered Ping at all. The read loop is not \
+         reading — this is the 'accepts but does not serve' wedge, not a slow \
+         handler."
+    );
+    assert!(
+        exits_before_pong < SLOW,
+        "#432: all {SLOW} slow requests completed BEFORE the Pong, which means \
+         the read loop did not read the Ping until every handler ahead of it \
+         had finished. That is the serialized loop: while it holds, `Interrupt` \
+         (#411) can never reach a running turn, because the only moment it can \
+         be read is after that turn is already over."
+    );
+
+    server.abort();
+}

@@ -1712,7 +1712,48 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                dispatch_ws_frame(frame, &tx, &state).await;
+                // #432: THE READ LOOP MUST NEVER AWAIT REQUEST HANDLING.
+                //
+                // This used to be a bare `dispatch_ws_frame(...).await`, which
+                // makes the socket's reader and the request handler the same
+                // task. While a handler is in flight nothing is READ from the
+                // socket -- so the frames that exist precisely to arrive DURING
+                // a long request cannot arrive at all:
+                //
+                //   * `Interrupt` (#411) is the stop button. Its entire purpose
+                //     is to reach a request that is still running. Awaiting the
+                //     request first makes it unreachable BY CONSTRUCTION: the
+                //     only moment it could be read is after the thing it wanted
+                //     to cancel has already finished.
+                //   * `Ack` is Effect RPC's stream flow-control frame, sent per
+                //     chunk. A stream that stops being acked is a client the
+                //     server has stopped listening to.
+                //   * every later `Request` on the same socket, which is why a
+                //     wedged handler renders as "the whole app hung" rather
+                //     than as one failed call.
+                //
+                // Requests are multiplexed by `requestId` -- that field is the
+                // protocol saying they are concurrent -- so handling them on
+                // their own task is what the wire format already promises. The
+                // cheap non-Request tags stay INLINE and therefore stay
+                // ordered: Interrupt must not be reordered behind a Request,
+                // which is the whole point of getting it off the blocked path.
+                //
+                // NOTE the seam this deliberately does not move:
+                // `dispatch_ws_frame` still awaits everything it is given, so
+                // every existing test that drives it directly keeps its
+                // determinism. The concurrency is introduced HERE, at the
+                // transport, because that is the layer whose job is to keep
+                // reading.
+                if frame.get("_tag").and_then(|t| t.as_str()) == Some("Request") {
+                    let tx = tx.clone();
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        dispatch_ws_frame(frame, &tx, &state).await;
+                    });
+                } else {
+                    dispatch_ws_frame(frame, &tx, &state).await;
+                }
             }
             Message::Close(_) => break,
             other => {

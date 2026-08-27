@@ -82,3 +82,13 @@ turso = { path = "../../turso/bindings/rust" }
 
 [dev-dependencies]
 tempfile = "3"
+# #432 needs a test that goes through the REAL socket. Every existing ws test
+# drives `dispatch_ws_frame` directly, which is exactly why none of them could
+# see a defect that lives in the read loop ABOVE it -- the same shape as #404,
+# where 87 green tests coexisted with a server that stops serving.
+#
+# No new package enters the graph: axum's `ws` feature already resolves
+# tokio-tungstenite 0.29 (see Cargo.lock), so this is a dependents edge on a
+# crate that is already built, not a new dependency.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
