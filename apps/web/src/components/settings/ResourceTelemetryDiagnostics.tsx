@@ -996,11 +996,12 @@ export function ResourceTelemetryDiagnostics() {
           <div className="flex flex-col gap-3 border-b border-border/60 bg-linear-to-r from-muted/45 via-muted/20 to-transparent px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
             <div>
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/70">
-                T3 system footprint
+                T3 lens-local process footprint
               </div>
               <p className="mt-1 max-w-xl text-xs leading-relaxed text-muted-foreground">
-                Live native counters for the server, providers, terminals, desktop processes, and
-                the monitor itself.
+                Live native counters for THIS T3 server, its providers, terminals, and desktop
+                processes, and the monitor itself — a local sidecar's view of this machine, not
+                Atlas&#39;s canonical fleet-wide diagnostics.
               </p>
             </div>
             <div className="flex items-center gap-2 text-[10px] text-muted-foreground/65">

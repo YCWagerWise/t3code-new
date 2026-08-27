@@ -728,6 +728,23 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.serverGetUsageSummary,
       staleTimeMs: 60_000,
     }),
+    // The Atlas diagnostics transport proxy — see `atlasDiagnosticsProxy.ts`'s module doc.
+    // `atlasDiagnosticsHttp` is keyed by `{providerInstanceId, route, history?}`, so the
+    // handshake and diagnostics-snapshot reads (different `route`s) are independent queries
+    // rather than one clobbering the other's cached result.
+    atlasDiagnosticsHttp: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:atlas-diagnostics-http",
+      tag: WS_METHODS.serverCallAtlasDiagnosticsHttp,
+    }),
+    atlasDiagnosticsFeed: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:atlas-diagnostics-feed",
+      tag: WS_METHODS.serverOpenAtlasDiagnosticsFeed,
+      idleTtlMs: 0,
+    }),
+    sendAtlasDiagnosticsCommand: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:send-atlas-diagnostics-command",
+      tag: WS_METHODS.serverSendAtlasDiagnosticsCommand,
+    }),
     configProjection,
     welcome: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:welcome",

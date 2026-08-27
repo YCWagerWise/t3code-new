@@ -114,6 +114,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
+import * as AtlasDiagnosticsProxy from "./diagnostics/AtlasDiagnosticsProxy.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -488,6 +489,7 @@ const makeWsRpcLayer = (
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const sessions = yield* SessionStore.SessionStore;
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
+      const atlasDiagnosticsProxy = yield* AtlasDiagnosticsProxy.AtlasDiagnosticsProxy;
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const usage = yield* UsageService.UsageService;
@@ -1122,6 +1124,7 @@ const makeWsRpcLayer = (
           shellResumeCompletionMarker: true,
           threadResumeCompletionMarker: true,
           threadSnapshotPagination: true,
+          atlasDiagnosticsProxySupported: true,
         };
       });
 
@@ -1712,6 +1715,24 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverGetUsageSummary, usage.readSummary(input), {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverCallAtlasDiagnosticsHttp]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverCallAtlasDiagnosticsHttp,
+            atlasDiagnosticsProxy.callHttp(input),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.serverOpenAtlasDiagnosticsFeed]: (input) =>
+          observeRpcStream(
+            WS_METHODS.serverOpenAtlasDiagnosticsFeed,
+            atlasDiagnosticsProxy.openFeed(input),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.serverSendAtlasDiagnosticsCommand]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverSendAtlasDiagnosticsCommand,
+            atlasDiagnosticsProxy.sendCommand(input),
+            { "rpc.aggregate": "server" },
+          ),
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>
           observeRpcEffect(WS_METHODS.serverRetryResourceTelemetry, resourceTelemetry.retry, {
             "rpc.aggregate": "server",

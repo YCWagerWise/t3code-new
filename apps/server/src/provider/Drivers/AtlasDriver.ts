@@ -128,7 +128,13 @@ export type AtlasCredential =
   | { readonly kind: "token"; readonly value: string }
   | { readonly kind: "refused-insecure" };
 
-const readAtlasCredential = (
+/**
+ * Exported (not just via `readAtlasCredentialForTest`) because the Atlas diagnostics proxy
+ * (`apps/server/src/diagnostics/AtlasDiagnosticsProxy.ts`) resolves a configured instance's
+ * credential through this exact same decision — there is deliberately only one place T3 decides
+ * whether an Atlas token is safe to use.
+ */
+export const readAtlasCredential = (
   environment: ProviderInstanceEnvironment | undefined,
 ): AtlasCredential => {
   const entries = (environment ?? []).filter(
@@ -151,8 +157,12 @@ export const readAtlasCredentialForTest = (
   environment: ProviderInstanceEnvironment | undefined,
 ): AtlasCredential => readAtlasCredential(environment);
 
-/** Trailing slashes make `${base}/console/v1/...` produce a double slash, which some routers 404. */
-const normalizeBaseUrl = (raw: string | undefined): string =>
+/**
+ * Trailing slashes make `${base}/console/v1/...` produce a double slash, which some routers
+ * 404. Exported for the same reason `readAtlasCredential` is: the diagnostics proxy resolves a
+ * configured instance's base URL through this exact decision, not a re-derived copy of it.
+ */
+export const normalizeBaseUrl = (raw: string | undefined): string =>
   (raw?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
 
 export interface AtlasHostProbeInput {

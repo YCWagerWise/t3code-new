@@ -38,8 +38,10 @@ import { Button } from "../ui/button";
 import { ScrollArea } from "../ui/scroll-area";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
+import { AtlasDiagnosticsPanel } from "./AtlasDiagnostics";
 import { ResourceTelemetryDiagnostics } from "./ResourceTelemetryDiagnostics";
 import { SettingsPageContainer, SettingsSection, useRelativeTimeTick } from "./settingsLayout";
+import { T3LocalDiagnosticsBanner } from "./T3LocalDiagnosticsBanner";
 import { useAtomCommand } from "../../state/use-atom-command";
 
 const NUMBER_FORMAT = new Intl.NumberFormat();
@@ -993,6 +995,10 @@ export function DiagnosticsSettingsPanel() {
 
   return (
     <SettingsPageContainer width="expanded" className="gap-10">
+      <AtlasDiagnosticsPanel />
+
+      <T3LocalDiagnosticsBanner />
+
       <ResourceTelemetryDiagnostics />
 
       <SettingsSection

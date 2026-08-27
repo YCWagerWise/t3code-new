@@ -197,6 +197,15 @@ import {
   ResourceTelemetryRetryResult,
   ResourceTelemetrySnapshot,
 } from "./resourceTelemetry.ts";
+import {
+  AtlasDiagnosticsFeedInput,
+  AtlasDiagnosticsHttpInput,
+  AtlasDiagnosticsHttpResult,
+  AtlasDiagnosticsProxyError,
+  AtlasDiagnosticsRelayEvent,
+  AtlasDiagnosticsSendCommandInput,
+  AtlasDiagnosticsSendCommandResult,
+} from "./atlasDiagnosticsProxy.ts";
 import { UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
 import {
@@ -301,6 +310,9 @@ export const WS_METHODS = {
   serverReportHostPowerState: "server.reportHostPowerState",
   serverGetBackgroundPolicy: "server.getBackgroundPolicy",
   serverGetUsageSummary: "server.getUsageSummary",
+  serverCallAtlasDiagnosticsHttp: "server.callAtlasDiagnosticsHttp",
+  serverOpenAtlasDiagnosticsFeed: "server.openAtlasDiagnosticsFeed",
+  serverSendAtlasDiagnosticsCommand: "server.sendAtlasDiagnosticsCommand",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -462,6 +474,41 @@ export const WsServerGetUsageSummaryRpc = Rpc.make(WS_METHODS.serverGetUsageSumm
   success: UsageSummary,
   error: Schema.Union([EnvironmentAuthorizationError, UsageReadError]),
 });
+
+/**
+ * The HTTP half of the Atlas diagnostics proxy — see `atlasDiagnosticsProxy.ts`'s module doc.
+ * `success` is Atlas's own answer verbatim (status + body); `error` is only ever a T3-side
+ * proxy fault, never Atlas's.
+ */
+export const WsServerCallAtlasDiagnosticsHttpRpc = Rpc.make(
+  WS_METHODS.serverCallAtlasDiagnosticsHttp,
+  {
+    payload: AtlasDiagnosticsHttpInput,
+    success: AtlasDiagnosticsHttpResult,
+    error: Schema.Union([AtlasDiagnosticsProxyError, EnvironmentAuthorizationError]),
+  },
+);
+
+/** The live half: a relayed stream of raw `/_feed` text frames. See module doc. */
+export const WsServerOpenAtlasDiagnosticsFeedRpc = Rpc.make(
+  WS_METHODS.serverOpenAtlasDiagnosticsFeed,
+  {
+    payload: AtlasDiagnosticsFeedInput,
+    success: AtlasDiagnosticsRelayEvent,
+    error: Schema.Union([AtlasDiagnosticsProxyError, EnvironmentAuthorizationError]),
+    stream: true,
+  },
+);
+
+/** The browser->Atlas half of the relay: send one raw `DiagnosticsCommand` frame. */
+export const WsServerSendAtlasDiagnosticsCommandRpc = Rpc.make(
+  WS_METHODS.serverSendAtlasDiagnosticsCommand,
+  {
+    payload: AtlasDiagnosticsSendCommandInput,
+    success: AtlasDiagnosticsSendCommandResult,
+    error: EnvironmentAuthorizationError,
+  },
+);
 
 export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess, {
   payload: ServerSignalProcessInput,
@@ -1076,6 +1123,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetResourceTelemetryHistoryRpc,
   WsServerRetryResourceTelemetryRpc,
   WsServerGetUsageSummaryRpc,
+  WsServerCallAtlasDiagnosticsHttpRpc,
+  WsServerOpenAtlasDiagnosticsFeedRpc,
+  WsServerSendAtlasDiagnosticsCommandRpc,
   WsServerSignalProcessRpc,
   WsServerReportClientActivityRpc,
   WsServerReportHostPowerStateRpc,

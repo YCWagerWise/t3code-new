@@ -446,6 +446,17 @@ export const ServerConfig = Schema.Struct({
    * fields to servers that don't advertise this.
    */
   threadSnapshotPagination: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Whether this T3 server implements the Atlas diagnostics transport proxy
+   * (`server.callAtlasDiagnosticsHttp` / `server.openAtlasDiagnosticsFeed` /
+   * `server.sendAtlasDiagnosticsCommand`). A second T3 server implementation can legitimately
+   * not have this yet — its absence must render as "this server has no Atlas diagnostics
+   * proxy", a state distinct from Atlas being unreachable, unauthorized, or diagnostics-disabled
+   * on the node. The client MUST check this before calling those RPCs; firing them against a
+   * server that omits this capability would land on "unsupported method" wreckage instead of an
+   * honest render.
+   */
+  atlasDiagnosticsProxySupported: Schema.optionalKey(Schema.Boolean),
 });
 export type ServerConfig = typeof ServerConfig.Type;
 

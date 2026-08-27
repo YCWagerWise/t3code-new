@@ -46,6 +46,12 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverGetResourceTelemetryHistory]: AuthOrchestrationReadScope,
   [WS_METHODS.serverRetryResourceTelemetry]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverGetUsageSummary]: AuthOrchestrationReadScope,
+  // All three ride the same read scope `serverGetTraceDiagnostics`/`serverGetProcessDiagnostics`
+  // do: reading Atlas's diagnostics surface (including sending a `Refresh`/`Retry` cursor
+  // command over the relay) is a read of Atlas's state, not a T3 orchestration mutation.
+  [WS_METHODS.serverCallAtlasDiagnosticsHttp]: AuthOrchestrationReadScope,
+  [WS_METHODS.serverOpenAtlasDiagnosticsFeed]: AuthOrchestrationReadScope,
+  [WS_METHODS.serverSendAtlasDiagnosticsCommand]: AuthOrchestrationReadScope,
   [WS_METHODS.serverSignalProcess]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
   [WS_METHODS.serverReportHostPowerState]: AuthOrchestrationOperateScope,

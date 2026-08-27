@@ -25,14 +25,20 @@
  */
 import type { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
 import {
+  ATLAS_PROVIDER_DRIVER_KIND,
   EventId,
-  ProviderDriverKind,
   RuntimeItemId,
   RuntimeRequestId,
   TurnId,
 } from "@t3tools/contracts";
 
-export const ATLAS_DRIVER_KIND = ProviderDriverKind.make("atlas");
+/**
+ * Re-exported under its historical name. The canonical constant now lives in
+ * `@t3tools/contracts` (`ATLAS_PROVIDER_DRIVER_KIND`) so the Atlas diagnostics proxy's web
+ * client can locate the configured Atlas provider instance without importing this server-only
+ * module.
+ */
+export const ATLAS_DRIVER_KIND = ATLAS_PROVIDER_DRIVER_KIND;
 
 /** The subset of `fetch` this module uses, so a test supplies one without a network. */
 export type FetchLike = (
