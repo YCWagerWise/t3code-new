@@ -922,6 +922,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // list still need the selected instance's data even while it is unready.
   const noProviderAvailable =
     selectedProviderEntry === undefined || !isProviderInstancePickerReady(selectedProviderEntry);
+  // Whether anything else could run this turn. The distinction matters: "the provider you
+  // picked is broken" and "you have no providers" are different problems with different
+  // remedies, and only the second one is solved in Settings.
+  const readyInstanceCount = providerInstanceEntries.filter(isProviderInstancePickerReady).length;
   // The driver kind follows the instance that will actually run the turn,
   // which can differ from the persisted selection when that selection is
   // disabled.
@@ -3355,7 +3359,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                           : projectSelectionRequired
                             ? "Choose a project above to start a thread"
                             : noProviderAvailable
-                              ? "Enable a provider in Settings to send a message"
+                              ? readyInstanceCount > 0
+                                ? "This thread's provider is unavailable \u2014 switch it below to send"
+                                : "Enable a provider in Settings to send a message"
                               : phase === "disconnected"
                                 ? DISCONNECTED_COMPOSER_PLACEHOLDER
                                 : "Ask anything, @tag files/folders, $use skills, or / for commands"
@@ -3412,7 +3418,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 )}
               >
                 <div className="-m-1 -ms-3.5 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 ps-3.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                  {noProviderAvailable ? (
+                  {/*
+                    Replacing the picker with a dead button is only honest when there is
+                    genuinely nowhere to go. With a ready instance sitting in the same list,
+                    hiding the picker removes the ONE control that fixes the problem and tells
+                    the user they have no providers while one is enabled and ready.
+                  */}
+                  {noProviderAvailable && readyInstanceCount === 0 ? (
                     <Button
                       type="button"
                       size="sm"
