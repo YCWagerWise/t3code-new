@@ -3885,14 +3885,36 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     }
                 }
                 m => {
-                    let out = if m == "projects.readFile" {
+                    let reading = m == "projects.readFile";
+                    let out = if reading {
                         projects::read_file(&cwd, &payload).await
                     } else {
                         projects::write_file(&state.checkpoints, &cwd, &payload).await
                     };
                     match out {
                         Ok(v) => exit_success(tx, &id, v),
-                        Err(e) => exit_failure(tx, &id, &e),
+                        // DECLARED, so it travels as `Fail` with its tag intact.
+                        // These used to go to `exit_failure`, i.e. a `Die`
+                        // defect — and the app probes for an OPTIONAL `t3.json`
+                        // on every boot, so the single most common outcome of
+                        // this handler was a crash frame for a file that is
+                        // simply absent. `ProjectReadFileError` and
+                        // `ProjectWriteFileError` are declared in the RPC's
+                        // error channel (rpc.ts:667-676); before this they were
+                        // unreachable, which is why nothing in the client ever
+                        // branched on them.
+                        Err(e) => exit_typed_failure(
+                            tx,
+                            &id,
+                            e.to_wire(
+                                if reading {
+                                    "ProjectReadFileError"
+                                } else {
+                                    "ProjectWriteFileError"
+                                },
+                                &cwd,
+                            ),
+                        ),
                     }
                 }
             }
