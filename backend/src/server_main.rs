@@ -815,8 +815,21 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // away before the runtime ever started — the thread showed one project
     // while the work happened somewhere else (#137/#78/#79).
     let boot = command.pointer("/bootstrap/createThread");
+    // TRIMMED, not merely non-empty (#437). These values are encoded into
+    // `ThreadCreatedPayload`, whose `title` is `TrimmedNonEmptyString` and whose
+    // `branch`/`worktreePath` are `NullOr(TrimmedNonEmptyString)` —
+    // `TrimmedString.check(isNonEmpty())`, so the client TRIMS FIRST and then
+    // requires non-empty. A whitespace-only value passes `!s.is_empty()` here
+    // and decodes to "" there, which fails the check and drops the whole event.
+    //
+    // Dropping `thread.created` is not a cosmetic failure: it is the only event
+    // orchestrationEventEffects.ts:31 promotes a draft on, so the view stays
+    // parked on /draft/<id> while the turn runs to completion somewhere it is
+    // not looking. That is the exact "2 minutes for a hi" symptom this finding
+    // is about, reachable again through a title of "   ".
     let str_of = |v: Option<&Value>| {
         v.and_then(Value::as_str)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
@@ -826,7 +839,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
             command
                 .pointer("/message/text")
                 .and_then(|t| t.as_str())
+                // Take the 48 chars FIRST, then trim: truncation can leave a
+                // trailing space, and " hello wor" must not become a title the
+                // client refuses.
                 .map(|t| t.chars().take(48).collect::<String>())
+                .map(|t| t.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "New thread".into());

@@ -6974,6 +6974,80 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #437: a WHITESPACE title must not silently un-promote the draft.
+///
+/// `thread.created` is the only event `orchestrationEventEffects.ts:31`
+/// promotes a draft on, and its contract payload types `title` as
+/// `TrimmedNonEmptyString` — `TrimmedString.check(isNonEmpty())`, so the client
+/// TRIMS FIRST and then requires non-empty. The backend used to accept any
+/// title that was merely `!s.is_empty()`, so a titleSeed of "   " encoded fine
+/// here, decoded to "" there, failed the check, and took the WHOLE EVENT with
+/// it. The durable row still existed and the turn still ran; only the promotion
+/// was lost, which at the glass is "2 minutes for a hi" with the composer stuck
+/// on Thinking — indistinguishable from a hung backend.
+///
+/// The assertion is that a whitespace title falls through to the SAME fallback
+/// an absent title takes, so the payload can never carry a value the client
+/// will refuse. Asserted on the announced thread because it and the event are
+/// built from one `title` binding.
+#[tokio::test]
+async fn a_whitespace_title_falls_back_instead_of_shipping_an_undecodable_event() {
+    let (state, _dir) = test_state().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
+    let _ = drain(&mut rx);
+
+    let command = json!({
+        "type": "thread.turn.start",
+        "commandId": "c-ws",
+        "threadId": "t-ws",
+        // Whitespace everywhere a title can come from, so the fallback is the
+        // only honest source left. The message text is whitespace too —
+        // otherwise it would supply the title and the test would pass without
+        // the trim ever being exercised.
+        "titleSeed": "   ",
+        "message": { "messageId": "m-ws", "role": "user", "text": "   ", "attachments": [] },
+        "runtimeMode": "full-access",
+        "bootstrap": { "createThread": { "projectId": "p-ws", "title": "  \t " }},
+    });
+    ensure_thread_on_shell(&state, &command).await.unwrap();
+
+    let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
+        f.get("values")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|x| x.get("kind").and_then(Value::as_str) == Some("thread-upserted"))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    let upsert = announced
+        .iter()
+        .flat_map(|f| f["values"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["kind"] == "thread-upserted")
+        .unwrap_or_else(|| panic!("no thread-upserted in {announced:#?}"));
+    let title = upsert["thread"]["title"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        title.trim(),
+        title,
+        "#437: the title still carries surrounding whitespace, so the contract \
+         trims it to something shorter than what the backend recorded"
+    );
+    assert!(
+        !title.is_empty(),
+        "#437: a whitespace-only title survived as an empty/blank title. \
+         `TrimmedNonEmptyString` refuses it, the client drops `thread.created` \
+         entirely, and the draft never promotes."
+    );
+    assert_eq!(
+        title, "New thread",
+        "#437: a blank title must take the SAME fallback an absent title takes"
+    );
+}
+
 /// #137/#78/#79: the FIRST turn's context reaches the thread.
 ///
 /// The composer chooses a project, a worktree/branch and a runtime mode
