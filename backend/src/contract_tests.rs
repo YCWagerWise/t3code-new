@@ -12300,6 +12300,7 @@ async fn a_disconnecting_client_takes_its_in_flight_requests_with_it() {
     );
 
     server.abort();
+}
 // ---------------------------------------------------------------------------
 // RESTORED by clau-0e5a: three fail-closed tests whose cells landed to main
 // (merge commits eae0abd6b codex-4a9f, 4ecdfad50 codex-a47f, and codex-e9b6)
