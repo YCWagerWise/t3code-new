@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import { ATLAS_ACCESS_TOKEN_ENV } from "./settings.ts";
+import { ProviderDriverKind } from "./providerInstance.ts";
 import {
+  declaredCredentialsForDriver,
+  findInsecureDeclaredCredentials,
   isDeclaredCredentialName,
   isPreviouslyExposedCredentialRow,
   missingDeclaredCredentials,
@@ -94,6 +98,59 @@ describe("missingDeclaredCredentials", () => {
   it("is empty for a driver that declares no credentials", () => {
     expect(missingDeclaredCredentials(undefined, [])).toEqual([]);
     expect(missingDeclaredCredentials([], [])).toEqual([]);
+  });
+});
+
+describe("declaredCredentialsForDriver", () => {
+  it("returns Atlas's declared access-token credential", () => {
+    expect(declaredCredentialsForDriver(ProviderDriverKind.make("atlas"))).toEqual([
+      { name: ATLAS_ACCESS_TOKEN_ENV },
+    ]);
+  });
+
+  it("returns an empty list for a driver with no declared credentials", () => {
+    expect(declaredCredentialsForDriver(ProviderDriverKind.make("codex"))).toEqual([]);
+  });
+
+  it("returns an empty list for an unknown/fork driver kind", () => {
+    expect(declaredCredentialsForDriver("some-fork-driver")).toEqual([]);
+  });
+
+  it("returns an empty list when no driver is given", () => {
+    expect(declaredCredentialsForDriver(undefined)).toEqual([]);
+  });
+});
+
+describe("findInsecureDeclaredCredentials", () => {
+  it("flags Atlas's access token when submitted sensitive:false", () => {
+    const environment = [
+      { name: ATLAS_ACCESS_TOKEN_ENV, value: "leaked", sensitive: false },
+      { name: "OTHER_VAR", value: "fine", sensitive: false },
+    ];
+    expect(findInsecureDeclaredCredentials(ProviderDriverKind.make("atlas"), environment)).toEqual([
+      { name: ATLAS_ACCESS_TOKEN_ENV, value: "leaked", sensitive: false },
+    ]);
+  });
+
+  it("is empty when the same credential is submitted sensitive:true", () => {
+    const environment = [{ name: ATLAS_ACCESS_TOKEN_ENV, value: "tok", sensitive: true }];
+    expect(findInsecureDeclaredCredentials(ProviderDriverKind.make("atlas"), environment)).toEqual(
+      [],
+    );
+  });
+
+  it("is empty for a driver that declares no credentials, regardless of what's submitted", () => {
+    const environment = [{ name: "ANYTHING", value: "x", sensitive: false }];
+    expect(findInsecureDeclaredCredentials(ProviderDriverKind.make("codex"), environment)).toEqual(
+      [],
+    );
+  });
+
+  it("is empty for an undefined or empty environment", () => {
+    expect(findInsecureDeclaredCredentials(ProviderDriverKind.make("atlas"), undefined)).toEqual(
+      [],
+    );
+    expect(findInsecureDeclaredCredentials(ProviderDriverKind.make("atlas"), [])).toEqual([]);
   });
 });
 

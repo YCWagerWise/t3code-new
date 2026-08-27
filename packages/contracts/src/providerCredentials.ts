@@ -7,17 +7,52 @@
  * security-critical rule here — a declared credential loaded persisted
  * non-sensitive must never republish its old value — has to hold on BOTH
  * sides of the wire: the web settings UI decides what an edit publishes,
- * and the server's driver decides what counts as a usable token. Splitting
- * that rule into two hand-written copies is exactly how it drifts; one pure
- * implementation, imported by both, cannot.
+ * and the server decides what it will actually accept and persist.
+ * Splitting either the rule OR the driver->credential-name mapping into two
+ * hand-written copies is exactly how this class of bug recurs (finding #22
+ * against b04afc2fa: the client sanitized, but the server accepted
+ * whatever it was given, because nothing server-side even knew Atlas
+ * declared a credential). One list, one set of decision functions, read by
+ * both sides.
  *
  * @module providerCredentials
  */
-import type { ProviderInstanceEnvironmentVariable } from "./providerInstance.ts";
+import { ATLAS_ACCESS_TOKEN_ENV } from "./settings.ts";
+import {
+  ProviderDriverKind,
+  type ProviderInstanceEnvironmentVariable,
+} from "./providerInstance.ts";
 
 /** The minimal shape callers need: a declared credential's environment variable name. */
 export interface ProviderCredentialName {
   readonly name: string;
+}
+
+/**
+ * The single driver -> declared-credentials map. Web's `providerDriverMeta.ts`
+ * enriches these with presentation copy (label/description) for its own
+ * driver definitions; it does not maintain a second list of names — it reads
+ * this one. The server reads this same map to validate what it is asked to
+ * persist, in `serverSettings.ts`.
+ */
+export const PROVIDER_DECLARED_CREDENTIALS: Partial<
+  Record<ProviderDriverKind, ReadonlyArray<ProviderCredentialName>>
+> = {
+  [ProviderDriverKind.make("atlas")]: [{ name: ATLAS_ACCESS_TOKEN_ENV }],
+};
+
+/**
+ * Declared credentials for a driver, or an empty list for a driver (or fork
+ * driver kind) that declares none. Accepts a loose `string` too — the
+ * server reads a persisted instance's `driver` field, which is typed as the
+ * open `ProviderDriverKind` brand but may not have been re-validated yet at
+ * the call site.
+ */
+export function declaredCredentialsForDriver(
+  driver: ProviderDriverKind | string | undefined,
+): ReadonlyArray<ProviderCredentialName> {
+  if (driver === undefined) return [];
+  return PROVIDER_DECLARED_CREDENTIALS[driver as ProviderDriverKind] ?? [];
 }
 
 /**
@@ -112,4 +147,27 @@ export function preparePublishedCredentialVariable(
     value: mustDropValue ? "" : variable.value,
     sensitive: resolveEnvironmentRowSensitive(credentials, variable.name, variable.sensitive),
   };
+}
+
+/**
+ * Server-side counterpart to `preparePublishedCredentialVariable`: scans an
+ * incoming environment for entries the server must refuse to persist or
+ * broadcast — a declared credential submitted `sensitive: false`.
+ *
+ * This does not assume the caller ran `preparePublishedCredentialVariable`
+ * first. It cannot: a stale client build, a hand-rolled RPC call, or any
+ * future surface that writes provider settings can submit whatever shape
+ * it wants, and the server is the only party positioned to say no before
+ * that value is written to disk, moved into the secret store, or broadcast
+ * to every other connected client.
+ */
+export function findInsecureDeclaredCredentials(
+  driver: ProviderDriverKind | string | undefined,
+  environment: ReadonlyArray<ProviderInstanceEnvironmentVariable> | undefined,
+): ReadonlyArray<ProviderInstanceEnvironmentVariable> {
+  const declared = declaredCredentialsForDriver(driver);
+  if (declared.length === 0 || !environment || environment.length === 0) return [];
+  return environment.filter(
+    (variable) => isDeclaredCredentialName(declared, variable.name) && variable.sensitive !== true,
+  );
 }

@@ -15,6 +15,7 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
+  findInsecureDeclaredCredentials,
   type ModelSelection,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
@@ -161,6 +162,67 @@ export function redactServerSettingsForClient(settings: ServerSettings): ServerS
   return { ...settings, providerInstances };
 }
 
+/**
+ * A declared credential (see `declaredCredentialsForDriver` in
+ * `@t3tools/contracts`) submitted with `sensitive: false`, found in an
+ * incoming settings patch.
+ *
+ * This is the server-side half of the fix for finding #22 against
+ * b04afc2fa: the web settings UI sanitizes what IT publishes
+ * (`preparePublishedCredentialVariable`), but nothing stopped a stale
+ * client, a hand-rolled RPC call, or a future surface from sending the raw
+ * shape straight to `updateSettings`. The client cannot be trusted to have
+ * been well-behaved, so `updateSettings` checks this itself, before
+ * anything is written to disk, the secret store, or broadcast to other
+ * clients.
+ */
+function findInsecureCredentialPatches(
+  patch: ServerSettingsPatch,
+): ReadonlyArray<{ readonly instanceId: string; readonly name: string }> {
+  const violations: Array<{ instanceId: string; name: string }> = [];
+  for (const [instanceId, instancePatch] of Object.entries(patch.providerInstances ?? {})) {
+    for (const variable of findInsecureDeclaredCredentials(
+      instancePatch.driver,
+      instancePatch.environment,
+    )) {
+      violations.push({ instanceId, name: variable.name });
+    }
+  }
+  return violations;
+}
+
+/**
+ * Rejects (rather than silently sanitizes) an incoming patch that submits a
+ * declared credential unsafely. Rejecting is louder: the caller gets a
+ * typed, inspectable failure instead of a settings update that "succeeds"
+ * while quietly discarding what they thought they set — the same silent
+ * surprise `preparePublishedCredentialVariable`'s dropped value would be if
+ * it happened server-side without telling anyone. A malformed submission
+ * here is either a bug in the caller or a stale/hostile client; either way
+ * the fix is to surface it, not to guess at a "corrected" payload.
+ */
+const rejectInsecureCredentialPatch = (
+  settingsPath: string,
+  patch: ServerSettingsPatch,
+): Effect.Effect<void, ServerSettingsError> => {
+  const violations = findInsecureCredentialPatches(patch);
+  if (violations.length === 0) return Effect.void;
+  const first = violations[0]!;
+  return Effect.fail(
+    new ServerSettingsError({
+      settingsPath,
+      operation: "reject-insecure-credential",
+      providerInstanceId: first.instanceId,
+      environmentVariable: first.name,
+      cause: new Error(
+        `Environment variable "${first.name}" on provider instance "${first.instanceId}" is a ` +
+          `declared credential and must be submitted with sensitive: true. Refusing to persist ` +
+          `or broadcast it unsanitized.`,
+      ),
+    }),
+  );
+};
+
 export class ServerSettingsService extends Context.Service<
   ServerSettingsService,
   {
@@ -214,7 +276,8 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
       ready: Effect.void,
       getSettings: Ref.get(currentSettingsRef).pipe(Effect.map(resolveTextGenerationProvider)),
       updateSettings: (patch) =>
-        Ref.get(currentSettingsRef).pipe(
+        rejectInsecureCredentialPatch("<memory>", patch).pipe(
+          Effect.andThen(() => Ref.get(currentSettingsRef)),
           Effect.map((currentSettings) => applyServerSettingsPatch(currentSettings, patch)),
           Effect.flatMap(normalizeServerSettings),
           Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
@@ -627,6 +690,7 @@ const make = Effect.gen(function* () {
     updateSettings: (patch) =>
       writeSemaphore.withPermits(1)(
         Effect.gen(function* () {
+          yield* rejectInsecureCredentialPatch(settingsPath, patch);
           const current = yield* getSettingsFromCache;
           const nextPersisted = yield* persistProviderEnvironmentSecrets(
             current,

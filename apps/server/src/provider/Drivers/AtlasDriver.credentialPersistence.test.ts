@@ -8,11 +8,18 @@
  * `sensitive: true` while still carrying its old value, this is where it
  * would show up as `{ kind: "token", value: "<the leaked token>" }`.
  *
- * `preparePublishedCredentialVariable` (from `@t3tools/contracts`) is the
- * exact function `ProviderEnvironmentSection.publishRows` calls per row —
- * see `apps/web/src/components/settings/ProviderEnvironmentSection.test.tsx`
- * for proof the component wires it correctly. This file proves what happens
- * to its output once it leaves the browser.
+ * Round 2 proved the CLIENT sanitizes what it publishes
+ * (`preparePublishedCredentialVariable`, called below exactly the way
+ * `ProviderEnvironmentSection.publishRows` calls it — see
+ * `apps/web/src/components/settings/ProviderEnvironmentSection.test.tsx`).
+ *
+ * Finding #22 against that round: the seam test called the sanitizer
+ * itself and only then handed the cleaned payload to `updateSettings`, so
+ * it proved the client behaves — not that the server enforces anything.
+ * The server accepted whatever it was given. The second test below drives
+ * `updateSettings` DIRECTLY with a raw, unsanitized entry — no sanitizer in
+ * the call path at all — the shape a stale client, a hand-rolled RPC call,
+ * or a hostile one would send.
  */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -128,14 +135,14 @@ it.layer(NodeServices.layer)("the Atlas credential across save, persistence, and
         // this is exactly what a real process restart would read.
         const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
         assert.notInclude(raw, LEAKED_TOKEN);
-        const rawEnvironment = // @effect-diagnostics-next-line preferSchemaOverJson:off
-        (
+        const parsedRawSettings =
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
           JSON.parse(raw) as {
             providerInstances: {
               atlas: { environment: ReadonlyArray<ProviderInstanceEnvironmentVariable> };
             };
-          }
-        ).providerInstances.atlas.environment;
+          };
+        const rawEnvironment = parsedRawSettings.providerInstances.atlas.environment;
         const atlasRowOnDisk = rawEnvironment.find((v) => v.name === ATLAS_ACCESS_TOKEN_ENV);
         assert.deepEqual(atlasRowOnDisk, {
           name: ATLAS_ACCESS_TOKEN_ENV,
@@ -159,6 +166,72 @@ it.layer(NodeServices.layer)("the Atlas credential across save, persistence, and
         // does not depend on the settings cache the same service instance
         // is still holding.
         assert.deepEqual(readAtlasCredentialForTest(rawEnvironment), { kind: "none" });
+      }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect(
+    "rejects a raw, unsanitized declared-credential submission before persistence, broadcast, or use — finding #22",
+    () =>
+      Effect.gen(function* () {
+        const serverConfig = yield* ServerConfig.ServerConfig;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+        // Deliberately NOT run through `preparePublishedCredentialVariable` —
+        // this is the raw shape the reviewer's finding describes: whatever a
+        // stale client, a hand-rolled RPC call, or a hostile one submits
+        // directly. Nothing upstream of `updateSettings` has cleaned this.
+        const rawUnsanitizedEnvironment: ReadonlyArray<ProviderInstanceEnvironmentVariable> = [
+          { name: ATLAS_ACCESS_TOKEN_ENV, value: LEAKED_TOKEN, sensitive: false },
+        ];
+
+        const error = yield* Effect.flip(
+          serverSettings.updateSettings({
+            providerInstances: {
+              [ATLAS_INSTANCE_ID]: {
+                driver: ProviderDriverKind.make("atlas"),
+                enabled: true,
+                config: { baseUrl: "http://127.0.0.1:3019" },
+                environment: rawUnsanitizedEnvironment,
+              },
+            },
+          }),
+        );
+
+        // Rejected, not silently sanitized: the caller gets a typed,
+        // inspectable failure instead of an update that "succeeds" while
+        // quietly discarding what it asked to store.
+        assert.equal(error._tag, "ServerSettingsError");
+        assert.equal(error.operation, "reject-insecure-credential");
+        assert.equal(error.providerInstanceId, ATLAS_INSTANCE_ID);
+        assert.equal(error.environmentVariable, ATLAS_ACCESS_TOKEN_ENV);
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        assert.notInclude(JSON.stringify(error), LEAKED_TOKEN);
+
+        // Not persisted: the rejection happens before any write, so nothing
+        // ever reached settings.json.
+        const settingsFileExists = yield* fileSystem.exists(serverConfig.settingsPath);
+        if (settingsFileExists) {
+          const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
+          assert.notInclude(raw, LEAKED_TOKEN);
+        }
+
+        // Not broadcast, not usable: `emitChange` and every persistence step
+        // sit after the rejection in `updateSettings`, so the settings this
+        // same service would serve to another client, and the environment
+        // the Atlas driver would read on the next probe, never saw this
+        // value at all — not "saw it and refused it", never received it.
+        const settingsAfterRejection = yield* serverSettings.getSettings;
+        const atlasEnvironmentAfterRejection =
+          settingsAfterRejection.providerInstances[ATLAS_INSTANCE_ID]?.environment;
+        if (atlasEnvironmentAfterRejection !== undefined) {
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          assert.notInclude(JSON.stringify(atlasEnvironmentAfterRejection), LEAKED_TOKEN);
+        }
+        assert.notDeepEqual(readAtlasCredentialForTest(atlasEnvironmentAfterRejection), {
+          kind: "token",
+          value: LEAKED_TOKEN,
+        });
       }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 });

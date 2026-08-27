@@ -859,6 +859,10 @@ export const ServerSettingsOperation = Schema.Literals([
   "write-secret",
   "write-file",
   "prepare-directory",
+  // A declared credential (see `providerCredentials.ts`) arrived with
+  // `sensitive: false`. Rejected before persistence rather than silently
+  // sanitized — see `rejectInsecureCredentialPatch` in the server.
+  "reject-insecure-credential",
 ]);
 export type ServerSettingsOperation = typeof ServerSettingsOperation.Type;
 

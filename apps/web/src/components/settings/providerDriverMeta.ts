@@ -3,6 +3,7 @@ import {
   AtlasSettings,
   ClaudeSettings,
   CodexSettings,
+  declaredCredentialsForDriver,
   OpenCodeSettings,
   OpenaiCompatSettings,
   ProviderDriverKind,
@@ -57,6 +58,39 @@ export interface ProviderClientDefinition {
 export interface ProviderClientCredentialDeclaration extends ProviderCredentialName {
   readonly label: string;
   readonly description: string;
+}
+
+/**
+ * Presentation copy for a declared credential, keyed by its environment
+ * variable name. The list of WHICH names each driver declares lives once,
+ * in `@t3tools/contracts`'s `PROVIDER_DECLARED_CREDENTIALS` (read below via
+ * `declaredCredentialsForDriver`) — this only supplies the label/description
+ * a row for that name shows, so there is no second copy of the name itself
+ * that could drift from what the server enforces.
+ */
+const CREDENTIAL_PRESENTATION: Record<
+  string,
+  { readonly label: string; readonly description: string }
+> = {
+  [ATLAS_ACCESS_TOKEN_ENV]: {
+    label: "Access token",
+    description:
+      "Bearer token this instance authenticates to the Atlas node with. Must be " +
+      "sensitive: the driver refuses to send a matching, non-sensitive entry rather " +
+      "than risk it round-tripping through settings in clear text.",
+  },
+};
+
+function credentialDeclarationsForDriver(
+  driver: ProviderDriverKind,
+): ReadonlyArray<ProviderClientCredentialDeclaration> {
+  return declaredCredentialsForDriver(driver).map((credential) => ({
+    ...credential,
+    ...(CREDENTIAL_PRESENTATION[credential.name] ?? {
+      label: credential.name,
+      description: "Required credential for this provider instance.",
+    }),
+  }));
 }
 
 export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
@@ -115,16 +149,7 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     // secret-store backed. Putting it in this form would have shipped the credential in
     // settings JSON and in every client snapshot.
     settingsSchema: AtlasSettings,
-    credentials: [
-      {
-        name: ATLAS_ACCESS_TOKEN_ENV,
-        label: "Access token",
-        description:
-          "Bearer token this instance authenticates to the Atlas node with. Must be " +
-          "sensitive: the driver refuses to send a matching, non-sensitive entry rather " +
-          "than risk it round-tripping through settings in clear text.",
-      },
-    ],
+    credentials: credentialDeclarationsForDriver(ProviderDriverKind.make("atlas")),
   },
   // Cursor and Grok were removed from this build (#150). Their entries stayed
   // here after the drivers were deleted, so Add Provider still offered Grok
