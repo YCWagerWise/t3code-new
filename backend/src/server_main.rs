@@ -4943,7 +4943,62 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                _ => {}
+                // #433/#446: AN UNHANDLED COMMAND MUST NOT ACK AS APPLIED.
+                //
+                // This arm used to be `_ => {}`, which fell through to the
+                // applied-ack below. `DispatchableClientOrchestrationCommand`
+                // (contracts/orchestration.ts:924) is a union of 23; this match
+                // implements 8. The other 15 were answered `Success({sequence})`
+                // — the reducer's signal that the command LANDED — while the
+                // runtime did nothing at all:
+                //
+                //   project.create            thread.snooze
+                //   project.delete            thread.unsnooze
+                //   thread.create             thread.pin
+                //   thread.delete             thread.unpin
+                //   thread.archive            thread.pin.reorder
+                //   thread.unarchive          thread.runtime-mode.set
+                //   thread.settle             thread.interaction-mode.set
+                //   thread.unsettle
+                //
+                // That is worse than a missing feature: the client optimistically
+                // applies, the ack confirms, and the state diverges from the
+                // runtime silently until a reload — at which point the user's
+                // archive/pin/mode change is simply gone with no error anywhere.
+                //
+                // #446 is right that the GENERATOR is the defect, not the 15
+                // instances: a catch-all that succeeds means every command added
+                // to the contract from now on is silently no-op'd by default.
+                // Fixing 15 arms leaves that default intact. So the default flips
+                // — unknown now REFUSES, and each of the 15 becomes a visible
+                // failure a user can report and a test can assert, instead of a
+                // lie the reducer believes.
+                //
+                // This is the rule the RPC dispatcher in this same file already
+                // follows for exactly the same reason ("Genuinely unimplemented
+                // RPCs FAIL explicitly rather than returning a masking
+                // Success(null)"). The two dispatchers disagreeing on that is how
+                // one of them ended up with 15 silent no-ops and the other with
+                // none.
+                other => {
+                    let kind = other.unwrap_or("<missing type>");
+                    tracing::warn!(
+                        cmd = kind,
+                        "dispatchCommand: unimplemented command — refusing rather than \
+                         acking it as applied"
+                    );
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!(
+                            "orchestration command '{kind}' is not implemented by this \
+                             runtime. It was REFUSED, not applied — nothing changed. \
+                             (Previously this acked success and did nothing, so the UI \
+                             showed the change until the next reload.)"
+                        ),
+                    );
+                    return;
+                }
             }
             // The applied-ack. Any arm that failed has already sent its own
             // terminal and returned, so this cannot double-send.
