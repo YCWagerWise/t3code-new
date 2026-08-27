@@ -1121,6 +1121,124 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
 }
 
 /// #33: the terminal RPCs are wired to the shared PTY (not the unsupported
+/// FE-PROBE-6: which Origins may open the control socket.
+///
+/// Both directions matter. Only asserting that evil.com is refused would pass
+/// for a predicate that refuses EVERYTHING, which would take the desktop app
+/// and every native client down with it — so the allow cases are asserted just
+/// as hard as the deny cases.
+#[test]
+fn only_loopback_origins_may_open_the_control_socket() {
+    use crate::origin_may_open_control_socket as allowed;
+
+    // Native clients send no Origin. A browser cannot omit it (the user agent
+    // sets it and script cannot), so "absent" is exactly the non-browser set.
+    assert!(allowed(None), "a native client sends no Origin");
+    assert!(allowed(Some("")), "an empty Origin is not a web page");
+    assert!(allowed(Some("null")), "sandboxed/file:// embeddings send null");
+
+    // The app itself.
+    assert!(allowed(Some("http://localhost:3773")));
+    assert!(allowed(Some("http://127.0.0.1:5173")));
+    assert!(allowed(Some("https://localhost")));
+    assert!(allowed(Some("http://[::1]:3773")), "IPv6 loopback with a port");
+    assert!(allowed(Some("http://127.0.0.2:80")), "all of 127/8 is loopback");
+
+    // Embeddings that are not web pages.
+    assert!(allowed(Some("tauri://localhost")));
+    assert!(allowed(Some("file://")));
+
+    // THE ATTACK: any page the user has open can reach ws://127.0.0.1/ws,
+    // because the same-origin policy does not apply to WebSockets. The server
+    // is the only thing that can refuse, and this is it refusing.
+    assert!(!allowed(Some("https://evil.com")), "a real site is not loopback");
+    assert!(!allowed(Some("http://evil.com:3773")), "the port is not the check");
+    assert!(
+        !allowed(Some("https://localhost.evil.com")),
+        "a suffix that merely CONTAINS localhost is a different host"
+    );
+    assert!(
+        !allowed(Some("https://127.0.0.1.evil.com")),
+        "an origin that merely starts with the loopback literal is a different host"
+    );
+    assert!(!allowed(Some("http://10.0.0.5")), "LAN is not loopback");
+    assert!(!allowed(Some("garbage")), "an unparseable Origin is refused, not trusted");
+}
+
+/// FE-PROBE-6: is the terminal owner CHECKED, or merely REQUIRED?
+///
+/// Every `terminal.*` method takes an owner (sessionId or threadId) plus a
+/// terminal id, and the pane store is keyed by `(owner.scope(), terminal_id)`.
+/// That keying is real and it does prevent an ACCIDENTAL collision between a
+/// subagent and its parent (#149). It is not access control, because the owner
+/// is parsed out of the REQUEST PAYLOAD — `TerminalOwner::parse(&payload)` at
+/// server_main.rs — and nothing anywhere ties a connection to an owner it is
+/// entitled to name. "Non-empty" is not "yours".
+///
+/// This test DOES NOT assert that the cross-owner write is refused, because it
+/// is not. It pins the exposure as it currently stands so the fix has a
+/// failing-by-design witness to flip, and so nobody reads the (scope, id)
+/// keying as a security boundary it was never built to be.
+///
+/// Why this is arbitrary command execution and not a tidiness complaint:
+///   * `ws_upgrade` (server_main.rs) takes no Origin, no token, no auth of any
+///     kind, and the router mounts no CORS layer — so ANY web page the user has
+///     open can `new WebSocket("ws://127.0.0.1:<port>/ws")` and be a client.
+///   * `terminal_id` defaults to the literal "term-1" (terminal.rs:267), so the
+///     attacker does not even have to guess a terminal id.
+///   * hearth's model is ONE persistent PTY per session carrying cd/export/venv
+///     state, so a foreign write both executes and corrupts state the real
+///     owner will later trust.
+///
+/// If a later change makes cross-owner writes refuse, THIS TEST SHOULD FAIL and
+/// be inverted to assert the refusal. That is the intended end state.
+#[tokio::test]
+async fn a_foreign_owner_can_drive_a_terminal_it_never_opened() {
+    let (state, _d) = test_state().await;
+
+    // VICTIM opens its pane. Default terminal id on purpose: it is what the
+    // product uses and what an attacker would assume.
+    let (tx_victim, mut rx_victim) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx_victim,
+        "terminal.open",
+        json!({ "threadId": "t-victim", "terminalId": "term-1", "cwd": state.cwd, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    let opened = drain(&mut rx_victim);
+    assert_eq!(
+        opened[0]["exit"]["_tag"], "Success",
+        "precondition: the victim's terminal opened: {:?}",
+        opened[0]
+    );
+
+    // ATTACKER is a different client that never opened anything and never
+    // identified as t-victim. It simply SAYS it is t-victim.
+    let (tx_attacker, mut rx_attacker) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx_attacker,
+        "terminal.write",
+        json!({ "threadId": "t-victim", "terminalId": "term-1", "data": "echo pwned\n" }),
+    )
+    .await;
+    let wrote = drain(&mut rx_attacker);
+
+    assert_eq!(
+        wrote[0]["exit"]["_tag"], "Success",
+        "FE-PROBE-6: recorded exposure — a client that never opened this pane \
+         and holds no claim to `t-victim` wrote into its PTY and the server \
+         accepted it. The owner is taken from the request payload \
+         (TerminalOwner::parse) and never checked against the connection, so \
+         `terminal.write` is arbitrary command execution in another session's \
+         shell for anyone who can reach /ws — which, with no Origin check and \
+         no auth on the upgrade, is any web page the user has open. If this \
+         assertion has started failing, the hole is closed: invert it. \
+         Frames: {wrote:?}"
+    );
+}
+
 /// arm), and return contract-shaped payloads. terminal.open yields a
 /// TerminalSessionSnapshot; write/resize succeed; attach streams a snapshot.
 #[tokio::test]
