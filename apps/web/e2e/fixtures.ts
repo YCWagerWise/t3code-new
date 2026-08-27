@@ -25,7 +25,7 @@
  */
 import { test as base, expect, type Page } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, openSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
@@ -145,9 +145,14 @@ export const test = base.extend<Record<string, never>, Fixtures>({
     async ({ backend }, use) => {
       const webPort = await freePort();
       const vp = join(REPO, "node_modules", ".bin", "vp");
+      // NOT `stdio: "ignore"`. When the web server fails to start, discarding its
+      // output leaves only "nothing answered at <url>", which is the symptom and
+      // never the cause. Its log is written where the failure message can point.
+      const webLog = join(tmpdir(), `t3e2e-web-${webPort}.log`);
+      const webOut = openSync(webLog, "a");
       const web = spawn(vp, ["dev", "--port", String(webPort)], {
         cwd: WEB_DIR,
-        stdio: "ignore",
+        stdio: ["ignore", webOut, webOut],
         env: {
           ...process.env,
           // `vp` lives in the workspace bin dir; spawning dev-runner with an
@@ -160,7 +165,14 @@ export const test = base.extend<Record<string, never>, Fixtures>({
         },
       });
       const url = `http://127.0.0.1:${webPort}/`;
-      await waitForHttp(url, 180_000);
+      try {
+        await waitForHttp(url, 180_000);
+      } catch (e) {
+        throw new Error(
+          `${(e as Error).message}\n--- web dev server log (${webLog}) ---\n` +
+            (existsSync(webLog) ? readFileSync(webLog, "utf8").slice(-4000) : "(no log)"),
+        );
+      }
       // WARM THE BUNDLE BEFORE ANY SPEC NAVIGATES. Vite answers the socket long
       // before it can serve a built graph, so the FIRST navigation pays the
       // whole bundle and blows a per-test timeout — which reads as "the app does
@@ -185,7 +197,18 @@ export const test = base.extend<Record<string, never>, Fixtures>({
   gotoApp: [
     async ({ appUrl }, use) => {
       await use(async (page: Page) => {
-        await page.goto(appUrl, { waitUntil: "commit", timeout: 180_000 });
+        // The app CLIENT-SIDE REDIRECTS to /draft/<id> as soon as it boots, which
+        // races `waitUntil: "commit"` and surfaces as
+        // `net::ERR_ABORTED; maybe frame was detached?`. That is the app working,
+        // not the app failing, so an aborted navigation is tolerated here and the
+        // real readiness signal — the composer — is awaited below. Anything else
+        // still throws.
+        try {
+          await page.goto(appUrl, { waitUntil: "commit", timeout: 180_000 });
+        } catch (e) {
+          const msg = String((e as Error).message);
+          if (!msg.includes("ERR_ABORTED")) throw e;
+        }
         await page
           .locator('[contenteditable="true"]')
           .first()
