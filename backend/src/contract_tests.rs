@@ -11788,3 +11788,174 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
         "the failure does not distinguish the close from the fanout: {closed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #432 — WebSocket head-of-line blocking.
+//
+// The read loop used to `.await` each decoded frame inline:
+//
+//     while let Some(Ok(msg)) = stream.next().await {
+//         Message::Text(text) => { ... dispatch_ws_frame(frame, &tx, &state).await; }
+//
+// `orchestration.subscribeThread` attaches a durable tail and never returns, so
+// awaiting it there parked the READER. Every frame that arrived afterwards was
+// never read at all — not merely never answered. That starves exactly the two
+// frames whose whole purpose is to control a running stream: Effect RPC's
+// per-chunk `Ack`, and #411's `Interrupt` (the stop button). At the glass it
+// showed up as "Loading messages..." forever and a turn that had actually run
+// but could never be delivered.
+//
+// THESE TESTS MUST BIND THE REAL ROUTER. The note on `build_app` says it
+// outright: the wedge lives ABOVE the request dispatcher, so calling
+// `dispatch_ws_frame` directly does not reproduce it. A guard that skips the
+// socket is a guard that passes against the broken code — I checked, and an
+// earlier JS version of this assertion did exactly that.
+mod ws_head_of_line {
+    use super::*;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// Serve the REAL router on an ephemeral port. Returns the ws:// URL and the
+    /// serve task, which the caller aborts.
+    async fn serve(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let app = crate::build_app(state);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("ws://{addr}/ws"), handle)
+    }
+
+    fn request(id: &str, tag: &str, payload: serde_json::Value) -> WsMessage {
+        WsMessage::Text(
+            json!({ "_tag": "Request", "id": id, "tag": tag, "payload": payload })
+                .to_string()
+                .into(),
+        )
+    }
+
+    /// Read frames until `want(frame)` is true, or the budget expires.
+    /// Returns every frame seen, so a failure can say what DID arrive.
+    async fn read_until<S>(
+        stream: &mut S,
+        budget: std::time::Duration,
+        want: impl Fn(&Value) -> bool,
+    ) -> (bool, Vec<Value>)
+    where
+        S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let mut seen = Vec::new();
+        let found = tokio::time::timeout(budget, async {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let WsMessage::Text(t) = msg {
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        let hit = want(&v);
+                        seen.push(v);
+                        if hit {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        (found, seen)
+    }
+
+    fn is_exit_for(v: &Value, id: &str) -> bool {
+        v.get("_tag").and_then(Value::as_str) == Some("Exit")
+            && v.get("requestId").and_then(Value::as_str) == Some(id)
+    }
+
+    /// THE REGRESSION. A request sent after a live subscription must still be
+    /// READ and answered on the same socket.
+    ///
+    /// The budget is deliberately short. The defect is not "slow" — a parked
+    /// reader never answers at all — so a small budget makes the test fast
+    /// without making it flaky, and a genuine timeout here means the reader is
+    /// blocked rather than busy.
+    #[tokio::test]
+    async fn a_request_after_a_live_subscription_is_still_answered() {
+        let (state, _dir) = test_state().await;
+        let (url, server) = serve(state).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect to the real router");
+
+        // Park a durable tail on the socket. This request never Exits by design;
+        // it streams Chunks for the life of the thread.
+        ws.send(request("sub", "orchestration.subscribeThread", json!({ "threadId": "hol-guard" })))
+            .await
+            .expect("send subscribeThread");
+
+        // Wait for the subscription to be genuinely LIVE before probing. Sending
+        // the probe first would let it win a race and pass against a reader that
+        // is about to park — the test would then be green for the wrong reason.
+        let (live, seen) = read_until(&mut ws, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Chunk")
+                && v.get("requestId").and_then(Value::as_str) == Some("sub")
+        })
+        .await;
+        assert!(live, "subscribeThread never streamed a Chunk; frames seen: {seen:?}");
+
+        ws.send(request("probe", "server.getConfig", json!({})))
+            .await
+            .expect("send the probe request");
+        let (answered, seen) = read_until(&mut ws, std::time::Duration::from_secs(20), |v| {
+            is_exit_for(v, "probe")
+        })
+        .await;
+
+        server.abort();
+        assert!(
+            answered,
+            "#432: `server.getConfig` sent AFTER a live subscription was never answered — the read \
+             loop is parked inside the subscription, so the frame was never READ. Frames that did \
+             arrive: {seen:?}"
+        );
+    }
+
+    /// The consequence that actually reaches the user: with the reader parked,
+    /// the stop button and RPC flow control are unreachable exactly when a
+    /// stream is running. `Ping`/`Pong` stands in for them because it is
+    /// answered by the same read loop with no runtime state of its own, so a
+    /// failure here is unambiguously the transport rather than a handler.
+    #[tokio::test]
+    async fn control_frames_are_still_read_while_a_stream_is_live() {
+        let (state, _dir) = test_state().await;
+        let (url, server) = serve(state).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect to the real router");
+
+        ws.send(request("sub", "orchestration.subscribeThread", json!({ "threadId": "ctl-guard" })))
+            .await
+            .expect("send subscribeThread");
+        let (live, seen) = read_until(&mut ws, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Chunk")
+        })
+        .await;
+        assert!(live, "subscribeThread never streamed a Chunk; frames seen: {seen:?}");
+
+        ws.send(WsMessage::Text(r#"{"_tag":"Ping"}"#.into()))
+            .await
+            .expect("send Ping");
+        let (ponged, seen) = read_until(&mut ws, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Pong")
+        })
+        .await;
+
+        server.abort();
+        assert!(
+            ponged,
+            "#432: a `Ping` sent while a stream was live was never answered. Ack and Interrupt \
+             ride the same read loop, so the stop button is unreachable precisely when there is \
+             something to stop. Frames that did arrive: {seen:?}"
+        );
+    }
+}

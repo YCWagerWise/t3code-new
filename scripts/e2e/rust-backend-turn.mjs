@@ -20,8 +20,57 @@
  */
 import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
-const { chromium } = require("playwright-core");
+/**
+ * playwright-core is a dependency of `apps/desktop`, not of this script's
+ * package, so a bare `require("playwright-core")` from `scripts/e2e/` throws
+ * MODULE_NOT_FOUND — the harness could not run from the directory it lives in.
+ * Resolve it against the workspaces that actually declare it, and say WHERE it
+ * was found so a wrong copy is visible rather than silent.
+ */
+const REPO_ROOT = new URL("../../", import.meta.url).pathname;
+function loadPlaywright() {
+  const roots = [
+    import.meta.url,
+    `file://${REPO_ROOT}apps/desktop/package.json`,
+    `file://${REPO_ROOT}package.json`,
+  ];
+  const tried = [];
+  for (const from of roots) {
+    try {
+      return createRequire(from)("playwright-core");
+    } catch (e) {
+      tried.push(`${from}: ${e.code ?? e.message}`);
+    }
+  }
+  throw new Error(`playwright-core not resolvable. Tried:\n  ${tried.join("\n  ")}`);
+}
+const { chromium } = loadPlaywright();
+
+/**
+ * The bundled browser is NOT usable: playwright-core 1.60 asks its registry for
+ * chromium-1223 while chromium-1228 is what is installed, so `launch()` with no
+ * executable fails. Prefer the installed Chrome/Chromium; fall back to whatever
+ * the registry does resolve. Never hardcode an absolute per-user cache path —
+ * that is what made the previous rig physically unable to run on the build box.
+ */
+async function launchBrowser() {
+  const attempts = [
+    { channel: "chrome", headless: true },
+    { channel: "chromium", headless: true },
+    { headless: true },
+  ];
+  const tried = [];
+  for (const opts of attempts) {
+    try {
+      const b = await chromium.launch(opts);
+      console.log(`browser: ${JSON.stringify(opts)}`);
+      return b;
+    } catch (e) {
+      tried.push(`${JSON.stringify(opts)}: ${e.message.split("\n")[0]}`);
+    }
+  }
+  throw new Error(`no launchable browser. Tried:\n  ${tried.join("\n  ")}`);
+}
 
 const APP = process.argv[2] ?? "http://127.0.0.1:5199/";
 const PROMPT = "Reply with exactly the word PONG and nothing else.";
@@ -34,7 +83,7 @@ const check = (name, ok, detail = "") => {
   if (!ok) failures++;
 };
 
-const browser = await chromium.launch({ channel: "chrome", headless: true });
+const browser = await launchBrowser();
 const page = await browser.newPage();
 
 // Record every Effect-RPC frame on the app's socket, both directions.
@@ -46,9 +95,14 @@ const rpc = (tag) => frames.filter((f) => f.payload.includes(`"${tag}"`));
 
 try {
   step(1, "boot the real bundle against the Rust backend");
-  await page.goto(APP, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  // `domcontentloaded` is the WRONG event for this app in dev. The entry is a
+  // deferred module script, so DOMContentLoaded does not fire until the whole
+  // module graph has been fetched and executed — minutes on a cold unbundled
+  // graph — and the harness reported "the app does not boot" for what was
+  // actually a cold cache. Commit, then wait for the thing we actually need.
+  await page.goto(APP, { waitUntil: "commit", timeout: 60_000 });
   const composer = page.locator('[contenteditable="true"]').first();
-  await composer.waitFor({ state: "visible", timeout: 60_000 });
+  await composer.waitFor({ state: "visible", timeout: 180_000 });
   check("composer renders", true, `url=${page.url()}`);
   check("landed on a draft route", /\/draft\//.test(page.url()), page.url());
 
@@ -57,20 +111,25 @@ try {
   await page.keyboard.type(PROMPT, { delay: 8 });
   const typed = (await composer.innerText()).trim();
   check("composer holds the typed prompt", typed.includes("PONG"), JSON.stringify(typed));
-  if (!typed.includes("PONG")) throw new Error("composer never received text — cannot drive a turn");
+  if (!typed.includes("PONG"))
+    throw new Error("composer never received text — cannot drive a turn");
 
   step(3, "send — draft promotion");
   const draftUrl = page.url();
   await page.getByRole("button", { name: /send message/i }).click();
-  await page
-    .waitForURL((u) => !/\/draft\//.test(String(u)), { timeout: 60_000 })
-    .catch(() => {});
-  check("draft promoted to a real thread route", page.url() !== draftUrl, `${draftUrl} -> ${page.url()}`);
+  await page.waitForURL((u) => !/\/draft\//.test(String(u)), { timeout: 60_000 }).catch(() => {});
+  check(
+    "draft promoted to a real thread route",
+    page.url() !== draftUrl,
+    `${draftUrl} -> ${page.url()}`,
+  );
   // Count only frames the CLIENT sent: the tag string also appears inside
   // server config/catalog payloads, so an undirected match reports a turn that
   // was never dispatched.
   const sentTurn = frames.filter(
-    (f) => f.dir === "c2s" && /"tag":"(orchestration\.dispatchCommand|thread\.turn\.start)"/.test(f.payload),
+    (f) =>
+      f.dir === "c2s" &&
+      /"tag":"(orchestration\.dispatchCommand|thread\.turn\.start)"/.test(f.payload),
   );
   check(
     "client actually dispatched a turn",

@@ -575,6 +575,14 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(asset_http),
         )
         .route("/api/orchestration/shell", get(shell_snapshot_http))
+        // #436: the promotion lookup. The client GETs this the moment a draft
+        // becomes a real thread; without it the 404 leaves the route parked on
+        // /draft/<id> forever while the turn it started runs to completion
+        // somewhere the view is not looking.
+        .route(
+            "/api/orchestration/threads/{thread_id}",
+            get(thread_snapshot_http),
+        )
         .fallback(capture_http)
         .with_state(state)
 }
@@ -897,6 +905,10 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // and the next turn can silently drift back to it. Update the thread's
     // modelSelection + timestamps, re-save, and re-announce so the snapshot and
     // every subscriber reflect the switch — history is untouched.
+    // Did this call CREATE the thread, or update one that already existed? The
+    // answer decides whether `thread.created` is owed, and it can only be asked
+    // here — after `save_thread` the row exists either way.
+    let is_new_thread = existing_row.is_none();
     let thread = match existing_row {
         None => thread,
         Some(mut existing) => {
@@ -918,6 +930,46 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // process-local rollback to do — the store IS the state.
     if let Err(e) = state.rt.save_thread(&thread).await {
         return Err(format!("persisting thread {thread_id}: {e}"));
+    }
+    // #437: `thread.created` — THE EVENT DRAFT PROMOTION WAITS FOR.
+    //
+    // apps/web/src/orchestrationEventEffects.ts:31 promotes a draft on
+    // `case "thread.created"` and on nothing else. This backend emitted only
+    // `thread-upserted`, which is a SHELL frame (the sidebar list), not the
+    // thread lifecycle event the reducer switches on. So the durable row was
+    // written, the sidebar updated, the turn ran, its events were delivered
+    // correctly to the socket the client had subscribed on — and the view
+    // stayed parked on `/draft/<draftId>` rendering a draft that would never
+    // receive anything, because the one event that ends a draft's life never
+    // arrived. Reported as "2 minutes for a hi": the reply was on the wire in
+    // 38s and the composer sat on "Thinking" indefinitely.
+    //
+    // Emitted only on CREATE. Sending it on every turn would re-promote a draft
+    // that is already a thread, and `thread-upserted` still carries the update
+    // case — these are two different questions and they keep their two events.
+    //
+    // Ordering: AFTER the durable save, BEFORE the shell upsert. The event says
+    // "this thread exists", so the row must exist first or a client acting on it
+    // races a read against a write that has not landed.
+    if is_new_thread {
+        let payload = json!({
+            "threadId": thread_id,
+            "projectId": project_id,
+            "title": title,
+            "modelSelection": sel,
+            "runtimeMode": runtime_mode,
+            "interactionMode": launch.interaction_mode,
+            "branch": branch,
+            "worktreePath": worktree_path,
+            "createdAt": now,
+            "updatedAt": now,
+        });
+        if let Err(e) = emit_thread_event(&state.rt, &thread_id, "thread.created", payload).await {
+            // A lost `thread.created` is a draft that never promotes, which is
+            // indistinguishable at the glass from a hung turn. Fail the bootstrap
+            // rather than run a turn whose result has nowhere to land.
+            return Err(format!("announcing thread {thread_id}: {e}"));
+        }
     }
     upsert_thread_on_shell(state, thread).await;
     Ok(())
@@ -1712,7 +1764,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                dispatch_ws_frame(frame, &tx, &state).await;
+                // SPAWNED, not awaited (#432). Awaiting here made the READ LOOP
+                // the thing a long-lived subscription blocks: `subscribeThread`
+                // and `terminal.attach` never return, so the socket stopped
+                // reading FOREVER at the first one. The proof was the absent log
+                // line — a later request on that same socket never reached
+                // "ws: REQUEST" at all, because nothing was reading it.
+                //
+                // The two frames that exist to CONTROL a live stream are the
+                // ones this starved: Effect RPC's per-chunk `Ack` and #411's
+                // `Interrupt`. Both arrive while a stream is running, which is
+                // exactly when the reader was parked inside it. So flow control
+                // and cancellation were unreachable precisely when needed.
+                //
+                // Concurrency is safe: every Request carries its own requestId,
+                // so Effect RPC already tolerates out-of-order Exits, and each
+                // handler owns its own reply channel. This is NOT special-cased
+                // to the subscribe methods on purpose — a fast path for those
+                // would leave Ack and Interrupt starved by the same mechanism.
+                let (tx2, state2) = (tx.clone(), state.clone());
+                tokio::spawn(async move {
+                    dispatch_ws_frame(frame, &tx2, &state2).await;
+                });
             }
             Message::Close(_) => break,
             other => {
@@ -5474,6 +5547,165 @@ async fn shell_snapshot(state: &AppState, mark: i64, archived_only: bool) -> Res
 /// `200 {}`, the client's contract decode failed, and every session silently
 /// fell back to the socket — visible in the browser console as
 /// "Could not load the environment shell snapshot over HTTP".
+/// `GET /api/orchestration/threads/:threadId` — the one-shot thread snapshot
+/// (`OrchestrationThreadDetailSnapshot`, contracts/src/environmentHttp.ts:516).
+///
+/// #436. This route did not exist, and its absence is what broke DRAFT
+/// PROMOTION. The sequence, watched on the wire:
+///   1. the UI sits on `/draft/<draftId>`
+///   2. a turn is dispatched and the backend creates the REAL thread
+///   3. the client GETs this route for the real thread id, to promote
+///   4. 404 -> promotion never happens -> the route stays on the draft
+///   5. the turn runs to completion and its events are delivered correctly to
+///      the socket the client subscribed on, and the view renders none of them
+///      because it is still rendering the draft
+/// The symptom reported was "2 minutes for a hi": the reply had arrived on the
+/// wire in 38s, and the composer sat on "Thinking" because the promoted thread
+/// was never the one on screen.
+///
+/// Deliberately NO `snapshot_tail` here, unlike the `subscribeThread` arm. A
+/// tail exists to close the gap between a snapshot and a live stream; HTTP has
+/// no stream to bridge, and attaching one would leave a durable subscriber row
+/// that nothing ever drains or acks.
+async fn thread_snapshot_http(
+    State(state): State<AppState>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return http_failure("thread snapshot: empty threadId");
+    }
+    // The DURABLE record is the authority. A thread with no row cannot be
+    // snapshotted honestly — every metadata field would be invented — so this
+    // says so rather than shaping a plausible lie.
+    let record = match state.rt.thread_record(thread_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return http_failure(&format!("thread snapshot: unknown thread {thread_id}")),
+        Err(e) => return http_failure(&format!("thread snapshot: thread store unreadable: {e}")),
+    };
+    let messages = match state.rt.try_messages(thread_id).await {
+        Ok(m) => m,
+        Err(e) => return http_failure(&format!("thread snapshot: message store unreadable: {e}")),
+    };
+    // FAIL CLOSED on the pending set (packet M): an unreadable pending set is
+    // NOT an empty one, and handing back a snapshot with no approvals when the
+    // store is damaged hides a parked run behind a UI that looks idle.
+    let pending = match state.rt.pending_approvals_typed(thread_id).await {
+        Ok(p) => p,
+        Err(e) => return http_failure(&format!("thread snapshot: pending approvals unreadable: {e}")),
+    };
+    let mut activities: Vec<Value> = pending
+        .iter()
+        .map(|a| {
+            event_adapter::approval_requested_activity(
+                &a.session_id,
+                a.turn,
+                &a.call_id,
+                a.tool.as_deref().unwrap_or(""),
+                &a.args,
+                None,
+                &iso_ms(a.created_at_secs),
+            )
+        })
+        .collect();
+    let has_pending = !activities.is_empty();
+    // A question the agent asked is a parked wait too, and it has to survive a
+    // reload the same way an approval does.
+    match state.rt.pending_user_inputs(thread_id).await {
+        Ok(asks) => {
+            for ask in asks {
+                let session_id = ask.session_id;
+                let summary = if ask.prompt.trim().is_empty() {
+                    "The agent has a question".to_string()
+                } else {
+                    ask.prompt.clone()
+                };
+                activities.push(json!({
+                    "id": format!("user-input:{session_id}"),
+                    "tone": "approval",
+                    "kind": "user-input.requested",
+                    "summary": summary,
+                    "payload": {
+                        "requestId": session_id,
+                        "prompt": ask.prompt,
+                        "questions": ask.questions,
+                    },
+                    "createdAt": ask.requested_at,
+                }));
+            }
+        }
+        Err(e) => {
+            return http_failure(&format!("thread snapshot: pending questions unreadable: {e}"))
+        }
+    }
+    let has_pending_user_input = activities.len() > pending.len();
+    let now = now_iso();
+    // #92/#210: a "running" session whose activeTurnId is null hydrates NO
+    // stoppable latest turn, so a reload shows a spinner with no way out. A
+    // FAILED read of that marker must not be rendered as "no turn running" —
+    // that is the state that settles the spinner and drops the stop affordance.
+    let session = match state.rt.session_status(thread_id).await {
+        Ok(Some((_sid, st))) => {
+            use agent_sdk_shell::TurnState;
+            let live = matches!(st, TurnState::Running | TurnState::AwaitingApproval);
+            let status = match st {
+                TurnState::Running | TurnState::AwaitingApproval => "running",
+                TurnState::Failed => "error",
+                _ => "idle",
+            };
+            let active_turn = if live {
+                match state.rt.active_turn_id(thread_id).await {
+                    Ok(v) => v.map(Value::String).unwrap_or(Value::Null),
+                    Err(e) => {
+                        return http_failure(&format!(
+                            "thread snapshot: active turn unreadable: {e}"
+                        ))
+                    }
+                }
+            } else {
+                Value::Null
+            };
+            json!({
+                "threadId": thread_id, "status": status, "providerName": Value::Null,
+                "activeTurnId": active_turn, "lastError": Value::Null, "updatedAt": now,
+            })
+        }
+        Ok(None) => Value::Null,
+        Err(e) => return http_failure(&format!("thread snapshot: session status unreadable: {e}")),
+    };
+    let checkpoints = match checkpoint_summaries(
+        &state,
+        record.worktree_path.as_deref().unwrap_or(&state.cwd),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return http_failure(&format!("thread snapshot: {e}")),
+    };
+    let parts = json!({
+        "messages": messages,
+        "activities": activities,
+        "hasPendingApprovals": has_pending,
+        "hasPendingUserInput": has_pending_user_input,
+        "checkpoints": checkpoints,
+        "session": session,
+    });
+    let thread_obj = match record.project(parts) {
+        Ok(v) => v,
+        Err(e) => {
+            return http_failure(&format!("thread snapshot: invalid thread projection: {e}"))
+        }
+    };
+    // The sequence is read AFTER the reads above, so it can only be at or ahead
+    // of what this body reflects. A client that resumes `subscribeThread` from
+    // it re-receives a little rather than skipping anything — the safe side.
+    let seq = match state.rt.current_sequence().await {
+        Ok(s) => s,
+        Err(e) => return http_failure(&format!("thread snapshot: sequence unreadable: {e}")),
+    };
+    Json(json!({ "snapshotSequence": seq, "thread": thread_obj })).into_response()
+}
+
 async fn shell_snapshot_http(State(state): State<AppState>) -> axum::response::Response {
     let mark = match state.rt.current_sequence().await {
         Ok(mark) => mark,
