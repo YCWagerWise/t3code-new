@@ -59,6 +59,16 @@ function isCredentialInsecureMessage(message: string): boolean {
   return message.includes("is not marked sensitive");
 }
 
+/**
+ * "T3 has no saved instance" is a CONFIGURATION state, not a reachability one. Left in the
+ * default `unreachable` bucket it accused the Atlas node of being down when the node was
+ * healthy and T3 simply had nothing saved — the first operator to see it read the banner as
+ * Atlas failing.
+ */
+function isUnknownInstanceMessage(message: string): boolean {
+  return message.includes("has no saved provider instance");
+}
+
 function parseJsonRecord(bodyText: string): Record<string, unknown> | null {
   try {
     const parsed: unknown = JSON.parse(bodyText);
@@ -89,6 +99,7 @@ export function handshakeGrantsDiagnosticsRead(
 }
 
 function classifyProxyFailure(message: string): AtlasDiagnosticsViewState {
+  if (isUnknownInstanceMessage(message)) return { kind: "not-configured" };
   return isCredentialInsecureMessage(message)
     ? { kind: "credential-refused-insecure", message }
     : { kind: "unreachable", message };

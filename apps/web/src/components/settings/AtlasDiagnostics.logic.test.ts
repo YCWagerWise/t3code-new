@@ -90,6 +90,24 @@ describe("deriveAtlasDiagnosticsViewState", () => {
     expect(state.kind).toBe("not-configured");
   });
 
+  /**
+   * A default Atlas ROW exists on the Providers page before anything is saved, so
+   * `atlasInstanceId` is non-null while the server still has no instance. That path used to
+   * fall through to `unreachable`, which blamed a healthy Atlas node for T3's empty settings —
+   * the first operator to see it read the banner as Atlas being down.
+   */
+  it("renders not-configured, not unreachable, when the server has no saved instance", () => {
+    const state = deriveAtlasDiagnosticsViewState({
+      ...baseInput(),
+      atlasInstanceId: "atlas",
+      handshake: {
+        data: null,
+        error: 'T3 has no saved provider instance "atlas". Add it under Settings / Providers.',
+      },
+    });
+    expect(state.kind).toBe("not-configured");
+  });
+
   it("renders loading while the handshake is still in flight", () => {
     const state = deriveAtlasDiagnosticsViewState(baseInput());
     expect(state.kind).toBe("loading");

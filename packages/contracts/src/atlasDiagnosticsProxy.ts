@@ -95,7 +95,12 @@ export class AtlasProxyUnknownProviderInstanceError extends Schema.TaggedErrorCl
   { providerInstanceId: TrimmedNonEmptyString },
 ) {
   override get message(): string {
-    return `No provider instance "${this.providerInstanceId}" is configured on this server.`;
+    // Names T3 explicitly. "this server" was read as ATLAS by the first operator to hit it,
+    // which is the opposite of what it means — the Atlas node is fine, T3 has nothing saved.
+    return (
+      `T3 has no saved provider instance "${this.providerInstanceId}". ` +
+      "Add it under Settings / Providers."
+    );
   }
 }
 
