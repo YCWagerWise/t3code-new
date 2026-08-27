@@ -997,6 +997,13 @@ describe("deriveLockedProvider is attempt-scoped, not thread-scoped", () => {
     }
   });
 
+  it("locks while the session is starting, before any running turn exists", () => {
+    // The window the server also refuses in: a start has committed, no running turn yet.
+    const starting = threadWith({ sessionStatus: "starting", activeTurnId: null });
+    expect(attemptInFlight(starting)).toBe(true);
+    expect(lockFor(starting)).toEqual("claudeAgent");
+  });
+
   it("releases when a live session sits idle between turns", () => {
     const idle = threadWith({
       latestTurnState: "completed",

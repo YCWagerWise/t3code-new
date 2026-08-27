@@ -481,8 +481,12 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
 export function attemptInFlight(thread: Thread | null | undefined): boolean {
   if (!thread) return false;
   const session = thread.session;
-  if (session && session.status === "running" && session.activeTurnId !== null) {
-    return true;
+  if (session) {
+    // `starting` is in flight even with no activeTurnId yet: the start request has already
+    // committed, and letting the selection move inside that window would bind the attempt to
+    // something the caller never chose. The server refuses a switch here for the same reason.
+    if (session.status === "starting") return true;
+    if (session.status === "running" && session.activeTurnId !== null) return true;
   }
   return thread.latestTurn?.state === "running";
 }

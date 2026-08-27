@@ -2636,7 +2636,14 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
-  it("rejects cross-driver provider changes after the existing thread session has stopped", async () => {
+  /**
+   * Re-pointed by finding #38. This previously asserted that a STOPPED session still refused a
+   * cross-driver change, which the ruling reverses: a settled attempt must not constrain the
+   * next one. The invariant it was really protecting — you cannot move the binding out from
+   * under an attempt — is preserved here at the boundary that now matters, and which nothing
+   * covered before: `starting`, where a start request has committed but no running turn exists.
+   */
+  it("rejects a cross-driver provider change while the next attempt is still starting", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
 
@@ -2647,7 +2654,8 @@ describe("ProviderCommandReactor", () => {
         threadId: ThreadId.make("thread-1"),
         session: {
           threadId: ThreadId.make("thread-1"),
-          status: "stopped",
+          // In flight: a start has committed, no running turn exists yet.
+          status: "starting",
           providerName: "codex",
           providerInstanceId: ProviderInstanceId.make("codex"),
           runtimeMode: "approval-required",
@@ -2700,6 +2708,70 @@ describe("ProviderCommandReactor", () => {
         detail: expect.stringContaining("cannot switch to 'claudeAgent'"),
       },
     });
+  });
+
+  /**
+   * Finding #38. A settled attempt must not constrain the next one: the channel's contract is
+   * that a binding is immutable WITHIN an attempt and free BETWEEN settled ones. The rejection
+   * above gates on `thread.session !== null` with no settlement test, so a finished Claude
+   * conversation can never move to Atlas — which makes the composer's newly offered switch
+   * display-only.
+   */
+  it("accepts a cross-driver provider change once the previous attempt has settled", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-settled-switch"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          // Settled: stopped, with no attempt in flight.
+          status: "stopped",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-settled-switch"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-settled-switch"),
+          role: "user",
+          text: "continue with claude",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-4-6",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    // The next attempt runs on the newly chosen driver rather than being refused. Both mocks
+    // are awaited: sendTurn follows startSession, so asserting it synchronously would race.
+    await waitFor(async () => harness.startSession.mock.calls.length > 0);
+    await waitFor(async () => harness.sendTurn.mock.calls.length > 0);
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.find((activity) => activity.kind === "provider.turn.start.failed"),
+    ).toBeUndefined();
   });
 
   it("reacts to thread.turn.interrupt-requested by calling provider interrupt", async () => {

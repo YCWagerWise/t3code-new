@@ -624,8 +624,20 @@ const make = Effect.gen(function* () {
         requestedModelSelection,
       });
     }
-    if (
+    // A binding is immutable WITHIN an attempt and free BETWEEN settled ones. Gating on "a
+    // session exists" made it permanent instead: a finished conversation could never move to
+    // another provider, so the composer's offer to switch was display-only readiness.
+    //
+    // `starting` counts as in flight on purpose. A start request has already committed by then
+    // even though no running turn exists yet, and letting the selection move inside that window
+    // would bind the attempt to something the caller never chose.
+    const previousAttemptInFlight =
       thread.session !== null &&
+      (thread.session.status === "starting" ||
+        thread.session.status === "running" ||
+        thread.session.activeTurnId !== null);
+    if (
+      previousAttemptInFlight &&
       requestedModelSelection !== undefined &&
       requestedModelSelection.instanceId !== currentInstanceId
     ) {
