@@ -38,6 +38,16 @@ function PairRouteView() {
     return <HostedPairingRouteSurface />;
   }
 
+  // #27: the backend was unreachable at boot, so there is no `auth` descriptor to
+  // pair against — the server never answered the request that would have told us
+  // which bootstrap methods it offers. Rendering the pairing form anyway would
+  // ask the user to authenticate against a server that is not there. The root
+  // route already renders the real explanation for this state; this branch just
+  // keeps the pairing surface from being handed an `auth` that does not exist.
+  if (authGateState.status === "environment-unreachable") {
+    return <PairRoutePendingView />;
+  }
+
   return (
     <PairingRouteSurface
       auth={authGateState.auth}
