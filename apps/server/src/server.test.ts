@@ -148,6 +148,7 @@ import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts"
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
+import * as AtlasDiagnosticsProxy from "./diagnostics/AtlasDiagnosticsProxy.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as DesktopTelemetryReceiver from "./resourceTelemetry/DesktopTelemetryReceiver.ts";
 import * as NativeTelemetryClient from "./resourceTelemetry/NativeTelemetryClient.ts";
@@ -670,6 +671,14 @@ const buildAppUnderTest = (options?: {
           }),
           Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
             resolveTargets: () => Effect.succeed([]),
+          }),
+          // The router seam requires the Atlas proxy because the RPC handlers do, but these
+          // tests exercise routing, not Atlas. Merged in here rather than added as another
+          // `Layer.provide`: this pipe is already at `pipe`'s 20-argument ceiling.
+          Layer.mock(AtlasDiagnosticsProxy.AtlasDiagnosticsProxy)({
+            callHttp: () => Effect.succeed({ status: 200, bodyText: "{}" }),
+            openFeed: () => Stream.empty,
+            sendCommand: () => Effect.succeed({ sent: false }),
           }),
         ),
       ),

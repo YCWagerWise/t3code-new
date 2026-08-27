@@ -60,6 +60,22 @@ import * as ServerSettings from "../serverSettings.ts";
 
 /** A generous but finite ceiling — a diagnostics dump is telemetry, not a file transfer. */
 export const ATLAS_PROXY_MAX_BODY_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The live relay needs its own bounds, and for the same reason the HTTP path has them: a
+ * configured node is not a trusted one, and a browser that stops draining is not a rare case.
+ *
+ * A frame over `ATLAS_PROXY_MAX_FRAME_BYTES` CLOSES the relay rather than being truncated —
+ * truncating would hand the browser a half a JSON document and let it decode garbage. A queue
+ * that cannot accept a frame also closes it, rather than dropping one silently: the browser
+ * owns the Atlas cursor, so a hole it cannot see is worse than a disconnect it can, and the
+ * reconnect path already replays from that cursor.
+ */
+export const ATLAS_PROXY_MAX_FRAME_BYTES = 1024 * 1024;
+export const ATLAS_PROXY_RELAY_BUFFER_FRAMES = 256;
+/** Close codes the relay itself originates, distinct from anything Atlas sends. */
+export const ATLAS_PROXY_CLOSE_FRAME_TOO_LARGE = 4009;
+export const ATLAS_PROXY_CLOSE_BACKPRESSURE = 4010;
 export const ATLAS_PROXY_DEFAULT_TIMEOUT_MS = 10_000;
 
 const ROUTE_PATHS: Record<AtlasDiagnosticsHttpRoute, string> = {
@@ -373,35 +389,99 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
           const providerInstances = yield* currentProviderInstances;
           const endpoint = yield* resolveAtlasEndpoint(input.providerInstanceId, providerInstances);
           const wsUrl = feedWsUrl(endpoint);
-          return Stream.callback<AtlasDiagnosticsRelayEvent>((queue) =>
-            Effect.gen(function* () {
-              const relaySessionId = AtlasDiagnosticsRelaySessionId.make(mintRelaySessionId());
-              let isClosed = false;
-              const socket = socketFactory(wsUrl, {
-                onOpen: () => {
-                  Queue.offerUnsafe(queue, { kind: "open", relaySessionId });
-                },
-                onMessage: (data) => {
-                  Queue.offerUnsafe(queue, { kind: "message", raw: data });
-                },
-                onClose: (code, reason) => {
+          return Stream.callback<AtlasDiagnosticsRelayEvent, AtlasDiagnosticsProxyError>(
+            (queue) =>
+              Effect.gen(function* () {
+                const relaySessionId = AtlasDiagnosticsRelaySessionId.make(mintRelaySessionId());
+                let isClosed = false;
+                let socket: RelaySocket | undefined;
+
+                /** Ends the relay on OUR terms, so the browser is told rather than left guessing. */
+                const closeLocally = (code: number, reason: string) => {
+                  if (isClosed) return;
                   isClosed = true;
                   relaySessions.delete(relaySessionId);
                   Queue.offerUnsafe(queue, { kind: "closed", code, reason });
                   Queue.endUnsafe(queue);
-                },
-              });
-              // A socket that already closed SYNCHRONOUSLY (an immediate auth refusal) must
-              // never be registered as sendable — `sendCommand` has to see it as gone, not as
-              // a session it can still write to.
-              if (!isClosed) relaySessions.set(relaySessionId, socket);
-              yield* Effect.addFinalizer(() =>
-                Effect.sync(() => {
-                  relaySessions.delete(relaySessionId);
-                  if (!isClosed) socket.close();
-                }),
-              );
-            }),
+                  try {
+                    socket?.close();
+                  } catch {
+                    // Already gone; the browser has its `closed` either way.
+                  }
+                };
+
+                /**
+                 * A full queue means the browser is not keeping up. Dropping the frame would
+                 * leave a hole it cannot detect, so the relay closes instead and lets the
+                 * reconnect replay from the cursor the browser already holds.
+                 */
+                const offerOrClose = (event: AtlasDiagnosticsRelayEvent) => {
+                  if (isClosed) return;
+                  if (!Queue.offerUnsafe(queue, event)) {
+                    closeLocally(
+                      ATLAS_PROXY_CLOSE_BACKPRESSURE,
+                      "relay buffer full; reconnect and replay from your cursor",
+                    );
+                  }
+                };
+
+                const handlers: RelaySocketHandlers = {
+                  onOpen: () => {
+                    offerOrClose({ kind: "open", relaySessionId });
+                  },
+                  onMessage: (data) => {
+                    const bytes = Buffer.byteLength(data, "utf8");
+                    if (bytes > ATLAS_PROXY_MAX_FRAME_BYTES) {
+                      closeLocally(
+                        ATLAS_PROXY_CLOSE_FRAME_TOO_LARGE,
+                        `frame of ${bytes} bytes exceeds the ${ATLAS_PROXY_MAX_FRAME_BYTES}-byte relay limit`,
+                      );
+                      return;
+                    }
+                    offerOrClose({ kind: "message", raw: data });
+                  },
+                  onClose: (code, reason) => {
+                    if (isClosed) return;
+                    isClosed = true;
+                    relaySessions.delete(relaySessionId);
+                    Queue.offerUnsafe(queue, { kind: "closed", code, reason });
+                    Queue.endUnsafe(queue);
+                  },
+                };
+
+                // Constructing the socket can throw SYNCHRONOUSLY — a URL the runtime refuses,
+                // a connection it declines outright. Left bare that becomes a defect outside the
+                // declared error type, so the lens could not render `unreachable` for the very
+                // failure most likely to cause it.
+                try {
+                  socket = socketFactory(wsUrl, handlers);
+                } catch (cause) {
+                  return yield* Effect.fail(
+                    new AtlasProxyUnreachableError({
+                      providerInstanceId: input.providerInstanceId,
+                      detail: cause instanceof Error ? cause.message : String(cause),
+                    }),
+                  );
+                }
+                // A socket that already closed SYNCHRONOUSLY (an immediate auth refusal) must
+                // never be registered as sendable — `sendCommand` has to see it as gone, not as
+                // a session it can still write to.
+                if (!isClosed) relaySessions.set(relaySessionId, socket);
+                const opened = socket;
+                yield* Effect.addFinalizer(() =>
+                  Effect.sync(() => {
+                    relaySessions.delete(relaySessionId);
+                    if (!isClosed) opened.close();
+                  }),
+                );
+              }),
+            // Bounded so a browser that stops draining cannot grow this process without
+            // limit. `dropping` is the backstop only: `offerOrClose` sees the refused offer
+            // first and ends the relay, so a dropped frame is never a silent gap.
+            {
+              bufferSize: ATLAS_PROXY_RELAY_BUFFER_FRAMES,
+              strategy: "dropping",
+            },
           );
         }),
       );
@@ -410,6 +490,11 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
       Effect.sync(() => {
         const socket = relaySessions.get(input.relaySessionId);
         if (socket === undefined) return { sent: false };
+        // The outbound direction is bounded for the same reason the inbound one is: `raw` is
+        // caller-supplied and a command has no legitimate reason to approach a frame limit.
+        if (Buffer.byteLength(input.raw, "utf8") > ATLAS_PROXY_MAX_FRAME_BYTES) {
+          return { sent: false };
+        }
         try {
           socket.send(input.raw);
           return { sent: true };
