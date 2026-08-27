@@ -4007,6 +4007,7 @@ dependencies = [
  "chrono",
  "do-storage",
  "futures",
+ "futures-util",
  "hearth",
  "hmac 0.12.1",
  "regex",

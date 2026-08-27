@@ -196,6 +196,15 @@ struct AppState {
     /// transcripts, so the test either asserts nothing or asserts whatever
     /// happens to be on the machine (#328).
     usage_sources: Arc<Vec<agent_sdk_usage::SourceSpec>>,
+    /// How many spawned `Request` tasks are alive right now (#476).
+    ///
+    /// An OBSERVABLE, not a control: nothing reads it to make a decision, so it
+    /// cannot change behaviour. It exists because "the request task died with
+    /// its socket" is otherwise unfalsifiable — a detached task and an owned one
+    /// are byte-identical on the wire, and the difference only appears much
+    /// later as a leak. Decremented by a Drop guard so an ABORT still counts,
+    /// which is the whole case under test.
+    inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
     env: Value,
     cwd: String,
     project_name: String,
@@ -510,6 +519,7 @@ async fn main() {
         .await
         .expect("asset signing key");
     let state = AppState {
+        inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         rt,
         catalog,
         checkpoints,
@@ -1735,7 +1745,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
+    // #476: in-flight `Request` tasks, OWNED BY THIS SOCKET.
+    //
+    // A bare `tokio::spawn` fixes #432's starvation and opens a leak on the same
+    // line: the task is DETACHED, so a client that disconnects mid-stream leaves
+    // `orchestration.subscribeThread` attached to a durable tail, writing into a
+    // `tx` whose receiver is gone and holding an `AppState` clone forever.
+    // Reconnect and there are two. Serialization was the backpressure; removing
+    // it without putting ownership in its place trades a wedge for an unbounded
+    // leak on the exact path #27 is about.
+    //
+    // A `JoinSet` makes the lifetime structural instead of hoping the task ends:
+    // it is owned by this function, so it cannot outlive the connection. The
+    // design is claude-4e91's and it is better than the bare spawn I wrote.
+    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     while let Some(Ok(msg)) = stream.next().await {
+        // Reap finished tasks. A `JoinSet` keeps a completed task's slot until it
+        // is joined, so without this a long-lived socket grows one slot per
+        // request for its whole life — slower than the detached leak, still a leak.
+        while inflight.try_join_next().is_some() {}
         match msg {
             Message::Text(text) => {
                 let frame: Value = match serde_json::from_str(&text) {
@@ -1764,28 +1793,62 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         continue;
                     }
                 };
-                // SPAWNED, not awaited (#432). Awaiting here made the READ LOOP
-                // the thing a long-lived subscription blocks: `subscribeThread`
-                // and `terminal.attach` never return, so the socket stopped
-                // reading FOREVER at the first one. The proof was the absent log
-                // line — a later request on that same socket never reached
-                // "ws: REQUEST" at all, because nothing was reading it.
+                // #432: THE READ LOOP MUST NEVER AWAIT REQUEST HANDLING.
                 //
-                // The two frames that exist to CONTROL a live stream are the
-                // ones this starved: Effect RPC's per-chunk `Ack` and #411's
-                // `Interrupt`. Both arrive while a stream is running, which is
-                // exactly when the reader was parked inside it. So flow control
-                // and cancellation were unreachable precisely when needed.
+                // This used to be a bare `dispatch_ws_frame(...).await`, which
+                // makes the socket's reader and the request handler the same
+                // task. While a handler is in flight nothing is READ from the
+                // socket -- so the frames that exist precisely to arrive DURING
+                // a long request cannot arrive at all:
                 //
-                // Concurrency is safe: every Request carries its own requestId,
-                // so Effect RPC already tolerates out-of-order Exits, and each
-                // handler owns its own reply channel. This is NOT special-cased
-                // to the subscribe methods on purpose — a fast path for those
-                // would leave Ack and Interrupt starved by the same mechanism.
-                let (tx2, state2) = (tx.clone(), state.clone());
-                tokio::spawn(async move {
-                    dispatch_ws_frame(frame, &tx2, &state2).await;
-                });
+                //   * `Interrupt` (#411) is the stop button. Its entire purpose
+                //     is to reach a request that is still running. Awaiting the
+                //     request first makes it unreachable BY CONSTRUCTION: the
+                //     only moment it could be read is after the thing it wanted
+                //     to cancel has already finished.
+                //   * `Ack` is Effect RPC's stream flow-control frame, sent per
+                //     chunk. A stream that stops being acked is a client the
+                //     server has stopped listening to.
+                //   * every later `Request` on the same socket, which is why a
+                //     wedged handler renders as "the whole app hung" rather
+                //     than as one failed call.
+                //
+                // Requests are multiplexed by `requestId` -- that field is the
+                // protocol saying they are concurrent -- so handling them on
+                // their own task is what the wire format already promises. The
+                // cheap non-Request tags stay INLINE and therefore stay
+                // ordered: Interrupt must not be reordered behind a Request,
+                // which is the whole point of getting it off the blocked path.
+                //
+                // NOTE the seam this deliberately does not move:
+                // `dispatch_ws_frame` still awaits everything it is given, so
+                // every existing test that drives it directly keeps its
+                // determinism. The concurrency is introduced HERE, at the
+                // transport, because that is the layer whose job is to keep
+                // reading.
+                if frame.get("_tag").and_then(|t| t.as_str()) == Some("Request") {
+                    let tx = tx.clone();
+                    let state = state.clone();
+                    inflight.spawn(async move {
+                        // The counter is decremented by a GUARD, not by a
+                        // statement at the end of the block: a trailing statement
+                        // does not run when the task is ABORTED, and abort is
+                        // exactly the path #476 exists to observe.
+                        struct Inflight(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for Inflight {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        state
+                            .inflight_requests
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _guard = Inflight(state.inflight_requests.clone());
+                        dispatch_ws_frame(frame, &tx, &state).await;
+                    });
+                } else {
+                    dispatch_ws_frame(frame, &tx, &state).await;
+                }
             }
             Message::Close(_) => break,
             other => {
@@ -1798,6 +1861,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
     tracing::info!("ws: client closed");
+    // #476: take the in-flight requests down WITH the socket. Dropping the set
+    // aborts them anyway, but awaiting the shutdown means they are actually gone
+    // before this function returns, so the invariant is observable rather than
+    // merely eventual.
+    inflight.shutdown().await;
     writer.abort();
 }
 
@@ -4975,7 +5043,62 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                _ => {}
+                // #433/#446: AN UNHANDLED COMMAND MUST NOT ACK AS APPLIED.
+                //
+                // This arm used to be `_ => {}`, which fell through to the
+                // applied-ack below. `DispatchableClientOrchestrationCommand`
+                // (contracts/orchestration.ts:924) is a union of 23; this match
+                // implements 8. The other 15 were answered `Success({sequence})`
+                // — the reducer's signal that the command LANDED — while the
+                // runtime did nothing at all:
+                //
+                //   project.create            thread.snooze
+                //   project.delete            thread.unsnooze
+                //   thread.create             thread.pin
+                //   thread.delete             thread.unpin
+                //   thread.archive            thread.pin.reorder
+                //   thread.unarchive          thread.runtime-mode.set
+                //   thread.settle             thread.interaction-mode.set
+                //   thread.unsettle
+                //
+                // That is worse than a missing feature: the client optimistically
+                // applies, the ack confirms, and the state diverges from the
+                // runtime silently until a reload — at which point the user's
+                // archive/pin/mode change is simply gone with no error anywhere.
+                //
+                // #446 is right that the GENERATOR is the defect, not the 15
+                // instances: a catch-all that succeeds means every command added
+                // to the contract from now on is silently no-op'd by default.
+                // Fixing 15 arms leaves that default intact. So the default flips
+                // — unknown now REFUSES, and each of the 15 becomes a visible
+                // failure a user can report and a test can assert, instead of a
+                // lie the reducer believes.
+                //
+                // This is the rule the RPC dispatcher in this same file already
+                // follows for exactly the same reason ("Genuinely unimplemented
+                // RPCs FAIL explicitly rather than returning a masking
+                // Success(null)"). The two dispatchers disagreeing on that is how
+                // one of them ended up with 15 silent no-ops and the other with
+                // none.
+                other => {
+                    let kind = other.unwrap_or("<missing type>");
+                    tracing::warn!(
+                        cmd = kind,
+                        "dispatchCommand: unimplemented command — refusing rather than \
+                         acking it as applied"
+                    );
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!(
+                            "orchestration command '{kind}' is not implemented by this \
+                             runtime. It was REFUSED, not applied — nothing changed. \
+                             (Previously this acked success and did nothing, so the UI \
+                             showed the change until the next reload.)"
+                        ),
+                    );
+                    return;
+                }
             }
             // The applied-ack. Any arm that failed has already sent its own
             // terminal and returned, so this cannot double-send.

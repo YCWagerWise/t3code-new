@@ -454,6 +454,7 @@ async fn state_built(
         .await
         .unwrap();
     let state = AppState {
+        inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         rt,
         catalog: Arc::new(RwLock::new(providers::catalog())),
         checkpoints: tools::checkpoint_pool(data.join("checkpoints")),
@@ -2649,20 +2650,84 @@ async fn pull_request_rpcs_return_typed_unavailable_not_die_defect() {
     }
 }
 
+/// The applied-ack carries a sequence — and ONLY for a command that was applied.
+///
+/// REWRITTEN FOR #433/#446, and the rewrite is the point, so it is spelled out
+/// rather than quietly done.
+///
+/// This test used to dispatch `{"type": "noop"}` — a type that appears nowhere
+/// in `DispatchableClientOrchestrationCommand` — and assert
+/// `exit._tag == "Success"` with a numeric sequence. It passed. It passed
+/// because the dispatcher's catch-all was `_ => {}` falling through to the
+/// applied-ack, which is precisely the defect #433 enumerated and #446 traced to
+/// its generator. So the suite was not merely blind to those 15 silent no-ops:
+/// it PINNED them. Any worker who fixed the catch-all got a red test that read
+/// like a regression, which is a good way to make a real fix look wrong twice
+/// and get reverted.
+///
+/// That is why this is a rewrite and not a deletion. The property the old name
+/// promised — "dispatch acks with sequence" — is real and still worth holding.
+/// What was wrong was the input chosen to demonstrate it: an unimplemented
+/// command is the one case where the ack must NOT happen. So the test now
+/// asserts the property on a command that is genuinely implemented, and adds
+/// the boundary that the old version had inverted.
+///
+/// Both halves in one test on purpose: the ack and the refusal are the same
+/// decision read from two sides, and splitting them invites one to be updated
+/// without the other.
 #[tokio::test]
-async fn dispatch_acks_with_sequence() {
+async fn dispatch_acks_an_implemented_command_with_a_sequence_and_refuses_an_unimplemented_one() {
     let (state, _d) = test_state().await;
+
+    // HALF ONE — an IMPLEMENTED command still acks, and still carries the
+    // sequence. `project.meta.update` is handled at server_main.rs and defaults
+    // `projectId` to the seeded `p-workspace`, so it exercises the real applied
+    // path rather than an error path that happens to also return.
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
         &state,
         &tx,
         "orchestration.dispatchCommand",
-        json!({ "input": { "type": "noop" } }),
+        json!({ "input": { "type": "project.meta.update", "patch": { "name": "renamed" } } }),
     )
     .await;
     let frames = drain(&mut rx);
-    assert_eq!(frames[0]["exit"]["_tag"], "Success");
-    assert!(frames[0]["exit"]["value"]["sequence"].is_number());
+    assert_eq!(
+        frames[0]["exit"]["_tag"], "Success",
+        "an implemented command must still ack as applied: {:?}",
+        frames[0]
+    );
+    assert!(
+        frames[0]["exit"]["value"]["sequence"].is_number(),
+        "the applied-ack must still carry the durable sequence: {:?}",
+        frames[0]
+    );
+
+    // HALF TWO — the boundary the old test had backwards. An unimplemented
+    // command must be REFUSED, not acked. `noop` is the exact input the previous
+    // version asserted Success on.
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx2,
+        "orchestration.dispatchCommand",
+        json!({ "input": { "type": "noop" } }),
+    )
+    .await;
+    let frames2 = drain(&mut rx2);
+    assert_ne!(
+        frames2[0]["exit"]["_tag"], "Success",
+        "#433/#446: an unimplemented command acked as APPLIED. The client applies \
+         optimistically and the ack confirms, so the user's change is shown and \
+         then silently gone on the next reload. Got: {:?}",
+        frames2[0]
+    );
+    let rendered = frames2[0].to_string();
+    assert!(
+        rendered.contains("noop"),
+        "the refusal must name the command type it refused, or the user cannot \
+         report which action did nothing: {rendered}"
+    );
 }
 
 /// #35: the advertised catalog is the reconciled registry, not two
@@ -9120,6 +9185,7 @@ async fn the_shell_snapshot_reads_projects_from_the_durable_store() {
         Err(e) => panic!("project store unreadable: {e}"),
     }
     let state_b = AppState {
+        inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         rt: rt_b,
         catalog: state_a.catalog.clone(),
         checkpoints: tools::checkpoint_pool(data.join("checkpoints")),
@@ -11958,4 +12024,244 @@ mod ws_head_of_line {
              something to stop. Frames that did arrive: {seen:?}"
         );
     }
+}
+/// PROOF (#432): the WS read loop keeps reading while a request is in flight.
+///
+/// THE FAILURE THIS PINS, and why nothing already in this file could see it.
+/// Every other WS test here drives `dispatch_ws_frame` (or `handle_request`)
+/// directly. That is a function call, so it *cannot* observe a defect that
+/// lives in the loop ABOVE it — and the read loop is where this one lives:
+///
+///     while let Some(msg) = reader.next().await {
+///         ...
+///         dispatch_ws_frame(frame, &tx, &state).await;   // <-- same task
+///     }
+///
+/// Reader and handler were one task, so nothing was read from the socket while
+/// a handler ran. The frames that exist *specifically* to arrive during a long
+/// request were therefore unreachable by construction:
+///
+///   * `Interrupt` (#411) — the stop button. Its only purpose is to reach a
+///     request that is still running. Serialized, the earliest it can be read
+///     is after the thing it was cancelling has already finished.
+///   * `Ack` — Effect RPC's per-chunk flow-control frame.
+///   * every later `Request` on that socket, which is why one wedged handler
+///     presents as "the entire app hung".
+///
+/// This is the same lesson as #404 ("87 backend tests were green against that
+/// exact binary because every one of them drives ONE request at a time"), one
+/// layer up, so this test binds the REAL router with `build_app` and speaks
+/// real WebSocket to it.
+///
+/// THE ASSERTION IS AN ORDERING, NOT A TIMING THRESHOLD. A "responded within
+/// N ms" test buys a flake on a loaded box and proves less. Here: three slow
+/// requests are pipelined, then a `Ping`. Under the old serialized loop the
+/// Pong CANNOT come back before the third Exit — the loop has not read the
+/// Ping yet. Concurrently, the Pong overtakes them, because Ping needs no
+/// state and the slow requests are still working. Overtaking is the property;
+/// how fast is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_read_loop_answers_a_ping_while_slow_requests_are_still_running() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (state, _dir) = test_state().await;
+    let app = super::build_app(state);
+
+    // Port 0: the OS picks, so concurrent cells do not collide on a constant.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (mut sock, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("the real router must accept a WS upgrade on /ws");
+
+    // `server.getProcessDiagnostics` forks `ps` and awaits it — a genuinely
+    // slow, genuinely real handler. Deliberately NOT a test-only sleep method:
+    // a backdoor added to make a transport test pass would prove the backdoor.
+    const SLOW: usize = 3;
+    for i in 0..SLOW {
+        let frame = json!({
+            "_tag": "Request",
+            "id": format!("slow-{i}"),
+            "tag": "server.getProcessDiagnostics",
+            "payload": {},
+        });
+        sock.send(tokio_tungstenite::tungstenite::Message::Text(
+            frame.to_string().into(),
+        ))
+        .await
+        .expect("send slow request");
+    }
+    // Pipelined immediately behind them, with no wait in between — the whole
+    // point is that this frame is sitting in the socket while the handlers run.
+    sock.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({ "_tag": "Ping" }).to_string().into(),
+    ))
+    .await
+    .expect("send ping");
+
+    // Read until the Pong, counting how many slow Exits landed first. Bounded:
+    // a wedge must fail this in seconds with a named culprit, never hang CI.
+    let mut exits_before_pong = 0usize;
+    let mut saw_pong = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let next = tokio::time::timeout_at(deadline, sock.next()).await;
+        let Ok(Some(Ok(msg))) = next else { break };
+        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match v.get("_tag").and_then(|t| t.as_str()) {
+            Some("Pong") => {
+                saw_pong = true;
+                break;
+            }
+            Some("Exit") => {
+                if v.get("requestId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r.starts_with("slow-"))
+                {
+                    exits_before_pong += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_pong,
+        "#432: the server never answered Ping at all. The read loop is not \
+         reading — this is the 'accepts but does not serve' wedge, not a slow \
+         handler."
+    );
+    assert!(
+        exits_before_pong < SLOW,
+        "#432: all {SLOW} slow requests completed BEFORE the Pong, which means \
+         the read loop did not read the Ping until every handler ahead of it \
+         had finished. That is the serialized loop: while it holds, `Interrupt` \
+         (#411) can never reach a running turn, because the only moment it can \
+         be read is after that turn is already over."
+    );
+
+    server.abort();
+}
+
+/// PROOF (#476): a disconnecting client takes its in-flight requests with it.
+///
+/// THE DEFECT THIS PINS, AND IT WAS MINE. The first fix for #432 replaced the
+/// read loop's inline `dispatch_ws_frame(...).await` with a bare
+/// `tokio::spawn`. That un-starves the reader — the #432 test above proves it —
+/// and in the same line it detaches the work. `orchestration.subscribeThread`
+/// attaches a durable tail and streams for the life of the thread, so a client
+/// that disconnects mid-stream left a task writing into a `tx` whose receiver
+/// was gone, holding an `AppState` clone, forever. Reconnect and there are two.
+/// Serialization had been the backpressure, and removing it put nothing in its
+/// place.
+///
+/// clau-f11b caught it and claude-4e91 had already written the better shape: a
+/// `JoinSet` OWNED by `handle_socket`, so the tasks cannot outlive the
+/// connection. That is what this asserts.
+///
+/// WHY THE #432 TEST CANNOT COVER THIS. #432 asks "does the loop keep READING"
+/// — the bare spawn passes it. #476 asks "is the spawned work OWNED", and the
+/// two implementations are byte-identical on the wire; the difference only ever
+/// shows up as a leak, much later, in a process nobody is looking at. So this
+/// asserts on `AppState::inflight_requests`, which is an OBSERVABLE and not a
+/// control: nothing reads it to make a decision, so its presence cannot change
+/// the behaviour it measures.
+///
+/// NOT A TIMER. The assertion is that the count RETURNS TO ITS PRE-CONNECT
+/// VALUE, polled under a bounded deadline. A test that slept and then checked
+/// would pass on a detached task that merely happened to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disconnecting_client_takes_its_in_flight_requests_with_it() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (state, _dir) = test_state().await;
+    let counter = state.inflight_requests.clone();
+    let app = super::build_app(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing is in flight before a client connects"
+    );
+
+    let (mut sock, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("WS upgrade");
+
+    // Three slow-but-real requests, so there is genuinely something in flight
+    // when the socket goes away. Same handler the #432 test uses (it forks `ps`)
+    // and for the same reason: a test-only sleep method would prove the backdoor.
+    for i in 0..3 {
+        sock.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({
+                "_tag": "Request",
+                "id": format!("doomed-{i}"),
+                "tag": "server.getProcessDiagnostics",
+                "payload": {},
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send");
+    }
+
+    // Wait until the server has actually PICKED THEM UP, so the drop below is a
+    // disconnect-with-work-in-flight and not a race the test wins by accident.
+    // If this never rises, the test is not exercising #476 at all and says so
+    // rather than passing vacuously.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut peak = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        peak = peak.max(counter.load(std::sync::atomic::Ordering::SeqCst));
+        if peak > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        peak > 0,
+        "#476: no request task was ever observed in flight, so this test never \
+         reached the condition it exists to check. Either the spawn is gone or \
+         the counter is not wired — both make the assertion below vacuous."
+    );
+
+    // THE DISCONNECT.
+    drop(sock);
+
+    // THE ASSERTION: in-flight returns to zero because the tasks were OWNED, not
+    // because they happened to finish. Bounded poll, no sleep-then-check.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = usize::MAX;
+    while tokio::time::Instant::now() < deadline {
+        last = counter.load(std::sync::atomic::Ordering::SeqCst);
+        if last == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        last, 0,
+        "#476: {last} request task(s) outlived the socket that created them. A \
+         bare `tokio::spawn` detaches, so subscribeThread keeps streaming into a \
+         `tx` whose receiver is gone and holds an AppState clone per dead client. \
+         The JoinSet owned by handle_socket drops them with the connection."
+    );
+
+    server.abort();
 }
