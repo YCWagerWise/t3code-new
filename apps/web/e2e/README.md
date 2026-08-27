@@ -88,6 +88,27 @@ and it fails for the right reason on a fast machine and a wrecked one alike.
 Never assert "it responded within N seconds." That is the assertion that let the
 defect ship.
 
+## Settlement is measured against the EVENT'S clock, never wall-clock patience
+
+`Wire.threadEvents()` and `Wire.deliveryLagMs(event)`.
+
+A turn was measured starting and failing **88ms apart** — `updatedAt` 48.499 and
+48.587 in its own two payloads — while the settling `thread.session-set idle`
+did not reach the client until **25.00s**, because the tail parked, was never
+woken by the publication, and returned on its own `Duration::from_secs(25)`
+timeout (`server_main.rs:1658`). The UI spun for twenty-five seconds on a turn
+that finished in a tenth of a second.
+
+A spec asserting *"the spinner eventually stops"* **passes** that. A spec
+asserting *"the spinner stopped within 2s of the turn's own `updatedAt`"*
+catches it, and needs no magic threshold, because the payload carries the
+server's own timestamp and the lag can simply be computed.
+
+This is also what retires the "is it slow, or is it hung" argument the channel
+spent rounds on. It is neither: it is a timer. **A delivery lag that keeps
+landing on a round number equal to a timeout constant is a lost wake-up, not
+latency** — report it as one.
+
 ## Coverage is reported with its denominator
 
 Every spec ends by naming what it drove **and what it did not**. A method the UI
