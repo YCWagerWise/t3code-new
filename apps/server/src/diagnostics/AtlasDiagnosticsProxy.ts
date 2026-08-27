@@ -27,6 +27,8 @@ import {
   AtlasProxyCredentialInsecureError,
   AtlasProxyNotAtlasDriverError,
   AtlasProxyUnknownProviderInstanceError,
+  type AtlasDiagnosticsCommand,
+  AtlasProxyRelayOverflowError,
   AtlasProxyUnreachableError,
   AtlasProxyUpstreamTimeoutError,
   AtlasProxyUpstreamTooLargeError,
@@ -44,6 +46,7 @@ import {
   type ProviderInstanceConfig,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -73,9 +76,9 @@ export const ATLAS_PROXY_MAX_BODY_BYTES = 2 * 1024 * 1024;
  */
 export const ATLAS_PROXY_MAX_FRAME_BYTES = 1024 * 1024;
 export const ATLAS_PROXY_RELAY_BUFFER_FRAMES = 256;
-/** Close codes the relay itself originates, distinct from anything Atlas sends. */
-export const ATLAS_PROXY_CLOSE_FRAME_TOO_LARGE = 4009;
-export const ATLAS_PROXY_CLOSE_BACKPRESSURE = 4010;
+// Close CODES are deliberately absent: a relay-originated end is a typed failure
+// (`AtlasProxyRelayOverflowError`), not a `closed` event, because a close offered into a
+// saturated queue can be refused. Upstream's own close still rides through as `closed`.
 export const ATLAS_PROXY_DEFAULT_TIMEOUT_MS = 10_000;
 
 const ROUTE_PATHS: Record<AtlasDiagnosticsHttpRoute, string> = {
@@ -294,11 +297,17 @@ export class AtlasDiagnosticsProxy extends Context.Service<
     readonly callHttp: (
       input: AtlasDiagnosticsHttpInput,
     ) => Effect.Effect<AtlasDiagnosticsHttpResult, AtlasDiagnosticsProxyError>;
+    /**
+     * `ownerId` identifies the CONNECTION opening the relay and is supplied by the transport,
+     * never by the browser — otherwise a caller could simply claim someone else's ownership.
+     */
     readonly openFeed: (
       input: AtlasDiagnosticsFeedInput,
+      ownerId: string,
     ) => Stream.Stream<AtlasDiagnosticsRelayEvent, AtlasDiagnosticsProxyError>;
     readonly sendCommand: (
       input: AtlasDiagnosticsSendCommandInput,
+      ownerId: string,
     ) => Effect.Effect<AtlasDiagnosticsSendCommandResult>;
   }
 >()("t3/diagnostics/AtlasDiagnosticsProxy") {}
@@ -327,7 +336,12 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
     // Live relay sockets, keyed by the id minted for their `openFeed` subscription — the only
     // state this service holds. `sendCommand` looks a session up here; it never reaches for a
     // socket any other way, so a stale or unknown id can only ever produce `{ sent: false }`.
-    const relaySessions = new Map<string, RelaySocket>();
+    // #28: an id is not authority. Each session records the connection that opened it, so a
+    // different authenticated caller holding the id cannot actuate someone else's socket.
+    const relaySessions = new Map<
+      string,
+      { readonly socket: RelaySocket; readonly ownerId: string }
+    >();
 
     // A settings-read failure degrades to "no instances configured" (an honest
     // `AtlasProxyUnknownProviderInstanceError` once resolution runs) rather than dying the
@@ -383,7 +397,7 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
         }
       });
 
-    const openFeed: AtlasDiagnosticsProxy["Service"]["openFeed"] = (input) =>
+    const openFeed: AtlasDiagnosticsProxy["Service"]["openFeed"] = (input, ownerId) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const providerInstances = yield* currentProviderInstances;
@@ -396,49 +410,63 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
                 let isClosed = false;
                 let socket: RelaySocket | undefined;
 
-                /** Ends the relay on OUR terms, so the browser is told rather than left guessing. */
-                const closeLocally = (code: number, reason: string) => {
+                /**
+                 * Ends the relay on OUR terms by FAILING the stream, not by offering a
+                 * `closed` event.
+                 *
+                 * Saturation is one of the triggers, and a terminal event offered into a full
+                 * queue can itself be refused — the browser would drain stale frames and stop
+                 * with no explanation, which is the silent gap this bound exists to prevent.
+                 * A failure is not subject to capacity, so the signal always arrives.
+                 */
+                const failLocally = (detail: string) => {
                   if (isClosed) return;
                   isClosed = true;
                   relaySessions.delete(relaySessionId);
-                  Queue.offerUnsafe(queue, { kind: "closed", code, reason });
-                  Queue.endUnsafe(queue);
+                  Queue.failCauseUnsafe(
+                    queue,
+                    Cause.fail(
+                      new AtlasProxyRelayOverflowError({
+                        providerInstanceId: input.providerInstanceId,
+                        detail,
+                      }),
+                    ),
+                  );
                   try {
                     socket?.close();
                   } catch {
-                    // Already gone; the browser has its `closed` either way.
+                    // Already gone; the browser has its typed failure either way.
                   }
                 };
 
                 /**
-                 * A full queue means the browser is not keeping up. Dropping the frame would
-                 * leave a hole it cannot detect, so the relay closes instead and lets the
-                 * reconnect replay from the cursor the browser already holds.
+                 * A refused offer means the browser is more than the buffer behind. Dropping
+                 * the frame would leave a hole it cannot detect, so the relay ends instead and
+                 * the reconnect replays from the cursor the browser already holds.
                  */
-                const offerOrClose = (event: AtlasDiagnosticsRelayEvent) => {
+                const offerOrFail = (event: AtlasDiagnosticsRelayEvent) => {
                   if (isClosed) return;
                   if (!Queue.offerUnsafe(queue, event)) {
-                    closeLocally(
-                      ATLAS_PROXY_CLOSE_BACKPRESSURE,
-                      "relay buffer full; reconnect and replay from your cursor",
+                    failLocally(
+                      `the browser fell more than ${ATLAS_PROXY_RELAY_BUFFER_FRAMES} frames behind; ` +
+                        "reconnect and replay from your cursor",
                     );
                   }
                 };
 
                 const handlers: RelaySocketHandlers = {
                   onOpen: () => {
-                    offerOrClose({ kind: "open", relaySessionId });
+                    offerOrFail({ kind: "open", relaySessionId });
                   },
                   onMessage: (data) => {
                     const bytes = Buffer.byteLength(data, "utf8");
                     if (bytes > ATLAS_PROXY_MAX_FRAME_BYTES) {
-                      closeLocally(
-                        ATLAS_PROXY_CLOSE_FRAME_TOO_LARGE,
-                        `frame of ${bytes} bytes exceeds the ${ATLAS_PROXY_MAX_FRAME_BYTES}-byte relay limit`,
+                      failLocally(
+                        `a frame of ${bytes} bytes exceeds the ${ATLAS_PROXY_MAX_FRAME_BYTES}-byte relay limit`,
                       );
                       return;
                     }
-                    offerOrClose({ kind: "message", raw: data });
+                    offerOrFail({ kind: "message", raw: data });
                   },
                   onClose: (code, reason) => {
                     if (isClosed) return;
@@ -456,17 +484,25 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
                 try {
                   socket = socketFactory(wsUrl, handlers);
                 } catch (cause) {
-                  return yield* Effect.fail(
-                    new AtlasProxyUnreachableError({
-                      providerInstanceId: input.providerInstanceId,
-                      detail: cause instanceof Error ? cause.message : String(cause),
-                    }),
+                  // Fails the QUEUE, not the setup effect. A setup-effect failure leaves the
+                  // queue open and the consumer hanging forever — proven by the test for this
+                  // branch, which timed out at 120s before this was corrected.
+                  isClosed = true;
+                  Queue.failCauseUnsafe(
+                    queue,
+                    Cause.fail(
+                      new AtlasProxyUnreachableError({
+                        providerInstanceId: input.providerInstanceId,
+                        detail: cause instanceof Error ? cause.message : String(cause),
+                      }),
+                    ),
                   );
+                  return;
                 }
                 // A socket that already closed SYNCHRONOUSLY (an immediate auth refusal) must
                 // never be registered as sendable — `sendCommand` has to see it as gone, not as
                 // a session it can still write to.
-                if (!isClosed) relaySessions.set(relaySessionId, socket);
+                if (!isClosed) relaySessions.set(relaySessionId, { socket, ownerId });
                 const opened = socket;
                 yield* Effect.addFinalizer(() =>
                   Effect.sync(() => {
@@ -486,17 +522,33 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
         }),
       );
 
-    const sendCommand: AtlasDiagnosticsProxy["Service"]["sendCommand"] = (input) =>
+    /**
+     * Atlas tags `DiagnosticsCommand` adjacently in snake_case
+     * (`#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]`), so the
+     * browser names a command and the server writes the wire form. Bounded by the union's own
+     * shape rather than a byte cap: there is no arbitrary text to be too large.
+     */
+    const encodeDiagnosticsCommand = (command: AtlasDiagnosticsCommand): string =>
+      command.kind === "refresh"
+        ? JSON.stringify({ kind: "refresh" })
+        : JSON.stringify({
+            kind: "retry",
+            payload: {
+              after: command.after,
+              // Omitted upstream means "trust `after`" — preserved rather than defaulted.
+              ...(command.epoch === undefined ? {} : { epoch: command.epoch }),
+            },
+          });
+
+    const sendCommand: AtlasDiagnosticsProxy["Service"]["sendCommand"] = (input, ownerId) =>
       Effect.sync(() => {
-        const socket = relaySessions.get(input.relaySessionId);
-        if (socket === undefined) return { sent: false };
-        // The outbound direction is bounded for the same reason the inbound one is: `raw` is
-        // caller-supplied and a command has no legitimate reason to approach a frame limit.
-        if (Buffer.byteLength(input.raw, "utf8") > ATLAS_PROXY_MAX_FRAME_BYTES) {
-          return { sent: false };
-        }
+        const session = relaySessions.get(input.relaySessionId);
+        if (session === undefined) return { sent: false };
+        // #28: holding the id is not holding the authority. A session may only be actuated by
+        // the connection that opened it, so a leaked or guessed id is inert to anyone else.
+        if (session.ownerId !== ownerId) return { sent: false };
         try {
-          socket.send(input.raw);
+          session.socket.send(encodeDiagnosticsCommand(input.command));
           return { sent: true };
         } catch {
           return { sent: false };

@@ -26,6 +26,8 @@ import * as Stream from "effect/Stream";
 import { layerTest as serverSettingsLayerTest } from "../serverSettings.ts";
 import {
   ATLAS_PROXY_MAX_BODY_BYTES,
+  ATLAS_PROXY_MAX_FRAME_BYTES,
+  ATLAS_PROXY_RELAY_BUFFER_FRAMES,
   make,
   testables,
   type ProxyFetch,
@@ -297,6 +299,11 @@ describe("AtlasDiagnosticsProxy.callHttp", () => {
   );
 });
 
+/** Stands in for the per-connection id ws.ts supplies; never browser-controlled. */
+const OWNER = "conn-owner-1";
+/** A DIFFERENT authenticated connection, for the ownership tests. */
+const OTHER_OWNER = "conn-owner-2";
+
 describe("AtlasDiagnosticsProxy — live relay", () => {
   it.effect("relays open, a text frame, and a normal close verbatim", () =>
     Effect.gen(function* () {
@@ -310,7 +317,9 @@ describe("AtlasDiagnosticsProxy — live relay", () => {
         mintRelaySessionId: () => "session-1",
       });
       const events = Array.from(
-        yield* Stream.runCollect(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID })),
+        yield* Stream.runCollect(
+          service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+        ),
       );
       expect(events).toEqual([
         { kind: "open", relaySessionId: "session-1" },
@@ -337,15 +346,20 @@ describe("AtlasDiagnosticsProxy — live relay", () => {
           mintRelaySessionId: () => "session-refused",
         });
         const events = Array.from(
-          yield* Stream.runCollect(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID })),
+          yield* Stream.runCollect(
+            service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+          ),
         );
         expect(events).toEqual([{ kind: "closed", code: 4401, reason: "unauthenticated" }]);
 
         // A session that closed before this ever registered must not be sendable afterward.
-        const sendResult = yield* service.sendCommand({
-          relaySessionId: AtlasDiagnosticsRelaySessionId.make("session-refused"),
-          raw: '{"kind":"refresh"}',
-        });
+        const sendResult = yield* service.sendCommand(
+          {
+            relaySessionId: AtlasDiagnosticsRelaySessionId.make("session-refused"),
+            command: { kind: "refresh" },
+          },
+          OWNER,
+        );
         expect(sendResult).toEqual({ sent: false });
       }).pipe(
         Effect.provide(
@@ -371,14 +385,17 @@ describe("AtlasDiagnosticsProxy — live relay", () => {
       // Waiting on `opened` (rather than a bare yieldNow) is deterministic regardless of how
       // many fiber-forking layers sit between this test and `Stream.callback`'s own setup fork.
       const fiber = yield* Effect.forkChild(
-        Stream.runDrain(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID })),
+        Stream.runDrain(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER)),
       );
       yield* Deferred.await(opened);
 
-      const result = yield* service.sendCommand({
-        relaySessionId: AtlasDiagnosticsRelaySessionId.make("session-2"),
-        raw: '{"kind":"refresh"}',
-      });
+      const result = yield* service.sendCommand(
+        {
+          relaySessionId: AtlasDiagnosticsRelaySessionId.make("session-2"),
+          command: { kind: "refresh" },
+        },
+        OWNER,
+      );
       expect(result).toEqual({ sent: true });
       expect(sent).toEqual(['{"kind":"refresh"}']);
 
@@ -393,11 +410,126 @@ describe("AtlasDiagnosticsProxy — live relay", () => {
   it.effect("sendCommand against an unknown session honestly reports it was not sent", () =>
     Effect.gen(function* () {
       const service = yield* make();
-      const result = yield* service.sendCommand({
-        relaySessionId: AtlasDiagnosticsRelaySessionId.make("never-opened"),
-        raw: '{"kind":"refresh"}',
-      });
+      const result = yield* service.sendCommand(
+        {
+          relaySessionId: AtlasDiagnosticsRelaySessionId.make("never-opened"),
+          command: { kind: "refresh" },
+        },
+        OWNER,
+      );
       expect(result).toEqual({ sent: false });
     }).pipe(Effect.provide(serverSettingsLayerTest({ providerInstances: {} }))),
+  );
+});
+
+/**
+ * The bounds and the terminal invariant, each exercised at its actual branch.
+ *
+ * The commit that introduced these bounds added no tests for any of them, so every claim in
+ * its message was a comment. These are the branches: a constructor that throws, a frame
+ * exactly at and one past the ceiling, a consumer that never drains, and a session id used by
+ * a connection that does not own it.
+ */
+describe("AtlasDiagnosticsProxy — relay bounds and terminal invariant", () => {
+  it.effect("a synchronous socket-constructor throw is a typed failure, not a defect", () =>
+    Effect.gen(function* () {
+      const service = yield* make({
+        socketFactory: () => {
+          throw new Error("connection refused by the runtime");
+        },
+      });
+      const outcome = yield* Stream.runCollect(
+        service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+      ).pipe(
+        Effect.map(() => "succeeded-unexpectedly"),
+        // Asserting on the TAG proves the failure rode the declared error channel; a
+        // defect would never reach a tagged catch at all.
+        Effect.catchTag("AtlasProxyUnreachableError", (error) => Effect.succeed(error._tag)),
+      );
+      expect(outcome).toEqual("AtlasProxyUnreachableError");
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+
+  it.effect("a frame exactly at the byte ceiling is relayed, not refused", () =>
+    Effect.gen(function* () {
+      const exact = "x".repeat(ATLAS_PROXY_MAX_FRAME_BYTES);
+      const { factory } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        handlers.onMessage(exact);
+        handlers.onClose(1000, "normal");
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-exact" });
+      const events = Array.from(
+        yield* Stream.runCollect(
+          service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+        ),
+      );
+      expect(events.some((e) => e.kind === "message" && e.raw.length === exact.length)).toBe(true);
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+
+  it.effect("one byte past the ceiling ends the relay with a typed overflow, never truncated", () =>
+    Effect.gen(function* () {
+      const tooBig = "x".repeat(ATLAS_PROXY_MAX_FRAME_BYTES + 1);
+      const { factory } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        handlers.onMessage(tooBig);
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-big" });
+      const outcome = yield* Stream.runCollect(
+        service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+      ).pipe(
+        Effect.map(() => "succeeded-unexpectedly"),
+        // Asserting on the TAG proves the failure rode the declared error channel; a
+        // defect would never reach a tagged catch at all.
+        Effect.catchTag("AtlasProxyRelayOverflowError", (error) => Effect.succeed(error._tag)),
+      );
+      expect(outcome).toEqual("AtlasProxyRelayOverflowError");
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+
+  /**
+   * THE ONE THE REVIEWER ASKED FOR BY NAME. A terminal event offered into a saturated queue
+   * can itself be refused, which would leave the consumer draining stale frames and stopping
+   * with no explanation. Failing the stream is not subject to capacity, so this proves the
+   * signal actually arrives rather than trusting the comment that says it does.
+   */
+  it.effect("a consumer that never drains still receives the terminal signal", () =>
+    Effect.gen(function* () {
+      const { factory } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        // Emitted synchronously, before any consumer pulls, so the bounded queue saturates
+        // deterministically — no sleeps, no scheduler luck.
+        for (let i = 0; i < ATLAS_PROXY_RELAY_BUFFER_FRAMES + 50; i += 1) {
+          handlers.onMessage(`{"seq":${i}}`);
+        }
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-flood" });
+      const outcome = yield* Stream.runCollect(
+        service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+      ).pipe(
+        Effect.map(() => "succeeded-unexpectedly"),
+        // Asserting on the TAG proves the failure rode the declared error channel; a
+        // defect would never reach a tagged catch at all.
+        Effect.catchTag("AtlasProxyRelayOverflowError", (error) => Effect.succeed(error._tag)),
+      );
+      expect(outcome).toEqual("AtlasProxyRelayOverflowError");
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
   );
 });

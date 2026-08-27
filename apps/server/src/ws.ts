@@ -1724,13 +1724,15 @@ const makeWsRpcLayer = (
         [WS_METHODS.serverOpenAtlasDiagnosticsFeed]: (input) =>
           observeRpcStream(
             WS_METHODS.serverOpenAtlasDiagnosticsFeed,
-            atlasDiagnosticsProxy.openFeed(input),
+            // Ownership comes from the CONNECTION, never the payload: a browser that could
+            // name its own owner could name someone else's. See #28 in the proxy.
+            atlasDiagnosticsProxy.openFeed(input, currentSessionId),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverSendAtlasDiagnosticsCommand]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverSendAtlasDiagnosticsCommand,
-            atlasDiagnosticsProxy.sendCommand(input),
+            atlasDiagnosticsProxy.sendCommand(input, currentSessionId),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>

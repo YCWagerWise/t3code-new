@@ -143,6 +143,22 @@ export class AtlasProxyUpstreamTimeoutError extends Schema.TaggedErrorClass<Atla
   }
 }
 
+/**
+ * The relay ended because it could not keep the browser in sync -- a frame past the byte
+ * ceiling, or a consumer too slow to drain. It is an ERROR rather than a `closed` event on
+ * purpose: a terminal event offered into a saturated queue can itself be refused, so the
+ * browser would drain stale frames and stop with no explanation. Failing the stream cannot be
+ * dropped by capacity.
+ */
+export class AtlasProxyRelayOverflowError extends Schema.TaggedErrorClass<AtlasProxyRelayOverflowError>()(
+  "AtlasProxyRelayOverflowError",
+  { providerInstanceId: TrimmedNonEmptyString, detail: TrimmedNonEmptyString },
+) {
+  override get message(): string {
+    return `The Atlas diagnostics relay ended: ${this.detail}`;
+  }
+}
+
 export class AtlasProxyUpstreamTooLargeError extends Schema.TaggedErrorClass<AtlasProxyUpstreamTooLargeError>()(
   "AtlasProxyUpstreamTooLargeError",
   { providerInstanceId: TrimmedNonEmptyString, limitBytes: PositiveInt },
@@ -153,6 +169,7 @@ export class AtlasProxyUpstreamTooLargeError extends Schema.TaggedErrorClass<Atl
 }
 
 export const AtlasDiagnosticsProxyError = Schema.Union([
+  AtlasProxyRelayOverflowError,
   AtlasProxyUnknownProviderInstanceError,
   AtlasProxyNotAtlasDriverError,
   AtlasProxyCredentialInsecureError,
@@ -197,10 +214,28 @@ export const AtlasDiagnosticsRelayEvent = Schema.Union([
 ]);
 export type AtlasDiagnosticsRelayEvent = typeof AtlasDiagnosticsRelayEvent.Type;
 
+/**
+ * The only commands this lens may send upstream.
+ *
+ * `raw: Schema.String` made the relay a generic authenticated write tunnel into Atlas's
+ * `/_feed` for anyone holding orchestration-read — the diagnostics surface is supposed to
+ * expose two commands, not arbitrary frames. Validating the shape here is AUTHORIZATION; it
+ * does not take cursor policy away from the browser, which still chooses `after` and `epoch`.
+ */
+export const AtlasDiagnosticsCommand = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("refresh") }),
+  Schema.Struct({
+    kind: Schema.Literal("retry"),
+    after: Schema.Number,
+    /** Optional upstream (`RetryPayload.epoch: Option<i64>`): omitted means trust `after`. */
+    epoch: Schema.optional(Schema.Number),
+  }),
+]);
+export type AtlasDiagnosticsCommand = typeof AtlasDiagnosticsCommand.Type;
+
 export const AtlasDiagnosticsSendCommandInput = Schema.Struct({
   relaySessionId: AtlasDiagnosticsRelaySessionId,
-  /** A `DiagnosticsCommand` JSON frame, already encoded by the browser. Relayed verbatim. */
-  raw: Schema.String,
+  command: AtlasDiagnosticsCommand,
 });
 export type AtlasDiagnosticsSendCommandInput = typeof AtlasDiagnosticsSendCommandInput.Type;
 
