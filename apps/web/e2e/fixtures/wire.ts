@@ -151,6 +151,81 @@ export class Wire {
     ].sort();
   }
 
+  /**
+   * THE ORDERING ASSERTION. Use this, not a timeout, for anything about
+   * concurrency.
+   *
+   * Every outcome-with-a-generous-timeout spec on this bench would go GREEN on
+   * a socket that is head-of-line blocked, because with a long enough budget
+   * the reply DOES arrive — measured at 33.89s on a live backend, with three
+   * requests sent 30 seconds apart all answered in the same millisecond. One of
+   * them (`q1`) failed pure argument validation: no I/O, no worktree, no
+   * provider, nothing to wait for. It waited 3.2s behind an unrelated handler
+   * anyway. A 60s timeout calls that a pass.
+   *
+   * The property that catches it has no milliseconds in it at all:
+   *
+   *   1. issue a request known to be slow, and DO NOT await it;
+   *   2. issue a trivial one — one that fails argument validation is ideal,
+   *      because it cannot be slow for any legitimate reason;
+   *   3. assert the trivial one's Exit arrives FIRST.
+   *
+   * Serialized, that is impossible. Concurrent, it is guaranteed. So it cannot
+   * flake on a box at load average 400, which is the state this laptop is
+   * actually in — and it means the spec fails for the right reason on a fast
+   * machine and a wrecked one alike.
+   *
+   * Returns the two Exit timestamps and the verdict, so a failure message can
+   * quote the real gap rather than assert a bare boolean.
+   */
+  async answeredFirst(
+    trivial: { readonly method: string; readonly requestId: unknown },
+    slow: { readonly method: string; readonly requestId: unknown },
+    deadline?: Partial<Deadline>,
+  ): Promise<{ readonly ok: boolean; readonly detail: string }> {
+    const exitAt = (requestId: unknown): number | null => {
+      const key = JSON.stringify(requestId);
+      const frame = this.frames.find(
+        (f) =>
+          f.dir === "recv" &&
+          f.json?._tag === "Exit" &&
+          JSON.stringify(f.json?.requestId) === key,
+      );
+      return frame ? frame.at : null;
+    };
+
+    await waitFor(() => exitAt(trivial.requestId), {
+      ms: deadline?.ms ?? 60_000,
+      what:
+        deadline?.what ??
+        `an Exit for the trivial request ${trivial.method}. If this times out the ` +
+          `socket is not merely slow, it is not reading at all.`,
+    });
+
+    const fast = exitAt(trivial.requestId)!;
+    const blocked = exitAt(slow.requestId);
+    if (blocked === null) {
+      return {
+        ok: true,
+        detail:
+          `${trivial.method} answered while ${slow.method} was still in flight — ` +
+          `the socket kept reading. This is the pass.`,
+      };
+    }
+    const gap = fast - blocked;
+    return {
+      ok: fast < blocked,
+      detail:
+        fast < blocked
+          ? `${trivial.method} answered ${-gap}ms BEFORE ${slow.method}. Concurrent.`
+          : `${trivial.method} answered ${gap}ms AFTER ${slow.method}, and both landed ` +
+            `after ${slow.method} finished. That is head-of-line blocking: the trivial ` +
+            `request waited on a handler it has nothing to do with. Do NOT report this ` +
+            `as slowness — the fix is that the read loop must not await dispatch inline.` +
+            `\ntranscript:\n${this.transcript(20)}`,
+    };
+  }
+
   /** A short, quotable transcript for a failure message or an evidence blob. */
   transcript(limit = 40): string {
     return this.frames

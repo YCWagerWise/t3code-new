@@ -62,6 +62,32 @@ A spec that flattens `Failure` reports "implemented" for a method that answered
 "unimplemented". `Wire.outcomeOf` returns these as three distinct kinds on
 purpose.
 
+## Concurrency is asserted by ORDERING, never by a timeout
+
+`Wire.answeredFirst(trivial, slow)`. Use it for anything about the socket.
+
+Every outcome-with-a-generous-timeout spec on this bench goes **green** on a
+socket that is head-of-line blocked, because with a long enough budget the reply
+does arrive. Measured on a live backend: three requests sent 30 seconds apart,
+all answered in the same millisecond at 33.89s. One of them failed pure argument
+validation — no I/O, no worktree, no provider, nothing it could legitimately
+wait for — and it still waited 3.2s behind an unrelated handler. A 60s timeout
+calls that a pass.
+
+The property that catches it has no milliseconds in it:
+
+1. issue a request known to be slow, and **do not await it**;
+2. issue a trivial one — one that fails argument validation is ideal, because it
+   cannot be slow for any honest reason;
+3. assert the trivial one's `Exit` arrives **first**.
+
+Serialized that is impossible; concurrent it is guaranteed. So it cannot flake
+on a box at load average 400 — which is the state this laptop is actually in —
+and it fails for the right reason on a fast machine and a wrecked one alike.
+
+Never assert "it responded within N seconds." That is the assertion that let the
+defect ship.
+
 ## Coverage is reported with its denominator
 
 Every spec ends by naming what it drove **and what it did not**. A method the UI
