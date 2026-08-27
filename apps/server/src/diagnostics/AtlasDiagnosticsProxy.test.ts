@@ -14,6 +14,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ATLAS_PROVIDER_DRIVER_KIND,
   AtlasDiagnosticsCommand,
+  AtlasDiagnosticsSendCommandInput,
   AtlasDiagnosticsRelaySessionId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -647,5 +648,94 @@ describe("AtlasDiagnosticsCommand — hostile cursor boundaries", () => {
   it("refuses a command kind the relay does not implement", () => {
     expect(decode({ kind: "shutdown" })).toEqual("refused");
     expect(decode({ kind: "retry" })).toEqual("refused");
+  });
+});
+
+/**
+ * #29's remaining half. Effect Schema strips unknown keys rather than refusing them, and this
+ * version exposes no strict-struct option — so rather than claim a strictness the library does
+ * not give, this proves the property that actually matters: an extra field cannot REACH Atlas,
+ * because the server re-encodes the frame from the validated union instead of forwarding what
+ * the caller sent. Stripping is therefore not a smuggling vector on this path.
+ */
+describe("AtlasDiagnosticsProxy — the encoder is the boundary", () => {
+  it.effect("a smuggled field never reaches the socket, because the frame is re-encoded", () =>
+    Effect.gen(function* () {
+      const opened = yield* Deferred.make<void>();
+      const { factory, sent } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        Deferred.doneUnsafe(opened, Effect.void);
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-enc" });
+      const fiber = yield* Effect.forkChild(
+        Stream.runDrain(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER)),
+      );
+      yield* Deferred.await(opened);
+
+      yield* service.sendCommand(
+        {
+          relaySessionId: AtlasDiagnosticsRelaySessionId.make("s-enc"),
+          // Deliberately hostile: extra keys, and a nested object that would be a tunnel if
+          // the payload were forwarded rather than rebuilt.
+          command: {
+            kind: "retry",
+            after: 5,
+            smuggled: "../../etc/passwd",
+            nested: { exec: true },
+          },
+        } as never,
+        OWNER,
+      );
+
+      // Exactly Atlas's adjacently-tagged shape, and nothing the caller added.
+      expect(sent).toEqual(['{"kind":"retry","payload":{"after":5}}']);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+});
+
+/**
+ * #29's strict boundary, using the mechanism the reviewer identified: Effect Schema supports
+ * `.annotate({ parseOptions: { onExcessProperty: "error" } })`, so an unknown key is REFUSED
+ * rather than stripped. Injected at each level the finding named — refresh, retry, and the
+ * outer RPC input — because a strict variant is no protection if the enclosing shape is lax.
+ */
+describe("AtlasDiagnosticsCommand — unknown keys are refused, not stripped", () => {
+  const decodeCommand = (value: unknown) =>
+    Effect.runSync(
+      Schema.decodeUnknownEffect(AtlasDiagnosticsCommand)(value).pipe(
+        Effect.map(() => "accepted"),
+        Effect.catch(() => Effect.succeed("refused")),
+      ),
+    );
+  const decodeInput = (value: unknown) =>
+    Effect.runSync(
+      Schema.decodeUnknownEffect(AtlasDiagnosticsSendCommandInput)(value).pipe(
+        Effect.map(() => "accepted"),
+        Effect.catch(() => Effect.succeed("refused")),
+      ),
+    );
+
+  it("refuses an extra key on refresh", () => {
+    expect(decodeCommand({ kind: "refresh" })).toEqual("accepted");
+    expect(decodeCommand({ kind: "refresh", raw: "arbitrary" })).toEqual("refused");
+  });
+
+  it("refuses an extra key on retry, alongside its payload fields", () => {
+    expect(decodeCommand({ kind: "retry", after: 3 })).toEqual("accepted");
+    expect(decodeCommand({ kind: "retry", after: 3, epoch: 1 })).toEqual("accepted");
+    expect(decodeCommand({ kind: "retry", after: 3, smuggled: "x" })).toEqual("refused");
+  });
+
+  it("refuses an extra key on the outer RPC input, not only the command", () => {
+    const relaySessionId = "s-strict";
+    expect(decodeInput({ relaySessionId, command: { kind: "refresh" } })).toEqual("accepted");
+    expect(decodeInput({ relaySessionId, command: { kind: "refresh" }, extra: 1 })).toEqual(
+      "refused",
+    );
   });
 });

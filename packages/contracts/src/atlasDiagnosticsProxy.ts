@@ -235,20 +235,22 @@ const AtlasCursor = Schema.Int.check(
 );
 
 export const AtlasDiagnosticsCommand = Schema.Union([
-  Schema.Struct({ kind: Schema.Literal("refresh") }),
+  Schema.Struct({ kind: Schema.Literal("refresh") }).annotate({
+    parseOptions: { onExcessProperty: "error" },
+  }),
   Schema.Struct({
     kind: Schema.Literal("retry"),
     after: AtlasCursor,
     /** Optional upstream (`RetryPayload.epoch: Option<i64>`): omitted means trust `after`. */
     epoch: Schema.optional(AtlasCursor),
-  }),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
 ]);
 export type AtlasDiagnosticsCommand = typeof AtlasDiagnosticsCommand.Type;
 
 export const AtlasDiagnosticsSendCommandInput = Schema.Struct({
   relaySessionId: AtlasDiagnosticsRelaySessionId,
   command: AtlasDiagnosticsCommand,
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type AtlasDiagnosticsSendCommandInput = typeof AtlasDiagnosticsSendCommandInput.Type;
 
 /** `sent: false` is a recoverable outcome (the session already closed) — not a hard fault. */
