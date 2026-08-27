@@ -215,15 +215,125 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<i64> {
     Some(score)
 }
 
+/// A DECLARED project-file failure, in the shape `ProjectReadFileError` /
+/// `ProjectWriteFileError` already promise (packages/contracts/src/project.ts:237-318).
+///
+/// WHY THIS TYPE EXISTS AT THIS LAYER. Every failure here used to reach the
+/// dispatcher as a bare `String`, which `server_main.rs` could only hand to
+/// `exit_failure` — the `Die` channel. `Die` is the protocol's word for an
+/// unrecoverable DEFECT the client has no branch for, and the backend uses it
+/// deliberately so an unimplemented method cannot masquerade as
+/// `Success(null)`. Sending "that file does not exist" down it is a category
+/// error with a visible cost: a missing optional `t3.json` — which the app
+/// probes for on EVERY boot — arrives at the client as a crash, so the declared
+/// error channel the contract defines is dead code and the frontend cannot
+/// distinguish "absent" from "the backend broke".
+///
+/// The classification lives HERE, not in cairn, and that boundary is the point.
+/// cairn is a general confined-filesystem library; it has no business knowing
+/// the literals of a t3code RPC error schema. This module is the lowest layer
+/// that knows both the filesystem outcome and the contract, so it is the lowest
+/// layer that can honestly own the mapping.
+#[derive(Debug, Clone)]
+pub struct ProjectFileError {
+    /// One of `ProjectFileFailure` — the contract's closed literal set. Never
+    /// invent a value here: an undeclared literal fails the client's decoder,
+    /// which turns a handled error back into a crash by a different route.
+    pub failure: &'static str,
+    /// One of `ProjectFileOperation`, naming the step that failed.
+    pub operation: &'static str,
+    pub relative_path: Option<String>,
+    pub message: String,
+}
+
+impl ProjectFileError {
+    fn new(
+        failure: &'static str,
+        operation: &'static str,
+        rel: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            failure,
+            operation,
+            relative_path: rel.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    /// Render as the tagged value the RPC's error channel declares. `tag` is
+    /// `ProjectReadFileError` or `ProjectWriteFileError`.
+    pub fn to_wire(&self, tag: &str, cwd: &str) -> Value {
+        let mut out = json!({
+            "_tag": tag,
+            "cwd": cwd,
+            "failure": self.failure,
+            "operation": self.operation,
+            "message": self.message,
+        });
+        // `relativePath` is `TrimmedNonEmptyString` in the contract, so an empty
+        // one must be OMITTED rather than sent as "". A field that fails the
+        // client's decoder converts a declared error into a decode crash, which
+        // is the exact failure this type exists to end.
+        if let Some(rel) = self.relative_path.as_ref().filter(|r| !r.trim().is_empty()) {
+            out["relativePath"] = json!(rel);
+        }
+        out
+    }
+}
+
+/// Classify a cairn filesystem error string against what is actually on disk.
+///
+/// cairn reports `Result<_, String>` across its whole surface and that is fine
+/// for a general library — but a string cannot be branched on by a client, so
+/// the mapping happens once, here, by asking the filesystem rather than by
+/// pattern-matching prose.
+fn classify_read(root: &std::path::Path, rel: &str, raw: &str) -> ProjectFileError {
+    // cairn's confinement refusal is the one case its message is authoritative
+    // for, because the path never resolved and there is nothing on disk to ask.
+    if raw.contains("escapes the workspace") {
+        return ProjectFileError::new(
+            "resolved_path_outside_root",
+            "realpath-target",
+            Some(rel),
+            raw,
+        );
+    }
+    if raw.contains("did not contain valid UTF-8") {
+        return ProjectFileError::new("binary_file", "read", Some(rel), raw);
+    }
+    // A directory is a real, expected answer to "preview this path" — the file
+    // picker can navigate into it — and it is NOT the same failure as "gone".
+    let joined = root.join(rel);
+    if joined.is_dir() {
+        return ProjectFileError::new(
+            "path_not_file",
+            "stat",
+            Some(rel),
+            format!("{rel} is a directory, not a file"),
+        );
+    }
+    // Everything else, including a missing file, is a declared operation
+    // failure. `ProjectFileFailure` has no `not_found` literal and this is not
+    // the place to invent one: the message carries the detail, and the point of
+    // the change is that the client gets a DECLARED error it can branch on
+    // instead of a defect it cannot.
+    ProjectFileError::new("operation_failed", "open", Some(rel), raw)
+}
+
 /// `projects.readFile` — file preview.
-pub async fn read_file(cwd: &str, input: &Value) -> Result<Value, String> {
-    let rel = input
-        .get("relativePath")
-        .and_then(Value::as_str)
-        .ok_or("relativePath is required")?;
+pub async fn read_file(cwd: &str, input: &Value) -> Result<Value, ProjectFileError> {
+    let rel = input.get("relativePath").and_then(Value::as_str).ok_or_else(|| {
+        ProjectFileError::new(
+            "operation_failed",
+            "open",
+            None,
+            "relativePath is required",
+        )
+    })?;
     let root = std::path::Path::new(cwd);
     // cairn confines the path; an escape is refused rather than read
-    let contents = cairn::read_file(root, rel).map_err(|e| e.to_string())?;
+    let contents = cairn::read_file(root, rel).map_err(|e| classify_read(root, rel, &e))?;
     let byte_length = contents.len();
     // #229's fix, now the shared helper (#353) rather than a copy. Keeping it
     // written out here is what let `review.rs` ship the pre-fix version of the
@@ -258,24 +368,56 @@ pub async fn write_file(
     pool: &std::sync::Arc<do_storage::DbPool>,
     cwd: &str,
     input: &Value,
-) -> Result<Value, String> {
-    let rel = input
-        .get("relativePath")
-        .and_then(Value::as_str)
-        .ok_or("relativePath is required")?;
+) -> Result<Value, ProjectFileError> {
+    let rel = input.get("relativePath").and_then(Value::as_str).ok_or_else(|| {
+        ProjectFileError::new("operation_failed", "write-file", None, "relativePath is required")
+    })?;
     let contents = input.get("contents").and_then(Value::as_str).unwrap_or("");
     let root = std::path::Path::new(cwd);
     match crate::tools::discover_stack(pool, root).await {
         cairn::Discovery::Repo(stack) => {
-            cairn::write_file(&stack, rel, contents)
-                .await
-                .map_err(|e| e.to_string())?;
+            cairn::write_file(&stack, rel, contents).await.map_err(|e| {
+                let raw = e.to_string();
+                if raw.contains("escapes the workspace") {
+                    ProjectFileError::new(
+                        "resolved_path_outside_root",
+                        "realpath-target",
+                        Some(rel),
+                        raw,
+                    )
+                } else {
+                    ProjectFileError::new("operation_failed", "write-file", Some(rel), raw)
+                }
+            })?;
         }
-        cairn::Discovery::NotRepository => cairn::write_file_atomic(root, rel, contents)?,
+        cairn::Discovery::NotRepository => {
+            cairn::write_file_atomic(root, rel, contents).map_err(|raw| {
+                if raw.contains("escapes the workspace") {
+                    ProjectFileError::new(
+                        "resolved_path_outside_root",
+                        "realpath-target",
+                        Some(rel),
+                        raw,
+                    )
+                } else {
+                    ProjectFileError::new("operation_failed", "write-file", Some(rel), raw)
+                }
+            })?;
+        }
+        // STILL A REFUSAL, and still the right one: a save that produces no
+        // undoable history, in a UI that promises edits are Cairn-backed, is
+        // what discovery exists to prevent. Only the CHANNEL changes — the
+        // client is now told this in the declared error it can render, instead
+        // of a defect it can only crash on.
         cairn::Discovery::Unavailable(why) => {
-            return Err(format!(
-            "cairn checkpoint substrate unavailable ({why}); refusing unversioned write to {rel}"
-        ))
+            return Err(ProjectFileError::new(
+                "operation_failed",
+                "write-file",
+                Some(rel),
+                format!(
+                    "cairn checkpoint substrate unavailable ({why}); refusing unversioned write to {rel}"
+                ),
+            ))
         }
     }
     Ok(json!({ "relativePath": rel }))
