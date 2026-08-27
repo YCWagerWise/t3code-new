@@ -7,6 +7,7 @@ import {
   getDefaultProviderInstanceModel,
   isProviderInstancePickerReady,
   isProviderInstancePickerVisible,
+  readySwitchTargets,
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   resolveProviderDriverKindForInstanceSelection,
@@ -530,5 +531,56 @@ describe("resolveDefaultProviderModelSelection", () => {
         null,
       ),
     ).toBeNull();
+  });
+});
+
+/**
+ * Finding #37. A thread bound to a provider whose runtime cannot run it used to lose the model
+ * picker entirely — the app claimed there were no providers while a ready one sat in the same
+ * list, and removed the only control that would have switched to it. These pin the distinction
+ * the composer now gates on.
+ */
+describe("readySwitchTargets", () => {
+  const atlasReady = provider({
+    provider: ProviderDriverKind.make("atlas"),
+    instanceId: "atlas",
+    status: "ready",
+    models: [model("anthropic/claude-opus-4-8"), model("ollama/qwen2.5-coder:7b")],
+  });
+  const claudeBroken = provider({
+    provider: ProviderDriverKind.make("claudeAgent"),
+    instanceId: "claudeAgent",
+    status: "error",
+  });
+
+  it("counts a ready alternative when the selected instance is broken", () => {
+    const entries = deriveProviderInstanceEntries([claudeBroken, atlasReady]);
+    // The exact captured situation: claudeAgent status:error, Atlas ready in the same list.
+    expect(isProviderInstancePickerReady(entries[0]!)).toBe(false);
+    const targets = readySwitchTargets(entries, null, null);
+    expect(targets.map((entry) => String(entry.instanceId))).toEqual(["atlas"]);
+  });
+
+  it("reports no target when nothing is ready, which is the true no-provider state", () => {
+    const entries = deriveProviderInstanceEntries([
+      claudeBroken,
+      provider({
+        provider: ProviderDriverKind.make("codex"),
+        instanceId: "codex",
+        status: "error",
+      }),
+    ]);
+    expect(readySwitchTargets(entries, null, null)).toHaveLength(0);
+  });
+
+  it("does not offer an incompatible instance while the thread is locked to a provider", () => {
+    const entries = deriveProviderInstanceEntries([claudeBroken, atlasReady]);
+    // A continuation-locked thread cannot legally move to another provider, so a ready Atlas
+    // is NOT an escape route and must not be counted as one.
+    expect(readySwitchTargets(entries, ProviderDriverKind.make("claudeAgent"), null)).toHaveLength(
+      0,
+    );
+    // Unlocking the same set restores it, so the emptiness is the lock and not the readiness.
+    expect(readySwitchTargets(entries, null, null)).toHaveLength(1);
   });
 });

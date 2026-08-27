@@ -252,6 +252,7 @@ import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
   isProviderInstancePickerReady,
+  readySwitchTargets,
   NO_PROVIDER_MODEL_SELECTION,
   resolveProviderDriverKindForInstanceSelection,
   resolveSelectableProviderInstanceEntry,
@@ -925,7 +926,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Whether anything else could run this turn. The distinction matters: "the provider you
   // picked is broken" and "you have no providers" are different problems with different
   // remedies, and only the second one is solved in Settings.
-  const readyInstanceCount = providerInstanceEntries.filter(isProviderInstancePickerReady).length;
+  //
+  // Lock-aware on purpose: a continuation-locked thread cannot legally move to another
+  // provider, so an incompatible ready instance is not an escape route and must not be
+  // counted as one.
+  const readyInstanceCount = readySwitchTargets(
+    providerInstanceEntries,
+    lockedProvider,
+    lockedContinuationGroupKey,
+  ).length;
   // The driver kind follows the instance that will actually run the turn,
   // which can differ from the persisted selection when that selection is
   // disabled.

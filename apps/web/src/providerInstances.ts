@@ -75,6 +75,32 @@ export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boo
   return entry.enabled && entry.isAvailable && entry.status === "ready";
 }
 
+/**
+ * Ready instances the user could actually switch TO, honouring a locked thread.
+ *
+ * "The instance you picked cannot run" and "you have nothing that can run" are different
+ * problems: only the second is solved in Settings, and only the first is solved by the picker.
+ * Counting switch targets is what lets the composer tell them apart — and it must respect the
+ * lock, because a continuation-locked thread cannot legally move to another provider, so an
+ * incompatible ready instance is not an escape route.
+ *
+ * Mirrors ModelPickerContent's `matchesLockedProvider` deliberately: if the two disagree, the
+ * composer would offer a switch the picker then refuses.
+ */
+export function readySwitchTargets(
+  entries: ReadonlyArray<ProviderInstanceEntry>,
+  lockedProvider: ProviderDriverKind | null,
+  lockedContinuationGroupKey: string | null,
+): ReadonlyArray<ProviderInstanceEntry> {
+  return entries.filter((entry) => {
+    if (!isProviderInstancePickerReady(entry)) return false;
+    if (lockedProvider === null) return true;
+    if (entry.driverKind !== lockedProvider) return false;
+    if (!lockedContinuationGroupKey) return true;
+    return entry.continuationGroupKey === lockedContinuationGroupKey;
+  });
+}
+
 /** Picker rails contain configured, enabled instances only. */
 export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): boolean {
   return entry.enabled;
