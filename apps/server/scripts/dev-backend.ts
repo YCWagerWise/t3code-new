@@ -77,8 +77,11 @@ const resolveRustPort = (
 
 const run = Effect.gen(function* () {
   const path = yield* Path.Path;
-  const here = path.dirname(new URL(".", import.meta.url).pathname);
-  const serverDir = path.resolve(here, "..");
+  // `new URL(".", import.meta.url)` already ends in `scripts/`, so dirname()
+  // strips the trailing slash and lands on `apps/server` — not `scripts`. Going
+  // one more `..` from there walked out to `apps/`, and the cargo manifest path
+  // resolved to `<workspace>/backend/Cargo.toml`, which does not exist.
+  const serverDir = path.dirname(new URL(".", import.meta.url).pathname);
   const repoRoot = path.resolve(serverDir, "..", "..");
 
   const backend = yield* selectBackend(process.env.T3CODE_BACKEND);
@@ -139,9 +142,14 @@ NodeRuntime.runMain(
     Effect.catchTag("DevBackendRefused", (error) =>
       Effect.logError(`[dev-backend] ${error.message}`).pipe(Effect.as(2)),
     ),
+    Effect.scoped,
     Effect.provide(NodeServices.layer),
     Effect.tap((code) =>
-      code === 0 ? Effect.void : Effect.sync(() => { process.exitCode = code; }),
+      code === 0
+        ? Effect.void
+        : Effect.sync(() => {
+            process.exitCode = code;
+          }),
     ),
   ),
 );
