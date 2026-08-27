@@ -222,13 +222,25 @@ export type AtlasDiagnosticsRelayEvent = typeof AtlasDiagnosticsRelayEvent.Type;
  * expose two commands, not arbitrary frames. Validating the shape here is AUTHORIZATION; it
  * does not take cursor policy away from the browser, which still chooses `after` and `epoch`.
  */
+/**
+ * A cursor Atlas can actually hold. Upstream these are `i64`, so `Schema.Number` was wrong in
+ * both directions: it accepted 1.5, NaN, Infinity and 1e308, and JSON then sent a fraction, an
+ * out-of-range integer, or `null` — which Atlas rejects while T3 reported `{sent: true}`.
+ *
+ * Bounded to safe integers rather than the full i64 range because beyond 2^53-1 a JS number
+ * cannot represent the value it would be claiming to send.
+ */
+const AtlasCursor = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+);
+
 export const AtlasDiagnosticsCommand = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("refresh") }),
   Schema.Struct({
     kind: Schema.Literal("retry"),
-    after: Schema.Number,
+    after: AtlasCursor,
     /** Optional upstream (`RetryPayload.epoch: Option<i64>`): omitted means trust `after`. */
-    epoch: Schema.optional(Schema.Number),
+    epoch: Schema.optional(AtlasCursor),
   }),
 ]);
 export type AtlasDiagnosticsCommand = typeof AtlasDiagnosticsCommand.Type;

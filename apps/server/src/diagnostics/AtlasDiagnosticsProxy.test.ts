@@ -13,11 +13,13 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   ATLAS_PROVIDER_DRIVER_KIND,
+  AtlasDiagnosticsCommand,
   AtlasDiagnosticsRelaySessionId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -532,4 +534,118 @@ describe("AtlasDiagnosticsProxy — relay bounds and terminal invariant", () => 
       ),
     ),
   );
+});
+
+describe("AtlasDiagnosticsProxy — close, ownership, and command boundaries", () => {
+  /**
+   * The branch the previous saturation test never reached: it overfilled via onMessage, so the
+   * overflow failure always won before onClose ran. Here the queue is filled EXACTLY, so the
+   * first refused offer is the close event itself.
+   */
+  it.effect("an upstream close that cannot be delivered fails rather than ending silently", () =>
+    Effect.gen(function* () {
+      const { factory } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        // open + (BUFFER - 1) messages == exactly BUFFER events queued, nothing refused yet.
+        for (let i = 0; i < ATLAS_PROXY_RELAY_BUFFER_FRAMES - 1; i += 1) {
+          handlers.onMessage(`{"seq":${i}}`);
+        }
+        // The close is the first event with nowhere to go.
+        handlers.onClose(1000, "normal");
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-full" });
+      const outcome = yield* Stream.runCollect(
+        service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER),
+      ).pipe(
+        Effect.map(() => "ended-without-saying-why"),
+        Effect.catchTag("AtlasProxyRelayOverflowError", (error) => Effect.succeed(error._tag)),
+      );
+      expect(outcome).toEqual("AtlasProxyRelayOverflowError");
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+
+  /**
+   * #28. OTHER_OWNER was declared last round and never used, so this branch had never run.
+   * The invariant is an AUTH-SESSION boundary, not a per-connection one: ws.ts passes the
+   * authenticated session id, which reconnects on the same token share.
+   */
+  it.effect("a session opened by one principal cannot be actuated by another", () =>
+    Effect.gen(function* () {
+      const opened = yield* Deferred.make<void>();
+      const { factory, sent } = fakeSocketFactory((handlers) => {
+        handlers.onOpen();
+        Deferred.doneUnsafe(opened, Effect.void);
+      });
+      const service = yield* make({ socketFactory: factory, mintRelaySessionId: () => "s-own" });
+      const fiber = yield* Effect.forkChild(
+        Stream.runDrain(service.openFeed({ providerInstanceId: ATLAS_INSTANCE_ID }, OWNER)),
+      );
+      yield* Deferred.await(opened);
+
+      const foreign = yield* service.sendCommand(
+        {
+          relaySessionId: AtlasDiagnosticsRelaySessionId.make("s-own"),
+          command: { kind: "refresh" },
+        },
+        OTHER_OWNER,
+      );
+      expect(foreign).toEqual({ sent: false });
+      expect(sent).toEqual([]);
+
+      const mine = yield* service.sendCommand(
+        {
+          relaySessionId: AtlasDiagnosticsRelaySessionId.make("s-own"),
+          command: { kind: "refresh" },
+        },
+        OWNER,
+      );
+      expect(mine).toEqual({ sent: true });
+      expect(sent).toEqual(['{"kind":"refresh"}']);
+
+      yield* Fiber.interrupt(fiber);
+    }).pipe(
+      Effect.provide(
+        serverSettingsLayerTest({ providerInstances: { [ATLAS_INSTANCE_ID]: atlasInstance() } }),
+      ),
+    ),
+  );
+});
+
+/**
+ * #29. The union narrowed the KIND but not the cursor, so the contract still accepted values
+ * Atlas's `i64` cannot hold and T3 reported them sent.
+ */
+describe("AtlasDiagnosticsCommand — hostile cursor boundaries", () => {
+  const decode = (value: unknown) =>
+    Effect.runSync(
+      Schema.decodeUnknownEffect(AtlasDiagnosticsCommand)(value).pipe(
+        Effect.map(() => "accepted"),
+        Effect.catch(() => Effect.succeed("refused")),
+      ),
+    );
+
+  it("accepts refresh, and retry with and without an epoch", () => {
+    expect(decode({ kind: "refresh" })).toEqual("accepted");
+    expect(decode({ kind: "retry", after: 0 })).toEqual("accepted");
+    expect(decode({ kind: "retry", after: 42, epoch: 7 })).toEqual("accepted");
+    expect(decode({ kind: "retry", after: Number.MAX_SAFE_INTEGER })).toEqual("accepted");
+  });
+
+  it("refuses a cursor Atlas's i64 could not hold", () => {
+    expect(decode({ kind: "retry", after: 1.5 })).toEqual("refused");
+    expect(decode({ kind: "retry", after: Number.NaN })).toEqual("refused");
+    expect(decode({ kind: "retry", after: Number.POSITIVE_INFINITY })).toEqual("refused");
+    expect(decode({ kind: "retry", after: Number.MAX_VALUE })).toEqual("refused");
+    expect(decode({ kind: "retry", after: -1 })).toEqual("refused");
+    expect(decode({ kind: "retry", after: 1, epoch: 2.5 })).toEqual("refused");
+  });
+
+  it("refuses a command kind the relay does not implement", () => {
+    expect(decode({ kind: "shutdown" })).toEqual("refused");
+    expect(decode({ kind: "retry" })).toEqual("refused");
+  });
 });

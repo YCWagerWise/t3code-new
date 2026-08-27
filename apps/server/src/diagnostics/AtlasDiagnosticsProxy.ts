@@ -472,8 +472,25 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
                     if (isClosed) return;
                     isClosed = true;
                     relaySessions.delete(relaySessionId);
-                    Queue.offerUnsafe(queue, { kind: "closed", code, reason });
-                    Queue.endUnsafe(queue);
+                    // An ordinary upstream close is a `closed` EVENT, because it carries a code
+                    // and reason worth delivering in order. But the queue may be exactly full,
+                    // and an unchecked offer here would be refused and then ended — the browser
+                    // would drain stale frames and see a clean EOF with no reason at all. If the
+                    // event cannot be delivered, the relay fails instead, which capacity cannot
+                    // refuse; the reason survives in the failure.
+                    if (Queue.offerUnsafe(queue, { kind: "closed", code, reason })) {
+                      Queue.endUnsafe(queue);
+                      return;
+                    }
+                    Queue.failCauseUnsafe(
+                      queue,
+                      Cause.fail(
+                        new AtlasProxyRelayOverflowError({
+                          providerInstanceId: input.providerInstanceId,
+                          detail: `upstream closed (${code}: ${reason}) while the browser was more than ${ATLAS_PROXY_RELAY_BUFFER_FRAMES} frames behind`,
+                        }),
+                      ),
+                    );
                   },
                 };
 
