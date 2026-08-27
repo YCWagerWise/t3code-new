@@ -131,12 +131,65 @@ pub struct Resolved {
     pub source_path: Option<String>,
 }
 
+/// The marker the client looks for to render its own fallback icon.
+///
+/// Mirrors `PROJECT_FAVICON_FALLBACK_MARKER` in `packages/shared/src/projectFavicon.ts`;
+/// `isProjectFaviconFallbackUrl` compares it against the LAST path segment, so
+/// the URL below has to end in exactly this.
+pub const PROJECT_FAVICON_FALLBACK_MARKER: &str = "project-favicon-missing";
+
+/// The answer for "this project has no favicon".
+///
+/// Deliberately unsigned and non-redeemable: it names no file, so there is
+/// nothing to authorize. It exists to be recognised by the client, not fetched.
+pub fn project_favicon_fallback_url() -> String {
+    format!("{ROUTE_PREFIX}/{PROJECT_FAVICON_FALLBACK_MARKER}")
+}
+
+/// What a resource resolved to.
+///
+/// `Missing` is NOT an error. A project that has never had a favicon is the
+/// ordinary case, and the contract already has an answer for it — see
+/// `AssetResource` in `packages/contracts/src/assets.ts`, where
+/// `project-favicon.path` is `Schema.optional` and documented as "a cache-key
+/// hint only. The server reads the authoritative path from the project
+/// projection before it issues the signed URL." Reporting the ordinary case as
+/// a defect is what made every boot emit a `Die`.
+#[derive(Debug)]
+pub enum Resolution {
+    Found(Resolved),
+    Missing,
+}
+
 /// Resolve the contract's `AssetResource` union against an ALREADY-ADMITTED
 /// workspace root.
 ///
 /// `root` is the caller's business (it comes from the thread's worktree or the
 /// environment workspace, both admitted by `vcs::resolve_cwd`); what happens
 /// here is the second half: the resource's own path must land inside it.
+pub fn resolve_resource(resource: &Value, root: &str) -> Result<Resolution, String> {
+    let tag = resource.get("_tag").and_then(Value::as_str).unwrap_or_default();
+    let path = resource
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    // A favicon this server cannot name is absent, not broken. `workspace-file`
+    // keeps demanding a path: there the caller named a specific file and a
+    // silent empty answer would hide a real client bug.
+    if tag == "project-favicon" && path.is_none() {
+        return Ok(Resolution::Missing);
+    }
+    match resolve(resource, root) {
+        Ok(found) => Ok(Resolution::Found(found)),
+        // Same reasoning one step later: a favicon whose file was deleted or
+        // renamed is absent. An ESCAPE is still refused, because that is a
+        // containment failure and must never be softened into "no icon".
+        Err(e) if tag == "project-favicon" && e.contains("was not found") => Ok(Resolution::Missing),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn resolve(resource: &Value, root: &str) -> Result<Resolved, String> {
     let tag = resource.get("_tag").and_then(Value::as_str).unwrap_or_default();
     let rel = match tag {
@@ -334,5 +387,92 @@ mod tests {
             root.to_str().unwrap(),
         );
         assert!(out.unwrap_err().contains("attachments are not supported"));
+    }
+
+    // ---- project-favicon: absent is not a defect (the every-boot `Die`) ----
+
+    /// The case `apps/web` sends on every boot for a project that has never had
+    /// a favicon: `ProjectFavicon.tsx` omits `path` entirely when there is none,
+    /// which the contract explicitly permits (`path: Schema.optional`).
+    #[test]
+    fn a_project_favicon_with_no_path_is_missing_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = resolve_resource(
+            &json!({ "_tag": "project-favicon", "cwd": "." }),
+            dir.path().to_str().unwrap(),
+        );
+        assert!(
+            matches!(out, Ok(Resolution::Missing)),
+            "a project with no favicon must resolve to Missing, got {out:?}"
+        );
+    }
+
+    /// A favicon that was configured and then deleted is also absent. Without
+    /// this the user gets an unrecoverable defect for renaming a file.
+    #[test]
+    fn a_project_favicon_whose_file_is_gone_is_missing_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = resolve_resource(
+            &json!({ "_tag": "project-favicon", "cwd": ".", "path": "icon.png" }),
+            dir.path().to_str().unwrap(),
+        );
+        assert!(
+            matches!(out, Ok(Resolution::Missing)),
+            "a deleted favicon must resolve to Missing, got {out:?}"
+        );
+    }
+
+    /// THE BOUNDARY. Softening "absent" must not soften CONTAINMENT: a path
+    /// that escapes the workspace is a refusal, and turning it into "no icon"
+    /// would silently convert a security answer into a UI state.
+    #[test]
+    fn a_project_favicon_that_escapes_the_workspace_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("inside");
+        std::fs::create_dir_all(&root).unwrap();
+        // The decoy must sit where `root.join(rel)` ACTUALLY lands — i.e. one
+        // level up from `root`, inside the tempdir — so the file EXISTS and the
+        // only thing refusing it is containment. My first version of this test
+        // put it a level too high, so the path did not resolve and the case fell
+        // into `Missing` for the boring reason instead of the interesting one.
+        // That would have made this test pass while proving nothing.
+        let outside = dir.path().join("escape-probe.png");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(outside.is_file(), "the decoy must exist or this proves nothing");
+        let out = resolve_resource(
+            &json!({ "_tag": "project-favicon", "cwd": ".", "path": "../escape-probe.png" }),
+            root.to_str().unwrap(),
+        );
+        assert!(
+            out.is_err(),
+            "an EXISTING file outside the workspace must stay an error, never Missing — \
+             softening absence must not soften containment. got {out:?}"
+        );
+        assert!(
+            format!("{out:?}").contains("escapes"),
+            "the refusal must name containment, not absence: {out:?}"
+        );
+    }
+
+    /// `workspace-file` is unchanged: there the caller named a specific file, so
+    /// a missing path is a real client bug and must not be softened.
+    #[test]
+    fn a_workspace_file_with_no_path_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = resolve_resource(
+            &json!({ "_tag": "workspace-file", "threadId": "t" }),
+            dir.path().to_str().unwrap(),
+        );
+        assert!(out.is_err(), "workspace-file must still require a path, got {out:?}");
+    }
+
+    /// The fallback URL has to be recognisable by the client, which compares the
+    /// LAST path segment against `PROJECT_FAVICON_FALLBACK_MARKER`
+    /// (packages/shared/src/projectFavicon.ts).
+    #[test]
+    fn the_fallback_url_ends_in_the_marker_the_client_looks_for() {
+        let url = project_favicon_fallback_url();
+        assert_eq!(url.rsplit('/').next(), Some("project-favicon-missing"), "url was {url}");
+        assert!(url.starts_with(ROUTE_PREFIX), "url was {url}");
     }
 }

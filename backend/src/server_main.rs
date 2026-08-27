@@ -2745,8 +2745,8 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(r) => r,
                 Err(e) => return exit_failure(tx, &id, &format!("assets.createUrl: {e}")),
             };
-            match assets::resolve(&resource, &root) {
-                Ok(resolved) => {
+            match assets::resolve_resource(&resource, &root) {
+                Ok(assets::Resolution::Found(resolved)) => {
                     let (relative_url, expires_at) = assets::mint(
                         &resolved,
                         &state.assets_key,
@@ -2758,6 +2758,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     }
                     exit_success(tx, &id, out);
                 }
+                // A project with no favicon is the ORDINARY case, and the
+                // protocol already has an answer for it: a URL whose last
+                // segment is the fallback marker, which the client recognises
+                // with `isProjectFaviconFallbackUrl` and renders as its own
+                // folder icon. Reporting it as a `Die` defect instead made
+                // `apps/web` emit an unrecoverable failure on every boot for
+                // every project that had never set one — noise that trained
+                // readers to ignore the one channel a real asset fault uses.
+                //
+                // `expiresAt` is 0 deliberately: nothing was minted and there is
+                // nothing to redeem, so advertising a lifetime would be a lie.
+                Ok(assets::Resolution::Missing) => exit_success(
+                    tx,
+                    &id,
+                    json!({
+                        "relativeUrl": assets::project_favicon_fallback_url(),
+                        "expiresAt": 0,
+                    }),
+                ),
                 Err(e) => exit_failure(tx, &id, &format!("assets.createUrl: {e}")),
             }
         }
