@@ -14,6 +14,7 @@ import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.t
 import {
   ATLAS_DRIVER_KIND,
   type AtlasSocketFactory,
+  type AtlasSocketHandlers,
   atlasStartCommand,
   bindingFromSlug,
   bindingSlug,
@@ -750,29 +751,59 @@ describe("turn identity", () => {
   });
 });
 
-/** A console socket a test can open, drop and inspect, with no server involved. */
+/**
+ * A console socket a test can open, drop and inspect, with no server involved.
+ *
+ * Tracks connection GENERATIONS — one record per `connect()` call — because a single shared
+ * `live` handlers reference let a previous version of this file resurrect a socket that had
+ * already closed: `restore()` called `onOpen` on whichever handlers were assigned last, even
+ * a dead generation's, and if that ever landed before the production reconnect had actually
+ * re-dialled, the test would have passed via an impossible state no real WebSocket can be in
+ * (a closed one reopening) rather than via reconnection. A generation that closes is
+ * permanently unable to reopen or send, by construction — `restore()` can only ever complete
+ * a still-PENDING generation (dialled while the network was down, neither open nor closed
+ * yet), which only exists once the driver's own scheduled `dial()` has actually run.
+ */
 const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
   const sent: Array<{ kind: string; payload: Record<string, unknown> }> = [];
   const urls: Array<string> = [];
-  let live: { onOpen: () => void; onClose: () => void } | undefined;
+  type Generation = {
+    readonly handlers: AtlasSocketHandlers;
+    isOpen: boolean;
+    isClosed: boolean;
+  };
+  let current: Generation | undefined;
   let openNow = true;
 
   const connect: AtlasSocketFactory = (url, handlers) => {
     urls.push(url);
-    live = handlers;
-    if (openNow)
+    const generation: Generation = { handlers, isOpen: false, isClosed: false };
+    current = generation;
+    if (openNow) {
       queueMicrotask(() => {
+        if (generation.isClosed) return;
+        generation.isOpen = true;
         handlers.onOpen();
         handlers.onMessage();
       });
+    }
+    // Else: the network is down. This generation stays PENDING — neither open nor closed —
+    // exactly like a real dial against a dead network, until `restore()` completes it or a
+    // drop cuts it off first.
     return {
       send: (data: string) => {
+        // A real WebSocket physically cannot send before it has opened, or once closed —
+        // model that so a pending or dead generation can never deliver anything.
+        if (!generation.isOpen || generation.isClosed) return;
         const frame = JSON.parse(data) as { kind: string; payload: Record<string, unknown> };
         sent.push(frame);
         // The node durably records it, which is what the driver reads back to confirm.
         node?.recordConsole(frame);
       },
-      close: () => {},
+      close: () => {
+        generation.isClosed = true;
+        generation.isOpen = false;
+      },
     };
   };
 
@@ -783,7 +814,11 @@ const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
     /** Simulate the socket dropping, so queued decisions can be observed. */
     drop: () => {
       openNow = false;
-      live?.onClose();
+      const generation = current;
+      if (generation === undefined || generation.isClosed) return;
+      generation.isClosed = true;
+      generation.isOpen = false;
+      generation.handlers.onClose();
     },
     /**
      * A FAILED connection, as the browser factory reports one: `error` then `close`, both
@@ -791,14 +826,28 @@ const makeFakeSocket = (node?: ReturnType<typeof makeFakeAtlas>) => {
      */
     failWithErrorThenClose: () => {
       openNow = false;
-      const handlers = live;
-      handlers?.onClose();
-      handlers?.onClose();
+      const generation = current;
+      if (generation === undefined || generation.isClosed) return;
+      generation.isClosed = true;
+      generation.isOpen = false;
+      generation.handlers.onClose();
+      generation.handlers.onClose();
     },
+    /**
+     * Simulate the network coming back. Completes the CURRENT generation only while it is
+     * still pending — a closed generation is refused outright, on purpose: reopening one
+     * would be the exact impossible state this type exists to rule out. This does not dial
+     * anything itself; the caller is expected to wait for the production reconnect's own
+     * scheduled `dial()` to actually run first (a genuine second `connect()`, visible via
+     * `urls.length`), so this only ever finishes a reconnection that already started.
+     */
     restore: () => {
       openNow = true;
-      live?.onOpen();
-      live?.onMessage();
+      const generation = current;
+      if (generation === undefined || generation.isClosed || generation.isOpen) return;
+      generation.isOpen = true;
+      generation.handlers.onOpen();
+      generation.handlers.onMessage();
     },
   };
 };
@@ -967,7 +1016,7 @@ describe("approvals", () => {
     expect(socket.urls.length).toBeGreaterThan(dialsAfterOpen);
   });
 
-  it("does not report a decision delivered until Atlas has stored it", async () => {
+  it("does not report a decision delivered until Atlas has stored it, and only via a real reconnect", async () => {
     const node = makeFakeAtlas();
     const socket = makeFakeSocket(node);
     // A real (tiny) clock here, unlike the other tests: this one is ABOUT the retry window, and
@@ -981,18 +1030,35 @@ describe("approvals", () => {
       connect: socket.connect,
     });
     await startSession(adapter);
+    const dialsBeforeDrop = socket.urls.length;
     socket.drop();
 
-    // The user clicks while the connection is down. The decision must neither be lost nor
-    // reported as delivered — a success here would tell them the tool was approved while the
-    // turn quietly died on the gate's deadline.
+    // Wait for the production reconnect to actually schedule and run its own `dial()` — a
+    // genuine second `connect()` call — BEFORE the decision is even made, rather than racing a
+    // fixed wait against it. Racing was the defect: a manual restore that won the race against
+    // the scheduled redial could resurrect the CLOSED connection's stale handlers instead of a
+    // real reconnection ever happening, and the approval would go through without one.
+    await waitFor(() => socket.urls.length > dialsBeforeDrop, "the scheduled reconnect to redial");
+    // The point of this test: a real reconnect was dialled, not a resurrected dead one.
+    expect(socket.urls.length).toEqual(dialsBeforeDrop + 1);
+    // ...but the fake network is still down, so this new generation is pending — neither open
+    // nor closed — exactly like a real socket that has not finished connecting. `restore()` can
+    // only ever complete THIS generation now, never the closed one that preceded it.
+    expect(node.consoleFrames).toHaveLength(0);
+
+    // Now the user clicks, with the redial already dialled but not yet open. The decision must
+    // neither be lost nor reported as delivered — a success here would tell them the tool was
+    // approved while the turn quietly died on the gate's deadline.
     let settled = false;
     const decision = Effect.runPromise(
       adapter.respondToRequest(ThreadId.make("thr-1"), "run-1:call-1" as never, "accept" as never),
     ).then(() => {
       settled = true;
     });
-    await new Promise<void>((r) => setTimeout(r, 10));
+    // A minimal real-clock tick — enough for the fiber to reach its first `send`, comfortably
+    // less than the ~20ms retry window, so this does not race the SAME retry loop into sending
+    // (and queueing) a second time before `restore()` ever runs.
+    await new Promise<void>((r) => setTimeout(r, 1));
     expect(settled).toBe(false);
     expect(node.consoleFrames).toHaveLength(0);
 
@@ -1000,7 +1066,8 @@ describe("approvals", () => {
     await decision;
     await Effect.runPromise(adapter.stopSession(ThreadId.make("thr-1")));
 
-    // Held across the outage, then delivered and confirmed against the durable feed.
+    // Held across the outage, then delivered through the reconnected socket and confirmed
+    // against the durable feed.
     expect(settled).toBe(true);
     expect(node.consoleFrames).toHaveLength(1);
     expect(node.consoleFrames[0]?.["payload"]).toEqual({
@@ -1177,11 +1244,20 @@ describe("the Atlas credential never reaches a client", () => {
 
     // The secret is gone from everything a client can see.
     expect(wire).not.toContain("super-secret-value");
-    const instance = (redacted as unknown as Record<string, Record<string, never>>)
-      .providerInstances["atlas"] as unknown as {
-      config: Record<string, unknown>;
-      environment: ReadonlyArray<Record<string, unknown>>;
-    };
+    // Cast straight to the exact shape this fixture has, with `atlas` a NAMED property rather
+    // than a generic index signature — indexing a `Record<string, ...>` under
+    // `noUncheckedIndexedAccess` types the result `| undefined`, which is what made this a
+    // real (if test-only) type error rather than lint noise.
+    const instance = (
+      redacted as unknown as {
+        providerInstances: {
+          atlas: {
+            config: Record<string, unknown>;
+            environment: ReadonlyArray<Record<string, unknown>>;
+          };
+        };
+      }
+    ).providerInstances.atlas;
     const token = instance.environment.find((v) => v["name"] === ATLAS_ACCESS_TOKEN_ENV);
     expect(token?.["value"]).toEqual("");
     expect(token?.["valueRedacted"]).toBe(true);

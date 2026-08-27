@@ -74,8 +74,8 @@ import {
 } from "./AtlasConsole.ts";
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
   ProviderDriverError,
-  ProviderUnsupportedError,
 } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
@@ -292,8 +292,19 @@ const readHandshake = (
  * the first use, which is the defect this driver exists to remove — it does not get to sneak
  * back in as a convenience.
  */
+// `ProviderAdapterValidationError`, not `ProviderUnsupportedError`: the latter means the
+// DRIVER KIND itself is unregistered (a registry-level concern — see its doc comment), not
+// that a registered, working adapter simply has no console verb for one operation. Failing
+// with it here does not type-check against `ProviderAdapterShape<ProviderAdapterError>`
+// either, since `ProviderUnsupportedError` is not one of its members.
 const unsupported = (operation: string) =>
-  Effect.fail(new ProviderUnsupportedError({ provider: `${ATLAS_DRIVER_KIND} (${operation})` }));
+  Effect.fail(
+    new ProviderAdapterValidationError({
+      provider: ATLAS_DRIVER_KIND,
+      operation,
+      issue: `atlas-host has no console verb for ${operation}; this adapter does not support it.`,
+    }),
+  );
 
 const nowIso = () => new Date().toISOString();
 
@@ -405,7 +416,7 @@ export interface AtlasAdapterInput {
 
 export const makeAtlasAdapter = (
   input: AtlasAdapterInput,
-): ProviderAdapterShape<ProviderUnsupportedError | ProviderAdapterRequestError> => {
+): ProviderAdapterShape<ProviderAdapterValidationError | ProviderAdapterRequestError> => {
   // One cursor per thread, held by the READER. Atlas's log is the durable copy; this is only
   // the bookmark, so losing it costs a replay and never an event.
   const threads = new Map<string, LiveThread>();
@@ -904,6 +915,9 @@ export const makeAtlasDriver = (
         credential.kind === "refused-insecure"
           ? {
               installed: true,
+              // The refusal happens before any handshake, so there is no version to report —
+              // `null` is how every other "did not reach a live probe" branch here says that.
+              version: null,
               status: "error",
               auth: { status: "unauthenticated" },
               message:
