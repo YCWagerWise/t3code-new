@@ -639,6 +639,67 @@ async fn request_on(
     .await;
 }
 
+#[tokio::test]
+async fn dispatch_command_refuses_unknown_and_unimplemented_commands() {
+    let (state, _d) = test_state().await;
+
+    let dispatch = |input: Value| {
+        let state = state.clone();
+        async move {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            request(
+                &state,
+                &tx,
+                "orchestration.dispatchCommand",
+                json!({ "input": input }),
+            )
+            .await;
+            drain(&mut rx)
+                .into_iter()
+                .find(|f| f["_tag"] == "Exit")
+                .expect("dispatch exit")
+        }
+    };
+
+    let unknown = dispatch(json!({
+        "type": "thread.pni",
+        "commandId": "bad-tag",
+        "threadId": "t-typed",
+    }))
+    .await;
+    assert_eq!(
+        unknown["exit"]["_tag"], "Failure",
+        "an unknown command type must fail decode, not fall through to Success: {unknown}"
+    );
+    assert!(
+        unknown["exit"]["cause"].to_string().contains("unknown variant")
+            || unknown["exit"]["cause"].to_string().contains("invalid or unknown command"),
+        "the failure names the command decode problem: {unknown}"
+    );
+
+    let unimplemented = dispatch(json!({
+        "type": "thread.pin",
+        "commandId": "pin-unimplemented",
+        "threadId": "t-typed",
+        "orderKey": "m",
+    }))
+    .await;
+    assert_eq!(
+        unimplemented["exit"]["_tag"], "Failure",
+        "a known but unimplemented command must not receive a Success sequence: {unimplemented}"
+    );
+    assert_eq!(
+        unimplemented["exit"]["cause"][0]["error"]["_tag"],
+        "OrchestrationDispatchCommandError",
+        "known unimplemented commands use the dispatch command error channel: {unimplemented}"
+    );
+    assert!(
+        unimplemented["exit"]["cause"].to_string().contains("thread.pin")
+            && unimplemented["exit"]["cause"].to_string().contains("not implemented"),
+        "the failure names the unimplemented command: {unimplemented}"
+    );
+}
+
 /// #400 second failure path: `save_project` succeeds but the
 /// downstream `emit_shell_event(project-upserted)` fails — must
 /// return exactly one Failure, not a Success masking the missing
@@ -7983,7 +8044,7 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         &state,
         &tx,
         "filesystem.browse",
-        json!({ "partialPath": format!("{}/al", dir.to_string_lossy()) }),
+        json!({ "cwd": dir.to_string_lossy(), "partialPath": "al" }),
     )
     .await;
     let f = drain(&mut rx);
@@ -8036,21 +8097,22 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         "a picker for directories does not offer files"
     );
 
-    // an unreadable parent FAILS, and says which failure it was
+    // an absolute path outside the admitted workspace FAILS before the
+    // directory listing helper ever sees it.
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
         &state,
         &tx,
         "filesystem.browse",
-        json!({ "partialPath": "/definitely/not/here/at/all/x" }),
+        json!({ "partialPath": "/etc/" }),
     )
     .await;
     let bad = drain(&mut rx);
     assert_eq!(bad[0]["exit"]["_tag"], "Failure");
     let msg = bad[0]["exit"]["cause"].to_string();
     assert!(
-        msg.contains("read_directory_failed"),
-        "the failure is classified: {msg}"
+        msg.contains("not this environment's workspace") || msg.contains("path escapes"),
+        "the failure is an admission refusal, not a host directory listing: {msg}"
     );
 
     // open-in-editor: an installed editor launch crosses hearth, so the result
