@@ -3922,6 +3922,45 @@ async fn client_activity_reports_are_acknowledged() {
     );
 }
 
+/// Settings -> Connections subscribes to this. It used to answer `unsupported
+/// method`, so the page rendered an error where its real state belongs.
+///
+/// The assertion is deliberately two-sided: an EMPTY snapshot must arrive, and
+/// the request must NOT terminate. Asserting only "no longer unsupported" would
+/// pass against an arm that sent an Exit and killed the subscription, and
+/// asserting only the absence of an Exit would pass against an arm that sent
+/// nothing at all.
+#[tokio::test]
+async fn auth_access_subscription_emits_an_empty_snapshot_and_stays_open() {
+    let (state, _dir) = test_state().await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "subscribeAuthAccess", json!({})).await;
+    let frames = drain(&mut rx);
+
+    let chunk = frames
+        .iter()
+        .find(|f| f["_tag"] == "Chunk")
+        .unwrap_or_else(|| panic!("auth access must emit a snapshot chunk: {frames:#?}"));
+    let event = &chunk["values"][0];
+    assert_eq!(event["type"], "snapshot", "the first event is a snapshot: {chunk}");
+    assert_eq!(event["version"], 1, "snapshot carries the contract version: {chunk}");
+    assert_eq!(
+        event["payload"]["pairingLinks"],
+        json!([]),
+        "this backend mints no pairing links, and must say so rather than omit the key: {chunk}"
+    );
+    assert_eq!(
+        event["payload"]["clientSessions"],
+        json!([]),
+        "this backend tracks no client sessions: {chunk}"
+    );
+
+    assert!(
+        !frames.iter().any(|f| f["_tag"] == "Exit"),
+        "a subscription must stay open — an Exit ends it and the page stops updating: {frames:#?}"
+    );
+}
+
 /// #48: proving the SOURCE repo is ours says nothing about the DESTINATION.
 /// A worktree may only be created inside this environment's worktree area,
 /// and may only be force-removed if we created it and git still links it.
