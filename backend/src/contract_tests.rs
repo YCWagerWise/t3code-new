@@ -3710,6 +3710,88 @@ async fn get_config_advertises_the_registry_catalog() {
     }
 }
 
+/// #468/#437: `thread.created` IS the draft-promotion event, and it is emitted
+/// EXACTLY ONCE — on create, never on a later turn.
+///
+/// `apps/web/src/orchestrationEventEffects.ts:31` promotes a draft on
+/// `case "thread.created"` and on nothing else. The backend used to emit only
+/// `thread-upserted`, which is the SHELL frame that drives the sidebar list, not
+/// the thread lifecycle event the reducer switches on. Every part of the turn
+/// worked — durable row written, sidebar updated, running/assistant/idle all
+/// delivered to the socket the client had actually subscribed on — and the view
+/// stayed parked on `/draft/<id>` showing "Thinking" while the answer sat one
+/// route away.
+///
+/// The emission existed in the tree with no test on it, which is the shape that
+/// produced this channel's verify-then-reopen cycles: a fix nobody can re-check
+/// is a fix that silently regresses. Both halves are asserted here because both
+/// are load-bearing — a missing event never promotes the draft, and a repeated
+/// event re-promotes a draft that is already a thread.
+#[tokio::test]
+async fn thread_created_is_emitted_once_on_create_and_never_on_a_later_turn() {
+    let (state, _d) = test_state().await;
+    let sel = json!({"instanceId": "claudeAgent", "model": "claude-haiku-4-5-20251001"});
+
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-created", "modelSelection": sel,
+            "runtimeMode": "full-access",
+            "titleSeed": "promote me",
+            "message": {"text": "hi", "messageId": "m1"},
+        }),
+    )
+    .await
+    .unwrap();
+
+    let after_create = state.rt.events_after("t-created", 0, 100).await.unwrap();
+    let created: Vec<_> = after_create
+        .iter()
+        .filter(|e| e.pointer("/event/type").and_then(|v| v.as_str()) == Some("thread.created"))
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the first turn on a new thread owes exactly one thread.created; \
+         without it the client never leaves /draft/. events={after_create:?}"
+    );
+
+    // The payload is what the reducer reads to build the real thread route; a
+    // thread.created that does not name its thread promotes nothing.
+    let payload = created[0].pointer("/event/payload").expect("payload");
+    assert_eq!(payload["threadId"], "t-created", "payload: {payload}");
+    assert_eq!(payload["title"], "promote me", "payload: {payload}");
+    assert_eq!(payload["runtimeMode"], "full-access", "payload: {payload}");
+    assert!(
+        payload["projectId"].as_str().is_some_and(|p| !p.is_empty()),
+        "a promoted thread must name the project it lives in: {payload}"
+    );
+
+    // A SECOND turn on the same thread updates it. `thread-upserted` still
+    // carries that case; `thread.created` must not fire again.
+    ensure_thread_on_shell(
+        &state,
+        &json!({
+            "threadId": "t-created", "modelSelection": sel,
+            "runtimeMode": "full-access",
+            "message": {"text": "again", "messageId": "m2"},
+        }),
+    )
+    .await
+    .unwrap();
+
+    let after_second = state.rt.events_after("t-created", 0, 100).await.unwrap();
+    let created_now = after_second
+        .iter()
+        .filter(|e| e.pointer("/event/type").and_then(|v| v.as_str()) == Some("thread.created"))
+        .count();
+    assert_eq!(
+        created_now, 1,
+        "a turn on an EXISTING thread must not re-emit thread.created — it would \
+         re-promote a draft that is already a thread. events={after_second:?}"
+    );
+}
+
 /// #37: switching the model on an EXISTING thread persists durably, and the
 /// switch does not cost the thread its history.
 #[tokio::test]
@@ -11538,6 +11620,294 @@ async fn a_revert_never_touches_the_runtimes_own_state() {
         "advanced-since\n",
         "the revert rolled back the runtime's own state — the exclusion is not in scope, \
          it is only hiding the files from the review"
+    );
+}
+
+/// #433 — THE ELEVEN DURABLE THREAD-STATE COMMANDS, ASSERTED WHERE THEY BROKE.
+///
+/// The finding's failure scenario is precise and it is what this asserts:
+/// "Dispatch thread.archive (or pin/snooze/settle/runtime-mode.set) for any
+/// thread. The RPC returns Exit/Success ... Reload the page: the thread is
+/// unarchived. Nothing was ever written and no event was ever emitted, so no
+/// reconnect, replay, or second client can ever observe the change."
+///
+/// So a success ack is NOT the assertion — a success ack was the bug. Each
+/// command is checked on all three things that were missing:
+///   1. the DURABLE row carries the field afterwards (survives a reload),
+///   2. a `thread.meta-updated` event was RECORDED, not merely published, so a
+///      client reconnecting with `afterSequence` catches up (#318),
+///   3. the un-* twin puts it back to `null` rather than leaving it set.
+#[tokio::test]
+async fn the_durable_thread_state_commands_write_through_and_emit() {
+    let (state, _d) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-state")).await.unwrap();
+
+    // (command, extra fields, durable field, expected value shape)
+    let cases: Vec<(&str, Value, &str, bool)> = vec![
+        ("thread.archive", json!({}), "archivedAt", true),
+        ("thread.unarchive", json!({}), "archivedAt", false),
+        ("thread.settle", json!({}), "settledAt", true),
+        ("thread.unsettle", json!({}), "settledAt", false),
+        (
+            "thread.snooze",
+            json!({ "snoozedUntil": "2030-01-01T00:00:00.000Z" }),
+            "snoozedUntil",
+            true,
+        ),
+        ("thread.unsnooze", json!({}), "snoozedUntil", false),
+        ("thread.pin", json!({}), "pinnedAt", true),
+        ("thread.unpin", json!({}), "pinnedAt", false),
+    ];
+
+    for (cmd, extra, field, expect_set) in cases {
+        let mut input = json!({ "type": cmd, "threadId": "t-state" });
+        if let (Some(o), Some(e)) = (input.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, "orchestration.dispatchCommand", json!({ "input": input })).await;
+        let frames = drain(&mut rx);
+        assert!(
+            frames.iter().any(exit_is_success),
+            "{cmd} must succeed: {frames:?}"
+        );
+
+        // THE DURABLE ROW — this is what a reload reads, and it is what was
+        // empty while the ack said otherwise.
+        let row = state
+            .rt
+            .threads()
+            .await
+            .into_iter()
+            .find(|t| t["id"] == "t-state")
+            .expect("thread row persists");
+        if expect_set {
+            assert!(
+                row.get(field).and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
+                "{cmd} must WRITE {field} durably; row={row}"
+            );
+        } else {
+            assert!(
+                row.get(field).is_none_or(Value::is_null),
+                "{cmd} must CLEAR {field} durably, not leave it set; row={row}"
+            );
+        }
+    }
+
+    // RECORDED, not merely published. A client that reconnects with
+    // `afterSequence` reads the event log; a live-only publish is invisible to
+    // it and the thread keeps showing the old state until a full refresh.
+    let events = state.rt.events_after("t-state", 0, 200).await.unwrap();
+    let meta_updates = events
+        .iter()
+        .filter(|e| e.pointer("/event/type").and_then(Value::as_str) == Some("thread.meta-updated"))
+        .count();
+    assert!(
+        meta_updates >= 8,
+        "each state change owes a RECORDED thread.meta-updated (8 commands ran, \
+         saw {meta_updates}); without it a reconnecting client never learns of \
+         the change. events={events:?}"
+    );
+}
+
+/// The modes are a permission decision, so they are validated rather than stored
+/// as free text — and the un-parseable case must REFUSE, not default.
+#[tokio::test]
+async fn the_mode_set_commands_persist_a_valid_mode_and_refuse_an_invalid_one() {
+    let (state, _d) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-modes")).await.unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.runtime-mode.set", "threadId": "t-modes",
+        "runtimeMode": "approval-required",
+    }})).await;
+    let frames = drain(&mut rx);
+    assert!(frames.iter().any(exit_is_success), "a valid mode must land: {frames:?}");
+    let row = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-modes").unwrap();
+    assert_eq!(row["runtimeMode"], "approval-required", "row={row}");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.interaction-mode.set", "threadId": "t-modes",
+        "interactionMode": "plan",
+    }})).await;
+    assert!(drain(&mut rx).iter().any(exit_is_success), "interaction mode must land");
+    let row = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-modes").unwrap();
+    assert_eq!(row["interactionMode"], "plan", "row={row}");
+
+    // REFUSE, DO NOT DEFAULT. `RuntimeMode::parse` never fails — an unknown
+    // string becomes `Other(s)`, preserved verbatim for durable round-trip
+    // (record.rs:49-51). That is right for READING a row and useless as
+    // validation, so accepting a client's mode has to reject the `Other`
+    // variant. Defaulting here would give a thread more access than was asked
+    // for, silently.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.dispatchCommand", json!({"input": {
+        "type": "thread.runtime-mode.set", "threadId": "t-modes",
+        "runtimeMode": "definitely-not-a-mode",
+    }})).await;
+    let frames = drain(&mut rx);
+    assert!(
+        !frames.iter().any(exit_is_success),
+        "an unknown runtime mode must be REFUSED, not defaulted or stored: {frames:?}"
+    );
+    let row = state.rt.threads().await.into_iter().find(|t| t["id"] == "t-modes").unwrap();
+    assert_eq!(
+        row["runtimeMode"], "approval-required",
+        "a refused mode must leave the durable row untouched; row={row}"
+    );
+}
+
+/// A command that carries none of the information it needs must FAIL, not ack.
+/// Inventing a wake time the user cannot see is the same class of defect as the
+/// silent no-op this finding is about: the client is told something landed and
+/// the system did something else.
+#[tokio::test]
+async fn snooze_without_a_wake_time_and_reorder_without_an_order_both_refuse() {
+    let (state, _d) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-refuse")).await.unwrap();
+
+    for input in [
+        json!({ "type": "thread.snooze", "threadId": "t-refuse" }),
+        json!({ "type": "thread.pin.reorder", "threadId": "t-refuse" }),
+    ] {
+        let label = input["type"].as_str().unwrap().to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, "orchestration.dispatchCommand", json!({ "input": input })).await;
+        let frames = drain(&mut rx);
+        assert!(
+            !frames.iter().any(exit_is_success),
+            "{label} with no payload must refuse rather than ack: {frames:?}"
+        );
+    }
+}
+
+/// Drive the real `capture_http` handler and return its body as JSON.
+///
+/// Through the HANDLER, not a copy of its match: a test that reimplements the
+/// routing table asserts its own copy and passes while the server changes.
+async fn capture_http_raw(path: &str) -> (axum::http::StatusCode, String) {
+    // `axum::body::to_bytes`, NOT `http_body_util::BodyExt`. The latter would be
+    // a NEW PACKAGE in the graph for one line of a test, and this repo's
+    // dev-dependencies comment is explicit that a test dependency should be an
+    // edge on something already resolved, not a new node.
+    let response = super::capture_http(
+        Method::GET,
+        path.parse::<Uri>().expect("valid test uri"),
+        Bytes::new(),
+    )
+    .await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+async fn capture_http_json(path: &str) -> Value {
+    let (status, body) = capture_http_raw(path).await;
+    assert!(
+        status.is_success(),
+        "{path} must answer, got {status:?}: {body}"
+    );
+    serde_json::from_str(&body).unwrap_or_else(|e| panic!("{path} must return JSON ({e}): {body}"))
+}
+
+/// E2E-10 TIER-B — AUTHORIZATION, ASSERTED AS WHAT IT ACTUALLY IS.
+///
+/// The task's requirement is "authorization must fail CLOSED — assert an
+/// unauthenticated/expired-token client is refused, never silently allowed
+/// through". THAT ASSERTION CANNOT BE WRITTEN AGAINST THIS BACKEND AS A PASS,
+/// and writing one that passed would be the worst possible outcome here, so this
+/// asserts the truth instead:
+///
+///   `GET /api/auth/session` answers `authenticated: true` UNCONDITIONALLY, with
+///   the full scope list, to anyone who asks — no credential is read, no token is
+///   verified, nothing can be expired because nothing is ever checked. There is
+///   no `Authorization` handling anywhere in `backend/src`.
+///   `GET /api/auth/websocket-ticket` hands out a constant `"dev-ticket"`.
+///   `/ws` upgrades without consulting either.
+///
+/// That is a deliberate local-development posture, not an oversight — the
+/// response SAYS SO, in the payload, as `policy: "unsafe-no-auth"`. The danger is
+/// not the posture; it is the posture going UNDECLARED. A future change that
+/// starts answering `authenticated: true` under a policy string claiming real
+/// authentication would hand every client a full-scope session while the client
+/// gate (`resolveInitialServerAuthGateState` ->
+/// `_chat.tsx` beforeLoad) reports "authenticated" and lets it through — and
+/// nothing would be checking, because the client gate is a UI gate and cannot be
+/// the enforcement point.
+///
+/// So the invariant this pins is: **an unconditional yes must be self-declared as
+/// unsafe.** If someone implements real auth, this test fails and must be
+/// replaced with the refusal assertions the task actually wants. If someone
+/// removes the declaration while keeping the unconditional yes, this test fails
+/// and says why. Both are the right outcome; a silent transition between them is
+/// the one thing that must not happen quietly.
+#[tokio::test]
+async fn the_no_auth_posture_is_declared_in_the_payload_and_cannot_go_silent() {
+    let session = capture_http_json("/api/auth/session").await;
+
+    assert_eq!(
+        session["authenticated"], true,
+        "this backend answers every session probe with authenticated=true; if that \
+         has changed, the refusal assertions this test's doc comment describes are \
+         now writable and this test must be replaced by them. session={session}"
+    );
+
+    // THE DECLARATION. This is the assertion that matters.
+    assert_eq!(
+        session["auth"]["policy"], "unsafe-no-auth",
+        "an unconditional `authenticated: true` MUST declare itself unsafe. A \
+         policy string that claims real authentication while the handler verifies \
+         nothing would give every client a full-scope session with the UI gate \
+         reporting success and no enforcement anywhere. session={session}"
+    );
+
+    // The scopes are handed out with it, so the blast radius is explicit rather
+    // than something a reader has to infer from the absence of a check.
+    let scopes: Vec<String> = session["scopes"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    assert!(
+        scopes.contains(&"orchestration:operate".to_string()),
+        "the unconditional session grants operate scope; that is the fact this \
+         test exists to keep visible. scopes={scopes:?}"
+    );
+
+    // And the websocket ticket is a constant, not a credential.
+    let ticket = capture_http_json("/api/auth/websocket-ticket").await;
+    assert_eq!(
+        ticket["ticket"], "dev-ticket",
+        "the websocket ticket is a constant; if it has become a real credential, \
+         the ws upgrade must start verifying it and this test must be replaced. \
+         ticket={ticket}"
+    );
+}
+
+/// The other half of fail-closed, and this one the backend DOES get right: an
+/// unimplemented route must 404, not answer `200 {}`.
+///
+/// It is in this test because it is the same class of defect as the one above
+/// seen from the other side — a caller that cannot tell "not implemented" from
+/// "implemented and empty" makes a security decision on a shape rather than an
+/// answer. `GET /api/orchestration/shell` is how that bit before: the snapshot
+/// decoded as an empty object, the contract decode failed, and the app fell back
+/// to the socket on every connection while the server reported success.
+#[tokio::test]
+async fn an_unrouted_http_path_is_a_404_not_an_empty_success() {
+    let response = capture_http_raw("/api/definitely/not/a/route").await;
+    assert_eq!(
+        response.0,
+        axum::http::StatusCode::NOT_FOUND,
+        "an unimplemented route must 404 so a caller can tell it apart from an \
+         empty success; got {:?} body={}",
+        response.0,
+        response.1
     );
 }
 

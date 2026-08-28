@@ -133,8 +133,41 @@ export async function openApp(stack: StackHandle): Promise<App> {
       );
     },
     async close() {
-      await context.close();
-      await browser.close();
+      // BOUNDED, because an unbounded teardown withholds the RESULT of tests
+      // that already finished. node:test writes its summary at process exit, so
+      // a `browser.close()` that never resolves — a wedged renderer, a Chrome
+      // left over from an earlier launch — turns a completed run into a run that
+      // reports nothing at all. That is the third way this harness could answer
+      // "never" instead of "no", after the boot PATH failure and the leaked
+      // process group, and it is the same defect #481 describes: a hang is not a
+      // failure, it is silence.
+      //
+      // Killing beats hanging. The browser is disposable; the result is not.
+      const bounded = async (what: string, fn: () => Promise<unknown>) => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            fn(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(`teardown timed out: ${what}`)), 15_000);
+            }),
+          ]);
+        } catch (error) {
+          console.error(`[e2e teardown] ${String((error as Error).message)}`);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+      await bounded("context.close()", () => context.close());
+      await bounded("browser.close()", () => browser.close());
+      // Last resort: the process, by pid. `browser.close()` is cooperative and a
+      // wedged Chrome declines it.
+      try {
+        const proc = (browser as { process?: () => { pid?: number } | null }).process?.();
+        if (proc?.pid) process.kill(proc.pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
     },
   };
   return app;
