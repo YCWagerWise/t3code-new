@@ -25,18 +25,19 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use agent_sdk_shell::{
-    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, SessionBinding,
-    Projector, Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
+    emit_thread_event, AgentDefinition, Catalog, Lifecycle, ModelRef, Projector, SessionBinding,
+    Shell, ThreadEventVocab, ThreadRuntime, TurnOutcome, VocabProjector,
 };
 
 use tokio::sync::RwLock;
 
 use t3code_agent::{
-    assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol,
+    assets, diagnostics, keybindings, paths, projects, providers, review, settings, sourcecontrol,
     terminal, tools, vcs,
 };
 
@@ -50,6 +51,97 @@ type OutFrame = (String, Option<tokio::sync::oneshot::Sender<bool>>);
 struct WsThreadSink {
     tx: mpsc::UnboundedSender<OutFrame>,
     req: Value,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type")]
+enum DispatchableClientOrchestrationCommand {
+    #[serde(rename = "project.create")]
+    ProjectCreate,
+    #[serde(rename = "project.meta.update")]
+    ProjectMetaUpdate,
+    #[serde(rename = "project.delete")]
+    ProjectDelete,
+    #[serde(rename = "thread.create")]
+    ThreadCreate,
+    #[serde(rename = "thread.delete")]
+    ThreadDelete,
+    #[serde(rename = "thread.archive")]
+    ThreadArchive,
+    #[serde(rename = "thread.unarchive")]
+    ThreadUnarchive,
+    #[serde(rename = "thread.settle")]
+    ThreadSettle,
+    #[serde(rename = "thread.unsettle")]
+    ThreadUnsettle,
+    #[serde(rename = "thread.snooze")]
+    ThreadSnooze,
+    #[serde(rename = "thread.unsnooze")]
+    ThreadUnsnooze,
+    #[serde(rename = "thread.pin")]
+    ThreadPin,
+    #[serde(rename = "thread.unpin")]
+    ThreadUnpin,
+    #[serde(rename = "thread.pin.reorder")]
+    ThreadPinReorder,
+    #[serde(rename = "thread.meta.update")]
+    ThreadMetaUpdate,
+    #[serde(rename = "thread.runtime-mode.set")]
+    ThreadRuntimeModeSet,
+    #[serde(rename = "thread.interaction-mode.set")]
+    ThreadInteractionModeSet,
+    #[serde(rename = "thread.turn.start")]
+    ThreadTurnStart,
+    #[serde(rename = "thread.turn.interrupt")]
+    ThreadTurnInterrupt,
+    #[serde(rename = "thread.approval.respond")]
+    ThreadApprovalRespond,
+    #[serde(rename = "thread.user-input.respond")]
+    ThreadUserInputRespond,
+    #[serde(rename = "thread.checkpoint.revert")]
+    ThreadCheckpointRevert,
+    #[serde(rename = "thread.session.stop")]
+    ThreadSessionStop,
+}
+
+impl DispatchableClientOrchestrationCommand {
+    fn wire_name(self) -> &'static str {
+        match self {
+            DispatchableClientOrchestrationCommand::ProjectCreate => "project.create",
+            DispatchableClientOrchestrationCommand::ProjectMetaUpdate => "project.meta.update",
+            DispatchableClientOrchestrationCommand::ProjectDelete => "project.delete",
+            DispatchableClientOrchestrationCommand::ThreadCreate => "thread.create",
+            DispatchableClientOrchestrationCommand::ThreadDelete => "thread.delete",
+            DispatchableClientOrchestrationCommand::ThreadArchive => "thread.archive",
+            DispatchableClientOrchestrationCommand::ThreadUnarchive => "thread.unarchive",
+            DispatchableClientOrchestrationCommand::ThreadSettle => "thread.settle",
+            DispatchableClientOrchestrationCommand::ThreadUnsettle => "thread.unsettle",
+            DispatchableClientOrchestrationCommand::ThreadSnooze => "thread.snooze",
+            DispatchableClientOrchestrationCommand::ThreadUnsnooze => "thread.unsnooze",
+            DispatchableClientOrchestrationCommand::ThreadPin => "thread.pin",
+            DispatchableClientOrchestrationCommand::ThreadUnpin => "thread.unpin",
+            DispatchableClientOrchestrationCommand::ThreadPinReorder => "thread.pin.reorder",
+            DispatchableClientOrchestrationCommand::ThreadMetaUpdate => "thread.meta.update",
+            DispatchableClientOrchestrationCommand::ThreadRuntimeModeSet => {
+                "thread.runtime-mode.set"
+            }
+            DispatchableClientOrchestrationCommand::ThreadInteractionModeSet => {
+                "thread.interaction-mode.set"
+            }
+            DispatchableClientOrchestrationCommand::ThreadTurnStart => "thread.turn.start",
+            DispatchableClientOrchestrationCommand::ThreadTurnInterrupt => "thread.turn.interrupt",
+            DispatchableClientOrchestrationCommand::ThreadApprovalRespond => {
+                "thread.approval.respond"
+            }
+            DispatchableClientOrchestrationCommand::ThreadUserInputRespond => {
+                "thread.user-input.respond"
+            }
+            DispatchableClientOrchestrationCommand::ThreadCheckpointRevert => {
+                "thread.checkpoint.revert"
+            }
+            DispatchableClientOrchestrationCommand::ThreadSessionStop => "thread.session.stop",
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -369,17 +461,6 @@ fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, Strin
     (ask, instructions)
 }
 
-/// Where the agent works, and where its durable state lives.
-fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::var("T3CODE_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    let data = std::env::var("T3CODE_AGENT_DATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".t3code-agent"));
-    (root, data)
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     // NON-BLOCKING, and this is a liveness property of the server, not a
@@ -445,7 +526,7 @@ async fn main() {
     // ONE Hearth PTY per workspace, opened before any session exists and shared
     // by every session and subagent: `cd`/env persist across tool calls, and the
     // session id in each run_bash result is what a client attaches to.
-    let (ws_root, agent_data) = workspace_paths();
+    let (ws_root, agent_data) = paths::workspace_paths();
     // Open the ONE workspace PTY here so the SAME handle backs both the agent's
     // run_bash tools and the human-facing terminal RPCs (#33) — never two PTYs.
     let workspace_runner = tools::open_workspace_shell(&ws_root, agent_data.clone())
@@ -656,13 +737,17 @@ async fn asset_root(resource: &Value, state: &AppState) -> Result<String, String
                 .await
                 .into_iter()
                 .find(|t| t.get("id").and_then(Value::as_str) == Some(thread_id))
-                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` was not found"))?;
+                .ok_or_else(|| {
+                    format!("workspace-file asset thread `{thread_id}` was not found")
+                })?;
             let root = thread
                 .get("worktreePath")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("workspace-file asset thread `{thread_id}` has no worktree root"))?;
+                .ok_or_else(|| {
+                    format!("workspace-file asset thread `{thread_id}` has no worktree root")
+                })?;
             Some(root.to_string())
         }
         "project-favicon" => resource
@@ -848,9 +933,7 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
             {
                 Some(id) => id.to_string(),
                 None => {
-                    return Err(
-                        "no seed project in store; refusing to invent a project id".into()
-                    )
+                    return Err("no seed project in store; refusing to invent a project id".into())
                 }
             },
             Err(e) => return Err(format!("project store unreadable: {e}")),
@@ -1159,8 +1242,15 @@ async fn publish_approval_resolved(
     decision: &str,
     allowed: bool,
 ) -> Result<(), String> {
-    let decision =
-        if decision.is_empty() { if allowed { "accept" } else { "decline" } } else { decision };
+    let decision = if decision.is_empty() {
+        if allowed {
+            "accept"
+        } else {
+            "decline"
+        }
+    } else {
+        decision
+    };
     // `thread.approval-resolved` was invented — not in `OrchestrationEventType`,
     // so the reducer fell through its forward-compatible default and the banner
     // stayed up after the user answered (#315/#316).
@@ -1541,7 +1631,11 @@ impl AppState {
     /// workspace terminal. Keying the lookup by owner is the difference between
     /// addressing a subagent's shell and addressing something that merely
     /// answers.
-    async fn pane_runner(&self, owner: &terminal::TerminalOwner, terminal_id: &str) -> Result<terminal::Terminal, String> {
+    async fn pane_runner(
+        &self,
+        owner: &terminal::TerminalOwner,
+        terminal_id: &str,
+    ) -> Result<terminal::Terminal, String> {
         match self.terminals.get(owner, terminal_id).await {
             Ok(Some(pane)) => Ok(pane.runner),
             Ok(None) => Ok(self.terminal.clone()),
@@ -1592,7 +1686,11 @@ async fn broadcast_terminal_event(state: &AppState, event: Value) -> Result<(), 
     // Built ONCE for the thread rather than per subscriber: every watcher of a
     // thread receives the same rows, and each row costs a PTY session lock.
     let now = now_iso();
-    let payload = match state.terminals.list(&terminal::TerminalOwner::thread(&thread)).await {
+    let payload = match state
+        .terminals
+        .list(&terminal::TerminalOwner::thread(&thread))
+        .await
+    {
         Ok(panes) => {
             let mut rows = Vec::new();
             for pane in panes {
@@ -1653,7 +1751,10 @@ fn spawn_thread_tail_with_cleanup<F>(
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        let sink = WsThreadSink { tx: tx.clone(), req: req.clone() };
+        let sink = WsThreadSink {
+            tx: tx.clone(),
+            req: req.clone(),
+        };
         loop {
             match tail.next(std::time::Duration::from_secs(25)).await {
                 Ok(items) => {
@@ -1924,7 +2025,9 @@ pub(crate) async fn dispatch_ws_frame(
                 .map(str::to_string);
             if let Some(thread_id) = thread_id {
                 tracing::info!(%thread_id, ?req_id, "ws: Interrupt — routing to runtime");
-                if let Err(e) = stop_thread_checked(state, &thread_id, "thread.turn.interrupt").await {
+                if let Err(e) =
+                    stop_thread_checked(state, &thread_id, "thread.turn.interrupt").await
+                {
                     tracing::error!(%thread_id, ?req_id, %e, "ws interrupt failed");
                     if !req_id.is_null() {
                         exit_failure(tx, &req_id, &format!("interrupt failed: {e}"));
@@ -2147,7 +2250,7 @@ async fn checkpoint_stack(
 /// absolute roots (a worktree, a container mount) and the runtime data dir is
 /// named relative to it either way.
 fn agent_data_excludes() -> Vec<String> {
-    let (_, agent_data) = workspace_paths();
+    let (_, agent_data) = paths::workspace_paths();
     let name = agent_data
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -2369,7 +2472,11 @@ async fn revert_checkpoint(
                 json!({ "threadId": thread_id, "turnCount": turn_count }),
             )
             .await
-            .map_err(|e| format!("checkpoint revert completed but thread.reverted could not be recorded: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "checkpoint revert completed but thread.reverted could not be recorded: {e}"
+                )
+            })?;
             // The worktree moved under every source-control subscriber too.
             publish_vcs_status(state, &cwd).await;
             Ok(())
@@ -2434,8 +2541,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
+            let other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let settings_wire = settings::settings_wire(&instances, &other);
             let cat = state.catalog.read().await;
-            exit_success(tx, &id, server_config(&cat, &loaded, &[]));
+            exit_success(tx, &id, server_config(&cat, &loaded, &[], settings_wire));
         }
 
         // Diagnostics (#67). The settings Diagnostics page is the one screen that
@@ -2606,10 +2725,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // runtime routes. Each write persists to the do-rs store and reconciles
         // the SAME live catalog, then answers with the shape the UI decodes.
         "server.getSettings" => {
-            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(instances) => instances,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             let other = match settings::load_other(state.rt.store()).await {
                 Ok(other) => other,
                 Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
@@ -2617,21 +2739,31 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             exit_success(tx, &id, settings::settings_wire(&instances, &other));
         }
         "server.updateSettings" => {
+            let input = payload.get("input").cloned().unwrap_or(payload.clone());
             // Validate the patch's typed fields BEFORE touching the durable blob:
             // storing a mistyped field would make every later getSettings fail to
             // decode as ServerSettings and break the UI, so reject it and leave
             // settings unchanged (#121).
-            if let Err(e) = settings::validate_other(&payload) {
+            if let Err(e) = settings::validate_other(&input) {
                 exit_failure(tx, &id, &e);
                 return;
             }
-            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(current) => current,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
-            let next = match settings::apply_patch(&current, &payload) {
+            let current =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
+            let next = match settings::apply_patch(&current, &input) {
                 Ok(next) => next,
-                Err(e) => return exit_failure(tx, &id, &format!("malformed providerInstances patch: {e}")),
+                Err(e) => {
+                    return exit_failure(
+                        tx,
+                        &id,
+                        &format!("malformed providerInstances patch: {e}"),
+                    )
+                }
             };
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
@@ -2644,7 +2776,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(other) => other,
                 Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
             };
-            let other = settings::merge_other(&existing_other, &payload);
+            let other = settings::merge_other(&existing_other, &input);
             if let Err(e) = settings::save_other(state.rt.store(), &other).await {
                 exit_failure(tx, &id, &format!("persist settings failed: {e}"));
                 return;
@@ -2652,10 +2784,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // Reconcile + answer with the EFFECTIVE set (saved re-merged under the
             // boot defaults), so a whole-map replace that removed a custom
             // provider drops it from the catalog while stock providers survive.
-            let effective = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(effective) => effective,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let effective =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(effective) => effective,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             settings::reconcile(&mut *state.catalog.write().await, &effective);
             let wire = settings::settings_wire(&effective, &other);
             exit_success(tx, &id, wire.clone());
@@ -2676,10 +2811,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "server.refreshProviders" => {
             // re-reconcile from the durable set (re-probes availability), then
             // answer with the current provider snapshots the UI renders.
-            let instances = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(instances) => instances,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             // A refresh is exactly when to ASK each OpenAI-compatible endpoint
             // what it serves: the user pointed at an Ollama and expects its
             // models to appear without hand-typing slugs (#180).
@@ -2703,10 +2841,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             .await;
         }
         "server.updateProvider" => {
-            let current = match settings::load_instances(state.rt.store(), providers::configured_instances()).await {
-                Ok(current) => current,
-                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
-            };
+            let current =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
             let next = settings::apply_provider_update(&current, &payload);
             if let Err(e) = settings::save_instances(state.rt.store(), &next).await {
                 exit_failure(tx, &id, &format!("persist provider failed: {e}"));
@@ -3094,9 +3235,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     // returning or the subscriber row is left
                                     // with nothing draining it.
                                     snapshot_tail.close().await;
-                                    chunk(tx, &id, json!({ "kind": "error",
+                                    chunk(
+                                        tx,
+                                        &id,
+                                        json!({ "kind": "error",
                                         "error": { "message":
-                                            format!("active turn unreadable: {e}") } }));
+                                            format!("active turn unreadable: {e}") } }),
+                                    );
                                     return;
                                 }
                             }
@@ -3110,8 +3255,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     Err(e) => {
                         tracing::error!(%e, %thread_id, "session status unreadable");
                         snapshot_tail.close().await;
-                        chunk(tx, &id, json!({ "kind": "error",
-                            "error": { "message": format!("session status unreadable: {e}") } }));
+                        chunk(
+                            tx,
+                            &id,
+                            json!({ "kind": "error",
+                            "error": { "message": format!("session status unreadable: {e}") } }),
+                        );
                         return;
                     }
                 };
@@ -3236,6 +3385,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
+            let instances =
+                match settings::load_instances(state.rt.store(), providers::configured_instances())
+                    .await
+                {
+                    Ok(instances) => instances,
+                    Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+                };
+            let other = match settings::load_other(state.rt.store()).await {
+                Ok(other) => other,
+                Err(e) => return exit_failure(tx, &id, &format!("settings unreadable: {e}")),
+            };
+            let settings_wire = settings::settings_wire(&instances, &other);
             chunk(
                 tx,
                 &id,
@@ -3243,6 +3404,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     &*state.catalog.read().await,
                     &loaded,
                     &[],
+                    settings_wire,
                 )),
             );
             // Fanout attaches through the SDK's durable config topic (packet
@@ -3311,11 +3473,15 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             let cwd = match thread_cwd(&state, &thread_id).await {
                 Ok(cwd) => cwd,
                 Err(e) => {
-                    exit_typed_failure(tx, &id, json!({
-                        "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
-                                else { "OrchestrationGetFullThreadDiffError" },
-                        "message": format!("thread worktree unavailable: {e}"),
-                    }));
+                    exit_typed_failure(
+                        tx,
+                        &id,
+                        json!({
+                            "_tag": if method.ends_with("getTurnDiff") { "OrchestrationGetTurnDiffError" }
+                                    else { "OrchestrationGetFullThreadDiffError" },
+                            "message": format!("thread worktree unavailable: {e}"),
+                        }),
+                    );
                     return;
                 }
             };
@@ -3850,8 +4016,13 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 exit_failure(tx, &id, &format!("could not start action control: {e}"));
                 return;
             }
-            match vcs::run_stacked_action_streaming(&cwd, &payload, &mut emit, Some(&action_control))
-                .await
+            match vcs::run_stacked_action_streaming(
+                &cwd,
+                &payload,
+                &mut emit,
+                Some(&action_control),
+            )
+            .await
             {
                 Ok(None) => {
                     let _ = action_control.clear(&action_id).await;
@@ -3860,7 +4031,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 }
                 Ok(Some((phase, message))) => {
                     if message.contains("cancelled") {
-                        let _ = action_control.finish(&action_id, agent_sdk_do::Checkpoint::Cancel).await;
+                        let _ = action_control
+                            .finish(&action_id, agent_sdk_do::Checkpoint::Cancel)
+                            .await;
                     }
                     let _ = action_control.clear(&action_id).await;
                     // A refused phase can still have mutated the repository —
@@ -3965,10 +4138,46 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             }
         }
 
-        "filesystem.browse" => match projects::browse(&payload, &state.cwd) {
-            Ok(v) => exit_success(tx, &id, v),
-            Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
-        },
+        "filesystem.browse" => {
+            let cwd = match req_cwd(&payload, &state).await {
+                Ok(c) => c,
+                Err(e) => {
+                    exit_failure(tx, &id, &e);
+                    return;
+                }
+            };
+            let partial = payload
+                .get("partialPath")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let partial_path = std::path::Path::new(partial);
+            if partial.starts_with('~')
+                || partial_path.is_absolute()
+                || partial_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                exit_failure(
+                    tx,
+                    &id,
+                    "filesystem.browse is confined to this environment's workspace/worktrees",
+                );
+                return;
+            }
+            let mut admitted_payload = payload.clone();
+            if let Some(obj) = admitted_payload.as_object_mut() {
+                obj.insert("cwd".into(), json!(cwd));
+            }
+            match projects::browse(&admitted_payload, &state.cwd) {
+                Ok(v) => exit_success(tx, &id, v),
+                Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
+            }
+        }
         // Launching an editor is a HOST process with a path argument, so it
         // takes the same admission as every other path-bearing RPC: without it a
         // client can ask the backend to open any directory the backend user can
@@ -4012,10 +4221,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 "projects.searchEntries" => {
                     exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
                 }
-                "projects.searchContents" => match projects::search_contents(&cwd, &payload).await {
-                    Ok(v) => exit_success(tx, &id, v),
-                    Err(e) => exit_failure(tx, &id, &e),
-                },
+                "projects.searchContents" => {
+                    match projects::search_contents(&cwd, &payload).await {
+                        Ok(v) => exit_success(tx, &id, v),
+                        Err(e) => exit_failure(tx, &id, &e),
+                    }
+                }
                 "projects.searchEntries" => {
                     exit_success(tx, &id, projects::search_entries(&cwd, &payload).await)
                 }
@@ -4350,16 +4561,24 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             match state.terminals.get(&owner, &term).await {
                 Ok(Some(pane)) => {
                     let started = terminal::pane_snapshot(&pane, &now_iso()).await;
-                    chunk(tx, &id, json!({ "type": "started", "threadId": owner.thread_id(), "terminalId": term, "snapshot": started }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({ "type": "started", "threadId": owner.thread_id(), "terminalId": term, "snapshot": started }),
+                    );
                     spawn_terminal_tail(pane.runner.clone(), tx.clone(), id.clone(), thread, term);
                 }
                 Ok(None) => {
                     // Announce the subscription with no snapshot, then WAIT for
                     // the real open rather than manufacturing one.
-                    chunk(tx, &id, json!({
-                        "type": "started", "threadId": owner.thread_id(), "terminalId": term,
-                        "snapshot": Value::Null, "pending": true,
-                    }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "started", "threadId": owner.thread_id(), "terminalId": term,
+                            "snapshot": Value::Null, "pending": true,
+                        }),
+                    );
                     let terminals = state.terminals.clone();
                     let (tx2, id2) = (tx.clone(), id.clone());
                     let (owner2, thread2, term2) = (owner.clone(), thread.clone(), term.clone());
@@ -4370,35 +4589,47 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         {
                             Ok(Some(pane)) => {
                                 let snap = terminal::pane_snapshot(&pane, &now_iso()).await;
-                                chunk(&tx2, &id2, json!({
-                                    "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
-                                    "snapshot": snap,
-                                }));
+                                chunk(
+                                    &tx2,
+                                    &id2,
+                                    json!({
+                                        "type": "started", "threadId": thread2.clone(), "terminalId": term2.clone(),
+                                        "snapshot": snap,
+                                    }),
+                                );
                                 spawn_terminal_tail(pane.runner.clone(), tx2, id2, thread2, term2);
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                chunk(&tx2, &id2, json!({
-                                    "type": "started",
-                                    "threadId": thread2,
-                                    "terminalId": term2,
-                                    "snapshot": Value::Null,
-                                    "terminalUnavailable": true,
-                                    "terminalError": e,
-                                }));
+                                chunk(
+                                    &tx2,
+                                    &id2,
+                                    json!({
+                                        "type": "started",
+                                        "threadId": thread2,
+                                        "terminalId": term2,
+                                        "snapshot": Value::Null,
+                                        "terminalUnavailable": true,
+                                        "terminalError": e,
+                                    }),
+                                );
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    chunk(tx, &id, json!({
-                        "type": "started",
-                        "threadId": owner.thread_id(),
-                        "terminalId": term,
-                        "snapshot": Value::Null,
-                        "terminalUnavailable": true,
-                        "terminalError": e,
-                    }));
+                    chunk(
+                        tx,
+                        &id,
+                        json!({
+                            "type": "started",
+                            "threadId": owner.thread_id(),
+                            "terminalId": term,
+                            "snapshot": Value::Null,
+                            "terminalUnavailable": true,
+                            "terminalError": e,
+                        }),
+                    );
                 }
             }
         }
@@ -4509,7 +4740,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             let mark = match state.rt.current_sequence().await {
                 Ok(mark) => mark,
                 Err(e) => {
-                    exit_failure(tx, &id, &format!("getArchivedShellSnapshot: sequence unreadable: {e}"));
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("getArchivedShellSnapshot: sequence unreadable: {e}"),
+                    );
                     return;
                 }
             };
@@ -4530,8 +4765,33 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         }
         "orchestration.dispatchCommand" => {
             let command = payload.get("input").cloned().unwrap_or(payload.clone());
+            let command_kind = match serde_json::from_value::<DispatchableClientOrchestrationCommand>(
+                command.clone(),
+            ) {
+                Ok(kind) => kind,
+                Err(e) => {
+                    let received = command
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing type>");
+                    tracing::warn!(
+                        cmd = received,
+                        %e,
+                        "dispatchCommand: command failed contract decode"
+                    );
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!(
+                            "orchestration command '{received}' is not in \
+                                 DispatchableClientOrchestrationCommand: {e}"
+                        ),
+                    );
+                    return;
+                }
+            };
             tracing::info!(
-                cmd = command.get("type").and_then(|t| t.as_str()).unwrap_or("?"),
+                cmd = command_kind.wire_name(),
                 thread_id = command
                     .get("threadId")
                     .and_then(|t| t.as_str())
@@ -4542,8 +4802,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // selection that cannot route must not become a turn at all: acking
             // and then substituting the default is how the thread ends up
             // showing one provider while another one ran (#50).
-            let model = if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start")
-            {
+            let model = if command_kind == DispatchableClientOrchestrationCommand::ThreadTurnStart {
                 // #77 / packet EK: attachments in the command must not be
                 // dropped silently. This runtime does not yet forward image
                 // or file bytes to any provider — the ONLY current provider
@@ -4660,9 +4919,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // nothing on the wire to say why. Accepted still means accepted;
             // it just cannot precede the durable write it depends on.
             let async_lane =
-                command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            match command.get("type").and_then(|t| t.as_str()) {
-                Some("thread.turn.start") => {
+                command_kind == DispatchableClientOrchestrationCommand::ThreadTurnStart;
+            match command_kind {
+                DispatchableClientOrchestrationCommand::ThreadTurnStart => {
                     if let Some(model) = model {
                         // Durable bootstrap FIRST, then the accepted-ack, then
                         // the turn (#362). A failure here is reported as a
@@ -4683,9 +4942,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // to happen — the SDK's durable turn cancel, and Hearth's
                 // foreground interrupt for a bash command already running in
                 // the shared PTY.
-                Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
-                    let thread_id =
-                        command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                DispatchableClientOrchestrationCommand::ThreadTurnInterrupt
+                | DispatchableClientOrchestrationCommand::ThreadSessionStop => {
+                    let kind = command_kind.wire_name();
+                    let thread_id = command
+                        .get("threadId")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     match stop_thread_checked(&state, &thread_id, kind).await {
                         Ok(sessions) => tracing::info!(
                             %thread_id, %kind, sessions = sessions.len(), "stop dispatched"
@@ -4708,7 +4972,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // and doing nothing was the worst available behaviour — the UI
                 // reports the files restored while the worktree still holds
                 // every edit the user just rejected.
-                Some("thread.checkpoint.revert") => {
+                DispatchableClientOrchestrationCommand::ThreadCheckpointRevert => {
                     let thread_id = thread_id_of(&command);
                     let turn_count = command
                         .get("turnCount")
@@ -4755,7 +5019,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // picker, runtime/interaction mode, title, branch. Acking these
                 // and dropping them means the UI shows a setting the runtime
                 // never received, and the next turn silently uses the old one.
-                Some("thread.meta.update") => {
+                DispatchableClientOrchestrationCommand::ThreadMetaUpdate => {
                     let thread_id = thread_id_of(&command);
                     let patch = command.get("patch").cloned().unwrap_or(command.clone());
                     // FAIL VISIBLY. This arm used to log the error and fall
@@ -4773,7 +5037,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         return;
                     }
                 }
-                Some("project.meta.update") => {
+                DispatchableClientOrchestrationCommand::ProjectMetaUpdate => {
                     // Durable UPDATE (#370): the old in-memory patch mutated
                     // this process's Vec and evaporated on restart, so a
                     // renamed project reverted on the next boot and a second
@@ -4866,7 +5130,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // vocabulary. The requestId carries session|turn|callId, so
                 // nothing here has to remember which session asked — that map
                 // is what the SDK seam removed.
-                Some("thread.approval.respond") => {
+                DispatchableClientOrchestrationCommand::ThreadApprovalRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -4900,14 +5164,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     match routed {
                         None => {
                             tracing::error!(%request_id, "malformed approval requestId — refusing to route");
-                            let detail =
-                                "this approval could not be routed (malformed request id)";
+                            let detail = "this approval could not be routed (malformed request id)";
                             if let Err(e) = publish_approval_failed(
-                                &state, &thread_id_of(&command), &request_id, detail,
+                                &state,
+                                &thread_id_of(&command),
+                                &request_id,
+                                detail,
                             )
                             .await
                             {
-                                exit_failure(tx, &id, &format!("approval failure projection failed: {e}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("approval failure projection failed: {e}"),
+                                );
                                 return;
                             }
                             exit_failure(tx, &id, detail);
@@ -4923,11 +5193,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     // clear the pending UI state: a client that only
                                     // ever sees "requested" keeps the banner up.
                                     if let Err(e) = publish_approval_resolved(
-                                        &state, &thread_id_of(&command), &request_id, &decision, allow,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
+                                        &decision,
+                                        allow,
                                     )
                                     .await
                                     {
-                                        exit_failure(tx, &id, &format!("approval settlement projection failed: {e}"));
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            &format!("approval settlement projection failed: {e}"),
+                                        );
                                         return;
                                     }
                                 }
@@ -4947,11 +5225,20 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     );
                                     let detail = "this approval is no longer pending and could not be answered";
                                     if let Err(projection) = publish_approval_failed(
-                                        &state, &thread_id_of(&command), &request_id, detail,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
+                                        detail,
                                     )
                                     .await
                                     {
-                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            &format!(
+                                                "approval failure projection failed: {projection}"
+                                            ),
+                                        );
                                         return;
                                     }
                                     exit_failure(tx, &id, detail);
@@ -4963,14 +5250,23 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                                     // ignored; clearing it would be worse. The
                                     // request stays pending and carries why.
                                     tracing::error!(%request_id, %e, "approval response failed");
-                                    let detail = format!("the approval could not be delivered: {e}");
+                                    let detail =
+                                        format!("the approval could not be delivered: {e}");
                                     if let Err(projection) = publish_approval_failed(
-                                        &state, &thread_id_of(&command), &request_id,
+                                        &state,
+                                        &thread_id_of(&command),
+                                        &request_id,
                                         &detail,
                                     )
                                     .await
                                     {
-                                        exit_failure(tx, &id, &format!("approval failure projection failed: {projection}"));
+                                        exit_failure(
+                                            tx,
+                                            &id,
+                                            &format!(
+                                                "approval failure projection failed: {projection}"
+                                            ),
+                                        );
                                         return;
                                     }
                                     exit_failure(tx, &id, &detail);
@@ -4980,7 +5276,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                Some("thread.user-input.respond") => {
+                DispatchableClientOrchestrationCommand::ThreadUserInputRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -5036,11 +5332,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             // success: telling the client the question is
                             // answered when the answer never reached the agent
                             // would unblock the composer over a lost answer.
-                            if let Err(e) =
-                                publish_user_input_resolved(&state, &thread_id_of(&command), &session)
-                                    .await
+                            if let Err(e) = publish_user_input_resolved(
+                                &state,
+                                &thread_id_of(&command),
+                                &session,
+                            )
+                            .await
                             {
-                                exit_failure(tx, &id, &format!("user-input settlement projection failed: {e}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("user-input settlement projection failed: {e}"),
+                                );
                                 return;
                             }
                         }
@@ -5052,12 +5355,18 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                             tracing::error!(%request_id, %e, "user-input response failed");
                             let detail = format!("your answer could not be delivered: {e}");
                             if let Err(projection) = publish_user_input_failed(
-                                &state, &thread_id_of(&command), &session,
+                                &state,
+                                &thread_id_of(&command),
+                                &session,
                                 &detail,
                             )
                             .await
                             {
-                                exit_failure(tx, &id, &format!("user-input failure projection failed: {projection}"));
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!("user-input failure projection failed: {projection}"),
+                                );
                                 return;
                             }
                             exit_failure(tx, &id, &detail);
@@ -5102,8 +5411,22 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // Success(null)"). The two dispatchers disagreeing on that is how
                 // one of them ended up with 15 silent no-ops and the other with
                 // none.
-                other => {
-                    let kind = other.unwrap_or("<missing type>");
+                DispatchableClientOrchestrationCommand::ProjectCreate
+                | DispatchableClientOrchestrationCommand::ProjectDelete
+                | DispatchableClientOrchestrationCommand::ThreadCreate
+                | DispatchableClientOrchestrationCommand::ThreadDelete
+                | DispatchableClientOrchestrationCommand::ThreadArchive
+                | DispatchableClientOrchestrationCommand::ThreadUnarchive
+                | DispatchableClientOrchestrationCommand::ThreadSettle
+                | DispatchableClientOrchestrationCommand::ThreadUnsettle
+                | DispatchableClientOrchestrationCommand::ThreadSnooze
+                | DispatchableClientOrchestrationCommand::ThreadUnsnooze
+                | DispatchableClientOrchestrationCommand::ThreadPin
+                | DispatchableClientOrchestrationCommand::ThreadUnpin
+                | DispatchableClientOrchestrationCommand::ThreadPinReorder
+                | DispatchableClientOrchestrationCommand::ThreadRuntimeModeSet
+                | DispatchableClientOrchestrationCommand::ThreadInteractionModeSet => {
+                    let kind = command_kind.wire_name();
                     tracing::warn!(
                         cmd = kind,
                         "dispatchCommand: unimplemented command — refusing rather than \
@@ -5498,7 +5821,10 @@ fn spawn_metadata_tail(
             // Holding `panes` for the length of the iteration also keeps each
             // runner alive across the wait, so a watch cannot end underneath us
             // and turn one closed pane into a terminated stream.
-            let panes = match terminals.list(&terminal::TerminalOwner::thread(&thread_id)).await {
+            let panes = match terminals
+                .list(&terminal::TerminalOwner::thread(&thread_id))
+                .await
+            {
                 Ok(panes) => panes,
                 Err(e) => {
                     let ev = json!({
@@ -5507,7 +5833,11 @@ fn spawn_metadata_tail(
                         "terminals": Value::Null,
                         "error": format!("terminal pane store unavailable: {e}"),
                     });
-                    let _ = tx.send((json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] }).to_string(), None));
+                    let _ = tx.send((
+                        json!({ "_tag": "Chunk", "clientId": 0, "requestId": req, "values": [ev] })
+                            .to_string(),
+                        None,
+                    ));
                     return;
                 }
             };
@@ -5572,6 +5902,7 @@ fn server_config(
     catalog: &Catalog,
     custom: &[keybindings::Rule],
     issues: &[Value],
+    settings_wire: Value,
 ) -> Value {
     let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
         std::env::current_dir()
@@ -5594,7 +5925,7 @@ fn server_config(
         // its reason instead of vanishing (#35).
         "providers": catalog.snapshots().iter().map(provider_entry).collect::<Vec<_>>(),
         "observability": { "logsDirectoryPath": "/tmp", "localTracingEnabled": false, "otlpTracesEnabled": false, "otlpMetricsEnabled": false },
-        "settings": {},
+        "settings": settings_wire,
     })
 }
 
@@ -5737,7 +6068,11 @@ async fn thread_snapshot_http(
     // store is damaged hides a parked run behind a UI that looks idle.
     let pending = match state.rt.pending_approvals_typed(thread_id).await {
         Ok(p) => p,
-        Err(e) => return http_failure(&format!("thread snapshot: pending approvals unreadable: {e}")),
+        Err(e) => {
+            return http_failure(&format!(
+                "thread snapshot: pending approvals unreadable: {e}"
+            ))
+        }
     };
     let mut activities: Vec<Value> = pending
         .iter()
@@ -5780,7 +6115,9 @@ async fn thread_snapshot_http(
             }
         }
         Err(e) => {
-            return http_failure(&format!("thread snapshot: pending questions unreadable: {e}"))
+            return http_failure(&format!(
+                "thread snapshot: pending questions unreadable: {e}"
+            ))
         }
     }
     let has_pending_user_input = activities.len() > pending.len();
@@ -5837,9 +6174,7 @@ async fn thread_snapshot_http(
     });
     let thread_obj = match record.project(parts) {
         Ok(v) => v,
-        Err(e) => {
-            return http_failure(&format!("thread snapshot: invalid thread projection: {e}"))
-        }
+        Err(e) => return http_failure(&format!("thread snapshot: invalid thread projection: {e}")),
     };
     // The sequence is read AFTER the reads above, so it can only be at or ahead
     // of what this body reflects. A client that resumes `subscribeThread` from

@@ -9,7 +9,11 @@
     "build": "vp build",
     "preview": "vp preview",
     "typecheck": "tsgo --noEmit",
-    "test": "vp test run --passWithNoTests --project unit"
+    "test": "vp test run --passWithNoTests --project unit",
+    "e2e": "node e2e/run.ts",
+    "e2e:settings": "node e2e/run.ts settings",
+    "e2e:keybindings": "node e2e/run.ts keybindings",
+    "e2e:preview-refresh-focus-zoom": "node e2e/run.ts preview-refresh-focus-zoom"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",
