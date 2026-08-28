@@ -39,10 +39,12 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 
 import { makeAgentSdkTextGeneration } from "../../textGeneration/AgentSdkTextGeneration.ts";
 import {
@@ -316,7 +318,12 @@ const unsupported = (operation: string) =>
     }),
   );
 
-const nowIso = () => new Date().toISOString();
+/**
+ * Wall time for records this driver mints, through Effect's DateTime module rather than the
+ * `Date` global. `nowUnsafe` because the callers are the session's plain async read loops, not
+ * Effect fibers — see `DateTime.now` at the Effect-side probe for the injected-Clock form.
+ */
+const nowIso = () => DateTime.formatIso(DateTime.nowUnsafe());
 
 /**
  * Whether `next` is at or ahead of where the thread already is, on BOTH logs.
@@ -448,7 +455,8 @@ export const makeAtlasAdapter = (
     sink(events);
   };
   const readers = new Map<string, { stop: () => void; wake: () => void }>();
-  const sleep = input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const sleep =
+    input.sleep ?? ((ms: number) => Effect.runPromise(Effect.sleep(Duration.millis(ms))));
   const connect = input.connect ?? browserSocketFactory;
   // One console presence per thread, opened with the session — see `makeConsolePresence` on
   // why this cannot be deferred until a decision needs sending.
@@ -740,7 +748,7 @@ export const makeAtlasAdapter = (
             throw new AtlasRefusal({
               status: 400,
               code: "invalid_request",
-              message: `model selection ${JSON.stringify(slug)} does not name a provider; expected "provider/model_id"`,
+              message: `model selection "${slug}" does not name a provider; expected "provider/model_id"`,
             });
           }
           const text = turn.input ?? "";
@@ -915,9 +923,11 @@ export const makeAtlasDriver = (
       // is the seam that is already redacted on the way out and backed by `ServerSecretStore`.
       const credential = readAtlasCredential(environment);
       const accessToken = credential.kind === "token" ? credential.value : undefined;
+      const injectedFetch = yield* FetchHttpClient.Fetch;
       const fetchImpl =
         deps?.fetch ??
-        ((url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<FetchLike>);
+        ((url, init) =>
+          injectedFetch(url, init as RequestInit) as unknown as ReturnType<FetchLike>);
       // A token that exists but is stored unsafely is a configuration ERROR, not an absent
       // credential. Probing without it would render "not authenticated", the user would set
       // the same value again, and the leak would persist while the symptom looked like a typo.

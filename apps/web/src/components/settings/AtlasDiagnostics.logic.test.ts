@@ -103,6 +103,7 @@ describe("deriveAtlasDiagnosticsViewState", () => {
       handshake: {
         data: null,
         error: 'T3 has no saved provider instance "atlas". Add it under Settings / Providers.',
+        isPending: false,
       },
     });
     expect(state.kind).toBe("not-configured");

@@ -48,11 +48,14 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 
 import {
   AtlasSettings,
@@ -219,7 +222,18 @@ type FetchOutcome =
   | { readonly outcome: "timeout" }
   | { readonly outcome: "network-error"; readonly message: string };
 
-async function fetchBounded(
+/** One 32-bit draw; two of these make a relay session id. See `mintRelaySessionId`. */
+const RANDOM_ID_WORD = Random.nextIntBetween(0, 0x1_0000_0000, { halfOpen: true });
+
+/**
+ * One bounded GET against Atlas, reporting the transport bound it hit rather than throwing.
+ *
+ * The deadline is `Effect.timeoutOrElse`, not a hand-rolled `setTimeout`/`AbortController` pair:
+ * the abort signal comes from `Effect.tryPromise`, so a timeout interrupts the fiber and the
+ * in-flight request is aborted by the same mechanism that cancels the caller. The old shape had
+ * to distinguish "aborted" from "failed" by inspecting the controller after the fact.
+ */
+function fetchBounded(
   url: string,
   input: {
     readonly accessToken: string | undefined;
@@ -227,25 +241,27 @@ async function fetchBounded(
     readonly timeoutMs: number;
     readonly maxBytes: number;
   },
-): Promise<FetchOutcome> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs);
-  try {
-    const response = await input.fetchImpl(url, {
-      method: "GET",
-      headers:
-        input.accessToken === undefined ? {} : { Authorization: `Bearer ${input.accessToken}` },
-      signal: controller.signal,
-    });
-    const bounded = await readBoundedBody(response, input.maxBytes);
-    if (!bounded.ok) return { outcome: "too-large" };
-    return { outcome: "response", status: response.status, text: bounded.text };
-  } catch (cause) {
-    if (controller.signal.aborted) return { outcome: "timeout" };
-    return { outcome: "network-error", message: describeError(cause) };
-  } finally {
-    clearTimeout(timer);
-  }
+): Effect.Effect<FetchOutcome> {
+  return Effect.promise(async (signal): Promise<FetchOutcome> => {
+    try {
+      const response = await input.fetchImpl(url, {
+        method: "GET",
+        headers:
+          input.accessToken === undefined ? {} : { Authorization: `Bearer ${input.accessToken}` },
+        signal,
+      });
+      const bounded = await readBoundedBody(response, input.maxBytes);
+      if (!bounded.ok) return { outcome: "too-large" };
+      return { outcome: "response", status: response.status, text: bounded.text };
+    } catch (cause) {
+      return { outcome: "network-error", message: describeError(cause) };
+    }
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(input.timeoutMs),
+      orElse: () => Effect.succeed<FetchOutcome>({ outcome: "timeout" }),
+    }),
+  );
 }
 
 // --- Live relay socket abstraction ----------------------------------------------------------
@@ -321,17 +337,31 @@ export interface AtlasDiagnosticsProxyDeps {
   readonly mintRelaySessionId?: () => string;
 }
 
-const defaultFetch: ProxyFetch = (url, init) =>
-  fetch(url, init as RequestInit) as unknown as ReturnType<ProxyFetch>;
-
 export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
   Effect.gen(function* () {
     const settingsService = yield* ServerSettings.ServerSettingsService;
-    const fetchImpl = deps?.fetch ?? defaultFetch;
+    // `FetchHttpClient.Fetch` is Effect's injected fetch reference: it defaults to the platform
+    // fetch but can be replaced from the environment, so this service reaches for no global.
+    const injectedFetch = yield* FetchHttpClient.Fetch;
+    const fetchImpl =
+      deps?.fetch ??
+      ((url, init) => injectedFetch(url, init as RequestInit) as unknown as ReturnType<ProxyFetch>);
     const socketFactory = deps?.socketFactory ?? defaultRelaySocketFactory;
     const maxBytes = deps?.maxBodyBytes ?? ATLAS_PROXY_MAX_BODY_BYTES;
     const timeoutMs = deps?.timeoutMs ?? ATLAS_PROXY_DEFAULT_TIMEOUT_MS;
-    const mintRelaySessionId = deps?.mintRelaySessionId ?? (() => crypto.randomUUID());
+    // Randomness is Effect-injected rather than reached for. `Random` is a Context.Reference
+    // with a default, so this stays a plain `Effect<string>` and callers provide nothing extra.
+    // Two 32-bit draws, because the id keys `relaySessions` below and a collision would hand a
+    // caller someone else's socket entry. It is a correlation id, not authority — ownership is
+    // enforced by `ownerId`, per #28.
+    const mintRelaySessionId =
+      deps?.mintRelaySessionId !== undefined
+        ? Effect.sync(deps.mintRelaySessionId)
+        : Effect.map(
+            Effect.all([RANDOM_ID_WORD, RANDOM_ID_WORD]),
+            ([high, low]) =>
+              `${high.toString(16).padStart(8, "0")}${low.toString(16).padStart(8, "0")}`,
+          );
 
     // Live relay sockets, keyed by the id minted for their `openFeed` subscription — the only
     // state this service holds. `sendCommand` looks a session up here; it never reaches for a
@@ -368,9 +398,12 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
             }),
           );
         }
-        const outcome = yield* Effect.promise(() =>
-          fetchBounded(url, { accessToken: endpoint.accessToken, fetchImpl, timeoutMs, maxBytes }),
-        );
+        const outcome = yield* fetchBounded(url, {
+          accessToken: endpoint.accessToken,
+          fetchImpl,
+          timeoutMs,
+          maxBytes,
+        });
         switch (outcome.outcome) {
           case "response":
             return { status: outcome.status, bodyText: outcome.text };
@@ -406,7 +439,9 @@ export const make = (deps?: AtlasDiagnosticsProxyDeps) =>
           return Stream.callback<AtlasDiagnosticsRelayEvent, AtlasDiagnosticsProxyError>(
             (queue) =>
               Effect.gen(function* () {
-                const relaySessionId = AtlasDiagnosticsRelaySessionId.make(mintRelaySessionId());
+                const relaySessionId = AtlasDiagnosticsRelaySessionId.make(
+                  yield* mintRelaySessionId,
+                );
                 let isClosed = false;
                 let socket: RelaySocket | undefined;
 

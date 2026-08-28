@@ -23,6 +23,9 @@
  *
  * @module provider/Drivers/AtlasConsole
  */
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+
 import type { ProviderRuntimeEvent, ThreadId } from "@t3tools/contracts";
 import {
   ATLAS_PROVIDER_DRIVER_KIND,
@@ -945,7 +948,7 @@ export const makeConsolePresence = (input: {
   const schedule =
     input.schedule ??
     ((run: () => void, ms: number) => {
-      setTimeout(run, ms);
+      Effect.runFork(Effect.andThen(Effect.sleep(Duration.millis(ms)), Effect.sync(run)));
     });
   let socket: AtlasSocket | undefined;
   let open = false;

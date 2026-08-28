@@ -22,9 +22,11 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 
 import { layerTest as serverSettingsLayerTest } from "../serverSettings.ts";
 import {
@@ -255,9 +257,17 @@ describe("AtlasDiagnosticsProxy.callHttp", () => {
           }),
         timeoutMs: 20,
       });
-      const error = yield* Effect.flip(
+      // The proxy's deadline is `Effect.timeoutOrElse`, so it is measured on the Effect Clock
+      // and this test drives that clock rather than waiting on the wall. The previous shape
+      // could only pass by sleeping, because the deadline was a real `setTimeout`.
+      const errorFiber = yield* Effect.flip(
         service.callHttp({ providerInstanceId: ATLAS_INSTANCE_ID, route: "handshake" }),
-      );
+      ).pipe(Effect.forkScoped);
+
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.millis(20));
+      const error = yield* Fiber.join(errorFiber);
+
       expect(error._tag).toBe("AtlasProxyUpstreamTimeoutError");
     }).pipe(
       Effect.provide(
