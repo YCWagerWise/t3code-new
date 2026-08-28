@@ -1165,6 +1165,90 @@ fn only_loopback_origins_may_open_the_control_socket() {
     assert!(!allowed(Some("garbage")), "an unparseable Origin is refused, not trusted");
 }
 
+/// THE PREVIEW SURFACE IS DECLARED AND ENTIRELY UNIMPLEMENTED (E2E-6).
+///
+/// `packages/contracts/src/rpc.ts` declares TEN preview methods. `server_main.rs`
+/// implements NONE of them. That is not a gap in one arm — it is a whole
+/// contract surface the client can call and the server cannot serve.
+///
+/// It is why E2E-6 (task 3695) cannot be written as asked: "assert the zoom
+/// factor is actually applied, the url actually navigated, and survives a
+/// reload" requires a preview pane, a preview pane requires `preview.open`, and
+/// `preview.open` is not there. The five preview keybindings are gated on
+/// `previewFocus`, which can only become true once a pane exists, so they are
+/// unreachable too — which is exactly what the E2E-H keybinding probe reports
+/// for preview.refresh/focusUrl/zoomIn/zoomOut/resetZoom.
+///
+/// Worse than absent-and-refusing: `preview.toggle` carries NO `when` guard at
+/// all (keybindings.rs), so the product hands the user a reachable shortcut for
+/// a surface it cannot serve. Pressing it does nothing, forever, with no error.
+///
+/// The ratchet is the point. This makes the size of the gap a number that
+/// cannot drift: implementing one preview method fails this test with "lower
+/// the constant", which is the only moment anyone edits it, and it fails the
+/// other way if a method that answers today stops answering.
+#[tokio::test]
+async fn the_preview_surface_is_declared_but_no_method_is_served() {
+    let (state, _d) = test_state().await;
+
+    let declared = [
+        "preview.open",
+        "preview.navigate",
+        "preview.resize",
+        "preview.refresh",
+        "preview.close",
+        "preview.list",
+        "preview.reportStatus",
+        "previewAutomation.connect",
+        "previewAutomation.respond",
+        "previewAutomation.focusHost",
+    ];
+
+    let mut refused: Vec<&str> = Vec::new();
+    let mut served: Vec<&str> = Vec::new();
+    for method in declared {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, json!({})).await;
+        if format!("{:?}", drain(&mut rx)).contains("unsupported method") {
+            refused.push(method);
+        } else {
+            served.push(method);
+        }
+    }
+
+    println!("E2E-6 preview surface: {} declared, {} served, {} refused", declared.len(), served.len(), refused.len());
+    println!("  served:  {served:?}");
+    println!("  refused: {refused:?}");
+
+    // Refusing is the CORRECT behaviour for an unimplemented method — a
+    // Success(null) here would be indistinguishable from a working preview and
+    // would let a spec report a pass over a surface that does nothing.
+    assert!(
+        served.is_empty() || refused.len() + served.len() == declared.len(),
+        "bookkeeping: every declared method lands in exactly one bucket"
+    );
+
+    const KNOWN_UNSERVED: usize = 10;
+    assert!(
+        refused.len() <= KNOWN_UNSERVED,
+        "more preview methods are unserved than before ({} > {}); one LOST its implementation. \
+         Refused: {refused:?}",
+        refused.len(),
+        KNOWN_UNSERVED,
+    );
+    assert!(
+        refused.len() >= KNOWN_UNSERVED,
+        "only {} of the {} declared preview methods still refuse, down from {}. That is GOOD — \
+         the preview surface is being implemented. Lower KNOWN_UNSERVED to {} in this commit, \
+         and note that E2E-6 becomes writable once preview.open is among the served. \
+         Now served: {served:?}",
+        refused.len(),
+        declared.len(),
+        KNOWN_UNSERVED,
+        refused.len(),
+    );
+}
+
 /// The server.* RPCs this runtime does NOT implement must SAY SO, and the set
 /// may only shrink.
 ///
