@@ -738,6 +738,26 @@ pub(crate) fn origin_may_open_control_socket(origin: Option<&str>) -> bool {
     if origin.is_empty() || origin == "null" {
         return true;
     }
+    // AN EXPLICITLY CONFIGURED ORIGIN IS ADMITTED, and this stack cannot work
+    // without it. Loopback-only is the right default for a socket that starts
+    // processes and writes into a live PTY, but T3 Code is remote-ready by
+    // design: a browser on app.t3.codes, a tailnet host, or a T3 Connect tunnel
+    // sends its OWN origin, never a loopback one. Without this, every remote
+    // surface is refused at the upgrade with no way to allow it — which turns
+    // a security fix into an outage for the connection modes the product
+    // exists to support. Opt-IN, exact-match, no wildcards: the operator names
+    // the origins, and anything unnamed still has to be loopback.
+    let configured = std::env::var("T3CODE_WEB_ORIGIN")
+        .or_else(|_| std::env::var("T3CODE_ALLOWED_ORIGINS"))
+        .unwrap_or_default();
+    if configured
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|allowed| allowed == origin)
+    {
+        return true;
+    }
     // Scheme-relative parse: everything after "://" up to an optional ":port".
     let Some((scheme, rest)) = origin.split_once("://") else {
         return false;
