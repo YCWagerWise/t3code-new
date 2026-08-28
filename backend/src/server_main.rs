@@ -36,8 +36,8 @@ use agent_sdk_shell::{
 use tokio::sync::RwLock;
 
 use t3code_agent::{
-    assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol,
-    terminal, tools, vcs,
+    assets, diagnostics, keybindings, orchestration_command, projects, providers, review, settings,
+    sourcecontrol, terminal, tools, vcs,
 };
 
 /// One outbound websocket frame plus an OPTIONAL delivery-confirmation channel.
@@ -4659,10 +4659,21 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // the thread the user had just created vanished on reload with
             // nothing on the wire to say why. Accepted still means accepted;
             // it just cannot precede the durable write it depends on.
-            let async_lane =
-                command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            match command.get("type").and_then(|t| t.as_str()) {
-                Some("thread.turn.start") => {
+            // #446: THE DISCRIMINANT IS TYPED, and the match below has NO
+            // wildcard arm. A `&str` scrutinee could not be checked for
+            // exhaustiveness, so a `_` absorbed unhandled variants, typos, and
+            // strings the contract never defined — and a command added to
+            // `DispatchableClientOrchestrationCommand` could not fail the Rust
+            // build. Now an unknown tag fails to DECODE here, and a variant
+            // added to `CommandKind` without an arm fails to COMPILE.
+            let kind = match orchestration_command::CommandKind::parse(&command) {
+                Ok(kind) => kind,
+                Err(e) => return exit_failure(tx, &id, &format!("dispatchCommand: {e}")),
+            };
+            use orchestration_command::CommandKind as Cmd;
+            let async_lane = kind == Cmd::ThreadTurnStart;
+            match kind {
+                Cmd::ThreadTurnStart => {
                     if let Some(model) = model {
                         // Durable bootstrap FIRST, then the accepted-ack, then
                         // the turn (#362). A failure here is reported as a
@@ -4683,7 +4694,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // to happen — the SDK's durable turn cancel, and Hearth's
                 // foreground interrupt for a bash command already running in
                 // the shared PTY.
-                Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
+                Cmd::ThreadTurnInterrupt | Cmd::ThreadSessionStop => {
+                    // `stop_thread_checked` logs and reports the command by
+                    // name, so the wire string is recovered from the variant
+                    // rather than re-typed — the two cannot drift apart.
+                    let kind = kind.as_wire();
                     let thread_id =
                         command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
                     match stop_thread_checked(&state, &thread_id, kind).await {
@@ -4708,7 +4723,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // and doing nothing was the worst available behaviour — the UI
                 // reports the files restored while the worktree still holds
                 // every edit the user just rejected.
-                Some("thread.checkpoint.revert") => {
+                Cmd::ThreadCheckpointRevert => {
                     let thread_id = thread_id_of(&command);
                     let turn_count = command
                         .get("turnCount")
@@ -4755,7 +4770,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // picker, runtime/interaction mode, title, branch. Acking these
                 // and dropping them means the UI shows a setting the runtime
                 // never received, and the next turn silently uses the old one.
-                Some("thread.meta.update") => {
+                Cmd::ThreadMetaUpdate => {
                     let thread_id = thread_id_of(&command);
                     let patch = command.get("patch").cloned().unwrap_or(command.clone());
                     // FAIL VISIBLY. This arm used to log the error and fall
@@ -4773,7 +4788,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         return;
                     }
                 }
-                Some("project.meta.update") => {
+                Cmd::ProjectMetaUpdate => {
                     // Durable UPDATE (#370): the old in-memory patch mutated
                     // this process's Vec and evaporated on restart, so a
                     // renamed project reverted on the next boot and a second
@@ -4866,7 +4881,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // vocabulary. The requestId carries session|turn|callId, so
                 // nothing here has to remember which session asked — that map
                 // is what the SDK seam removed.
-                Some("thread.approval.respond") => {
+                Cmd::ThreadApprovalRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -4980,7 +4995,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                Some("thread.user-input.respond") => {
+                Cmd::ThreadUserInputRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -5102,10 +5117,43 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // Success(null)"). The two dispatchers disagreeing on that is how
                 // one of them ended up with 15 silent no-ops and the other with
                 // none.
-                other => {
-                    let kind = other.unwrap_or("<missing type>");
+                // THE FIFTEEN THIS RUNTIME DOES NOT IMPLEMENT, LISTED ONE BY
+                // ONE. This used to be `other => refuse`, which was already a
+                // large improvement on `_ => {}` (that fell through to the
+                // applied-ack, telling the client fifteen commands had durably
+                // landed when nothing was written — #433). But a catch-all still
+                // means the compiler cannot tell "deliberately unimplemented"
+                // from "forgotten", and a 24th command added to the contract
+                // would silently join this arm instead of breaking the build.
+                //
+                // Written out, the set is reviewable, `cargo build` fails if a
+                // variant is added to `CommandKind` and left off both lists, and
+                // implementing one is a matter of moving its name up rather than
+                // remembering that a default exists.
+                //
+                // They REFUSE. An ack is a durability claim; making one falsely
+                // is the defect, not the missing feature. The client sees a real
+                // failure it can surface, instead of applying optimistically and
+                // discovering on the next reload that the archive/pin/mode change
+                // is simply gone with no error anywhere on the wire.
+                Cmd::ProjectCreate
+                | Cmd::ProjectDelete
+                | Cmd::ThreadCreate
+                | Cmd::ThreadDelete
+                | Cmd::ThreadArchive
+                | Cmd::ThreadUnarchive
+                | Cmd::ThreadSettle
+                | Cmd::ThreadUnsettle
+                | Cmd::ThreadSnooze
+                | Cmd::ThreadUnsnooze
+                | Cmd::ThreadPin
+                | Cmd::ThreadUnpin
+                | Cmd::ThreadPinReorder
+                | Cmd::ThreadRuntimeModeSet
+                | Cmd::ThreadInteractionModeSet => {
+                    let wire = kind.as_wire();
                     tracing::warn!(
-                        cmd = kind,
+                        cmd = wire,
                         "dispatchCommand: unimplemented command — refusing rather than \
                          acking it as applied"
                     );
@@ -5113,7 +5161,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         tx,
                         &id,
                         &format!(
-                            "orchestration command '{kind}' is not implemented by this \
+                            "orchestration command '{wire}' is not implemented by this \
                              runtime. It was REFUSED, not applied — nothing changed. \
                              (Previously this acked success and did nothing, so the UI \
                              showed the change until the next reload.)"

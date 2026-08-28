@@ -11,6 +11,7 @@ pub mod assets;
 pub mod testtmp;
 pub mod diagnostics;
 pub mod keybindings;
+pub mod orchestration_command;
 pub mod paths;
 pub mod projects;
 pub mod providers;
