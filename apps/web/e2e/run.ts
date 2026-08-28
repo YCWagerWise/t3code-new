@@ -20,7 +20,7 @@ const actionsDir = path.join(HERE, "actions");
 
 const specs = fs
   .readdirSync(actionsDir)
-  .filter((f) => f.endsWith(".test.ts"))
+  .filter((f) => f.endsWith(".test.ts") || f.endsWith(".spec.ts"))
   .filter((f) => filters.length === 0 || filters.some((needle) => f.includes(needle)))
   .map((f) => path.join(actionsDir, f))
   .sort();
