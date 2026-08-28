@@ -122,6 +122,13 @@ export default defineConfig({
       "t3code/no-manual-effect-runtime-in-tests": "error",
       "t3code/no-native-title-tooltip": "error",
       "t3code/namespace-node-imports": "error",
+      // "warn", not "error", and deliberately: there are 405 existing
+      // violations (291 <Button>, 109 <button>, 3 <a>, 2 <input>). Landing it
+      // as an error would fail every build until all of them are fixed, which
+      // is how a rule gets reverted instead of adopted. As "warn" it stops the
+      // count from growing and each shard clears its own files as it touches
+      // them; promote to "error" when the count reaches zero.
+      "t3code/require-testid-on-clickable": "warn",
     },
     options: {
       // Revisit once Oxlint's tsgolint path can integrate with @effect/tsgo diagnostics.

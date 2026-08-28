@@ -32,6 +32,30 @@ export type Deadline = { readonly ms: number; readonly what: string };
  * names what was being waited for. Every wait in this suite goes through here
  * so that a timeout is never reported as a product failure by accident.
  */
+/**
+ * A probe failure that CANNOT become true by waiting longer.
+ *
+ * `waitFor` retries on a thrown probe, which is right for a transient error —
+ * a port not listening yet, a fetch refused mid-boot. It is exactly wrong for a
+ * condition that is now permanent, and the boot probe has one: if dev-runner
+ * has EXITED, no amount of polling will produce its banner.
+ *
+ * That distinction was missing, and it cost a diagnosis. `startStack`'s probe
+ * deliberately threw `dev-runner exited with N` to fail fast; `waitFor` caught
+ * it, stored it as `last`, and kept polling for the full `bootMs` — which
+ * defaults to 1_800_000, so a runner that died in a second produced a THIRTY
+ * MINUTE hang whose eventual message was a timeout, not the exit. Observed on
+ * woodbine, where dev-runner exits 0 immediately under node 22.14 (its
+ * entrypoint is guarded by `import.meta.main`, which that version does not
+ * support) and the spec sat with no children at 0% CPU until the harness
+ * timeout fired.
+ *
+ * Throw this when the wait is already lost, and `waitFor` reports it now.
+ */
+export class Unrecoverable extends Error {
+  override readonly name = "Unrecoverable";
+}
+
 export async function waitFor<T>(
   probe: () => T | Promise<T>,
   deadline: Deadline,
@@ -45,6 +69,9 @@ export async function waitFor<T>(
       if (value) return value as NonNullable<T>;
       last = value;
     } catch (error) {
+      // A permanent failure is reported NOW. Retrying it only converts a
+      // precise cause into a generic timeout, later.
+      if (error instanceof Unrecoverable) throw error;
       last = error;
     }
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -140,6 +167,23 @@ export async function startStack(
     cwd: REPO_ROOT,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    // DETACHED so the runner LEADS ITS OWN PROCESS GROUP, which is what makes
+    // `killTree`'s `process.kill(-pid)` mean anything.
+    //
+    // Without it the runner shares this process's group, `-pid` is not a valid
+    // pgid, the group kill throws, and the fallback `child.kill()` reaps only
+    // the runner — leaving `vite` and `t3code-server` alive and REPARENTED TO
+    // PID 1. Measured on woodbine: after all five specs reported, the suite
+    // would not exit, with an orphaned vite (ppid 1) and a live
+    // target/release/t3code-server still holding the port. Six stray dev
+    // servers were up across cells at the time, which is the same leak in
+    // everyone else's runs.
+    //
+    // This is hearth's own rule one layer up: kill the process GROUP, do not
+    // orphan the tree. The tradeoff is that a detached child outlives an
+    // abrupt parent death, so `dispose()` is now mandatory rather than
+    // best-effort — which it already was, via the `after` hook.
+    detached: true,
   });
 
   let out = "";
@@ -163,7 +207,18 @@ export async function startStack(
   const banner = await waitFor(
     () => {
       if (exited !== null) {
-        throw new Error(`dev-runner exited with ${exited}\n${out.slice(-2000)}`);
+        // Unrecoverable: the runner is gone, so the banner is never coming.
+        // Waiting out the remaining bootMs would replace this exit code and its
+        // output with "TIMED OUT waiting for the banner", which is the wrong
+        // diagnosis and the expensive one.
+        throw new Unrecoverable(
+          `dev-runner exited with ${exited} before printing its banner.\n` +
+            `Runner output:\n${out.slice(-2000)}\n` +
+            `If the output is empty, check the node version: this repo declares ` +
+            `engines.node ^24.13.1 and scripts/dev-runner.ts guards its entrypoint ` +
+            `with \`import.meta.main\`, which is unsupported before 22.18 — there ` +
+            `the CLI never runs and the process exits 0 silently.`,
+        );
       }
       const web = out.match(/Local:\s+(http:\/\/[^\s]+)/);
       // The runner prints `serverPort=NNNNN` in its own banner (dev-runner.ts:723).

@@ -1121,6 +1121,404 @@ async fn project_upserted_frame_is_a_recorded_fixture_the_ts_contract_decodes() 
 }
 
 /// #33: the terminal RPCs are wired to the shared PTY (not the unsupported
+/// FE-PROBE-6: which Origins may open the control socket.
+///
+/// Both directions matter. Only asserting that evil.com is refused would pass
+/// for a predicate that refuses EVERYTHING, which would take the desktop app
+/// and every native client down with it — so the allow cases are asserted just
+/// as hard as the deny cases.
+#[test]
+fn only_loopback_origins_may_open_the_control_socket() {
+    use crate::origin_may_open_control_socket as allowed;
+
+    // Native clients send no Origin. A browser cannot omit it (the user agent
+    // sets it and script cannot), so "absent" is exactly the non-browser set.
+    assert!(allowed(None), "a native client sends no Origin");
+    assert!(allowed(Some("")), "an empty Origin is not a web page");
+    assert!(allowed(Some("null")), "sandboxed/file:// embeddings send null");
+
+    // The app itself.
+    assert!(allowed(Some("http://localhost:3773")));
+    assert!(allowed(Some("http://127.0.0.1:5173")));
+    assert!(allowed(Some("https://localhost")));
+    assert!(allowed(Some("http://[::1]:3773")), "IPv6 loopback with a port");
+    assert!(allowed(Some("http://127.0.0.2:80")), "all of 127/8 is loopback");
+
+    // Embeddings that are not web pages.
+    assert!(allowed(Some("tauri://localhost")));
+    assert!(allowed(Some("file://")));
+
+    // THE ATTACK: any page the user has open can reach ws://127.0.0.1/ws,
+    // because the same-origin policy does not apply to WebSockets. The server
+    // is the only thing that can refuse, and this is it refusing.
+    assert!(!allowed(Some("https://evil.com")), "a real site is not loopback");
+    assert!(!allowed(Some("http://evil.com:3773")), "the port is not the check");
+    assert!(
+        !allowed(Some("https://localhost.evil.com")),
+        "a suffix that merely CONTAINS localhost is a different host"
+    );
+    assert!(
+        !allowed(Some("https://127.0.0.1.evil.com")),
+        "an origin that merely starts with the loopback literal is a different host"
+    );
+    assert!(!allowed(Some("http://10.0.0.5")), "LAN is not loopback");
+    assert!(!allowed(Some("garbage")), "an unparseable Origin is refused, not trusted");
+}
+
+/// The server.* RPCs this runtime does NOT implement must SAY SO, and the set
+/// may only shrink.
+///
+/// Seven of the settings surface's methods are absent from `server_main.rs`:
+/// server.probe, server.updateServer, server.updateServerWithProgress,
+/// server.signalProcess, server.getBackgroundPolicy,
+/// server.reportHostPowerState, server.retryResourceTelemetry.
+///
+/// Absent is FINE. Absent-and-silent is not. This file's own doctrine says
+/// "Genuinely unimplemented RPCs FAIL explicitly rather than returning a
+/// masking Success(null)", because a method that answers Success(null) is
+/// indistinguishable at the glass from one that worked — the UI renders an
+/// affordance, the user clicks it, nothing happens, and nothing anywhere says
+/// why. This pins that doctrine for the methods it currently applies to.
+///
+/// The ratchet is the point: implementing one of these makes this test fail
+/// with "lower the constant", which is the only moment anyone edits it, and
+/// LOSING an implementation fails it the other way.
+#[tokio::test]
+async fn unimplemented_server_rpcs_refuse_explicitly_instead_of_faking_success() {
+    let (state, _d) = test_state().await;
+
+    let absent = [
+        "server.probe",
+        "server.updateServer",
+        "server.updateServerWithProgress",
+        "server.signalProcess",
+        "server.getBackgroundPolicy",
+        "server.reportHostPowerState",
+        "server.retryResourceTelemetry",
+    ];
+
+    let mut refused: Vec<&str> = Vec::new();
+    let mut answered: Vec<&str> = Vec::new();
+    for method in absent {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, json!({})).await;
+        let frames = drain(&mut rx);
+        let text = format!("{frames:?}");
+        // "unsupported method" is the catch-all naming itself. A method that
+        // exists but errors for want of real state is a DIFFERENT fact and is
+        // not counted here.
+        if text.contains("unsupported method") {
+            refused.push(method);
+        } else {
+            answered.push(method);
+        }
+    }
+
+    println!("REFUSED as unsupported ({}): {refused:?}", refused.len());
+    println!("ANSWERED ({}): {answered:?}", answered.len());
+
+    // A Success(null) here is the exact failure the doctrine forbids: the UI
+    // renders the affordance, the user clicks it, nothing happens, and nothing
+    // says why. So an ANSWERED method is only acceptable if it genuinely became
+    // implemented, which the ratchet below forces someone to declare.
+    assert!(
+        answered.is_empty(),
+        "these server.* RPCs answered instead of refusing as unsupported: {answered:?}. \
+         If they were implemented, lower KNOWN_ABSENT below in the same commit. If they \
+         are returning a masking Success(null), that is the defect this test exists for."
+    );
+
+    const KNOWN_ABSENT: usize = 7;
+    assert!(
+        refused.len() <= KNOWN_ABSENT,
+        "more server.* RPCs are unimplemented than before ({} > {}). One LOST its \
+         implementation, and the settings UI will keep offering it. Refused: {:?}",
+        refused.len(),
+        KNOWN_ABSENT,
+        refused,
+    );
+    assert!(
+        refused.len() >= KNOWN_ABSENT,
+        "only {} of the {} known-absent server.* RPCs still refuse. That is GOOD — one gained \
+         an implementation. Lower KNOWN_ABSENT to {} in this commit. Now answering: {:?}",
+        refused.len(),
+        KNOWN_ABSENT,
+        refused.len(),
+        answered,
+    );
+}
+
+/// #469/#436: `GET /api/orchestration/threads/:threadId` must ANSWER, not 404.
+///
+/// The contract defines it (contracts/src/environmentHttp.ts:516) and the client
+/// calls it (client-runtime/src/state/threadSnapshotHttp.ts:50) the moment a
+/// draft becomes a real thread. When the route was absent it fell through to the
+/// capture_http fallback and 404'd ON THE REAL THREAD ID, so promotion never
+/// completed and the view stayed on /draft/<id> while the turn ran to completion
+/// somewhere it was not looking.
+///
+/// The route existing in source is not the same as the router serving it — a
+/// path registered under the wrong prefix, or shadowed by the fallback, reads
+/// identically in a grep. So this binds the REAL router with `build_app` and
+/// speaks HTTP to it over a socket, which is the only form that can tell those
+/// apart.
+///
+/// It asserts NOT-404 rather than 200: with no such thread the honest answer is
+/// a failure body from the handler, and demanding 200 here would force the
+/// handler to invent a snapshot for a thread that does not exist — which is
+/// exactly what its "the DURABLE record is the authority" comment refuses to do.
+#[tokio::test]
+async fn the_thread_snapshot_route_is_served_and_does_not_fall_through_to_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (state, _d) = test_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let app = crate::build_app(state);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(
+        b"GET /api/orchestration/threads/t-snapshot HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .expect("send the request");
+
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sock.read_to_end(&mut raw),
+    )
+    .await
+    .expect("the server answered within 20s");
+    server.abort();
+
+    let response = String::from_utf8_lossy(&raw);
+    let status = response.lines().next().unwrap_or("").to_string();
+    assert!(
+        !status.contains("404"),
+        "#469: the router 404'd on GET /api/orchestration/threads/:threadId, so it is not \
+         served — the client's promotion fetch falls through to capture_http exactly as it did \
+         when the route was missing. Status line: {status:?}"
+    );
+}
+
+/// #462: DUPLICATE DECIDER AUTHORITY, made red instead of merely known.
+///
+/// There are two deciders for one command set.
+/// `apps/server/src/orchestration/decider.ts` has 27 typed `case` arms; this
+/// backend implements 7. Which one runs is decided by `T3CODE_BACKEND`, so the
+/// same UI and the same contract produce different thread lifecycle behaviour
+/// depending on an env var, and any semantics edited on the TS side diverges
+/// from the Rust side with no compile error and no failing test.
+///
+/// THE REAL FIX IS NOT HERE. Orchestration semantics belong in agent-sdk-shell
+/// once, behind a typed command enum, with both backends reduced to transport.
+/// Porting the missing arms into `server_main.rs` would close the gap while
+/// making the architecture worse — it doubles down on the product owning the
+/// decider. That port is not this test.
+///
+/// What this test does is stop the gap being INVISIBLE. It dispatches every
+/// dispatchable command at the real dispatcher and sorts them into implemented
+/// and refused, then ratchets on the refused count. So:
+///   * a command that gains an implementation makes this test fail LOUDLY with
+///     "the ratchet moved, lower it" — a good failure, and the only way the
+///     number is ever revised;
+///   * a command that silently LOSES one fails the same way;
+///   * and the exact list is printed, so nobody has to re-derive which 16.
+///
+/// It asserts REFUSAL, not silence. `server_main.rs`'s catch-all fails the
+/// request explicitly rather than acking a no-op as applied, which is the
+/// behaviour that makes this measurable at all — an unimplemented command that
+/// answered Success(null) would be indistinguishable from a working one.
+#[tokio::test]
+async fn the_rust_decider_refuses_every_command_it_does_not_implement() {
+    let (state, _d) = test_state().await;
+
+    // The dispatchable command set, from packages/contracts/src/orchestration.ts.
+    // Server-ORIGINATED types (thread.activity.append, thread.message.assistant.*,
+    // thread.session.set, thread.revert.complete, thread.title.regeneration.complete,
+    // thread.turn.diff.complete) are deliberately excluded: the client never
+    // dispatches them, so their absence here is not a divergence a user can hit.
+    let dispatchable = [
+        "project.create",
+        "project.delete",
+        "project.meta.update",
+        "thread.approval.respond",
+        "thread.archive",
+        "thread.checkpoint.revert",
+        "thread.create",
+        "thread.delete",
+        "thread.meta.update",
+        "thread.pin",
+        "thread.pin.reorder",
+        "thread.session.stop",
+        "thread.settle",
+        "thread.snooze",
+        "thread.turn.interrupt",
+        "thread.turn.start",
+        "thread.unarchive",
+        "thread.unpin",
+        "thread.unsettle",
+        "thread.unsnooze",
+    ];
+
+    let mut implemented: Vec<&str> = Vec::new();
+    let mut refused: Vec<&str> = Vec::new();
+
+    for kind in dispatchable {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "orchestration.dispatchCommand",
+            json!({ "type": kind, "commandId": format!("c-{kind}"), "threadId": "t-decider" }),
+        )
+        .await;
+        let frames = drain(&mut rx);
+        // The catch-all names itself, so "not implemented by this runtime" in the
+        // failure is the discriminator — NOT merely "did it fail". A command that
+        // IS implemented can still fail here for want of a real thread, and that
+        // is implemented-but-erroring, which is a different fact.
+        let unimplemented = frames.iter().any(|f| {
+            f["exit"]["cause"][0]["error"]
+                .as_str()
+                .or_else(|| f["exit"]["cause"][0]["defect"].as_str())
+                .or_else(|| f["exit"]["value"].as_str())
+                .unwrap_or_default()
+                .contains("is not implemented by this runtime")
+                || format!("{f}").contains("is not implemented by this runtime")
+        });
+        if unimplemented {
+            refused.push(kind);
+        } else {
+            implemented.push(kind);
+        }
+    }
+
+    println!("#462 IMPLEMENTED by the Rust decider ({}): {implemented:?}", implemented.len());
+    println!("#462 REFUSED as unimplemented ({}): {refused:?}", refused.len());
+
+    // RATCHET. This number is the size of the divergence between the two
+    // deciders, and it may only ever go DOWN. Raising it means a command lost
+    // its implementation; lowering it means one gained an implementation and
+    // the constant should be edited in the same commit that did so.
+    // MEASURED, not assumed. My first guess was 14; the test said 13 and named
+    // the set, which is exactly the correction this ratchet exists to force.
+    const KNOWN_UNIMPLEMENTED: usize = 13;
+    assert!(
+        refused.len() <= KNOWN_UNIMPLEMENTED,
+        "#462: the Rust decider now refuses {} of {} dispatchable commands, up from {}. \
+         A command LOST its implementation, which silently changes behaviour for \
+         T3CODE_BACKEND=rust users while the TS decider still handles it. \
+         Refused: {:?}",
+        refused.len(),
+        dispatchable.len(),
+        KNOWN_UNIMPLEMENTED,
+        refused,
+    );
+    assert!(
+        refused.len() >= KNOWN_UNIMPLEMENTED,
+        "#462: the Rust decider now refuses only {} of {} dispatchable commands, \
+         down from {}. That is GOOD — a command gained an implementation. Lower \
+         KNOWN_UNIMPLEMENTED to {} in this commit so the ratchet holds the new \
+         ground. Refused: {:?}",
+        refused.len(),
+        dispatchable.len(),
+        KNOWN_UNIMPLEMENTED,
+        refused.len(),
+        refused,
+    );
+
+    // Whatever is implemented must STILL be implemented. This is the half that
+    // catches a regression rather than measuring the gap.
+    for kind in ["thread.turn.start", "thread.turn.interrupt", "thread.meta.update"] {
+        assert!(
+            implemented.contains(&kind),
+            "#462: '{kind}' is dispatched by the product's own UI and this runtime \
+             now refuses it. Refused set: {refused:?}"
+        );
+    }
+}
+
+/// FE-PROBE-6: is the terminal owner CHECKED, or merely REQUIRED?
+///
+/// Every `terminal.*` method takes an owner (sessionId or threadId) plus a
+/// terminal id, and the pane store is keyed by `(owner.scope(), terminal_id)`.
+/// That keying is real and it does prevent an ACCIDENTAL collision between a
+/// subagent and its parent (#149). It is not access control, because the owner
+/// is parsed out of the REQUEST PAYLOAD — `TerminalOwner::parse(&payload)` at
+/// server_main.rs — and nothing anywhere ties a connection to an owner it is
+/// entitled to name. "Non-empty" is not "yours".
+///
+/// This test DOES NOT assert that the cross-owner write is refused, because it
+/// is not. It pins the exposure as it currently stands so the fix has a
+/// failing-by-design witness to flip, and so nobody reads the (scope, id)
+/// keying as a security boundary it was never built to be.
+///
+/// Why this is arbitrary command execution and not a tidiness complaint:
+///   * `ws_upgrade` (server_main.rs) takes no Origin, no token, no auth of any
+///     kind, and the router mounts no CORS layer — so ANY web page the user has
+///     open can `new WebSocket("ws://127.0.0.1:<port>/ws")` and be a client.
+///   * `terminal_id` defaults to the literal "term-1" (terminal.rs:267), so the
+///     attacker does not even have to guess a terminal id.
+///   * hearth's model is ONE persistent PTY per session carrying cd/export/venv
+///     state, so a foreign write both executes and corrupts state the real
+///     owner will later trust.
+///
+/// If a later change makes cross-owner writes refuse, THIS TEST SHOULD FAIL and
+/// be inverted to assert the refusal. That is the intended end state.
+#[tokio::test]
+async fn a_foreign_owner_can_drive_a_terminal_it_never_opened() {
+    let (state, _d) = test_state().await;
+
+    // VICTIM opens its pane. Default terminal id on purpose: it is what the
+    // product uses and what an attacker would assume.
+    let (tx_victim, mut rx_victim) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx_victim,
+        "terminal.open",
+        json!({ "threadId": "t-victim", "terminalId": "term-1", "cwd": state.cwd, "cols": 80, "rows": 24 }),
+    )
+    .await;
+    let opened = drain(&mut rx_victim);
+    assert_eq!(
+        opened[0]["exit"]["_tag"], "Success",
+        "precondition: the victim's terminal opened: {:?}",
+        opened[0]
+    );
+
+    // ATTACKER is a different client that never opened anything and never
+    // identified as t-victim. It simply SAYS it is t-victim.
+    let (tx_attacker, mut rx_attacker) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx_attacker,
+        "terminal.write",
+        json!({ "threadId": "t-victim", "terminalId": "term-1", "data": "echo pwned\n" }),
+    )
+    .await;
+    let wrote = drain(&mut rx_attacker);
+
+    assert_eq!(
+        wrote[0]["exit"]["_tag"], "Success",
+        "FE-PROBE-6: recorded exposure — a client that never opened this pane \
+         and holds no claim to `t-victim` wrote into its PTY and the server \
+         accepted it. The owner is taken from the request payload \
+         (TerminalOwner::parse) and never checked against the connection, so \
+         `terminal.write` is arbitrary command execution in another session's \
+         shell for anyone who can reach /ws — which, with no Origin check and \
+         no auth on the upgrade, is any web page the user has open. If this \
+         assertion has started failing, the hole is closed: invert it. \
+         Frames: {wrote:?}"
+    );
+}
+
 /// arm), and return contract-shaped payloads. terminal.open yields a
 /// TerminalSessionSnapshot; write/resize succeed; attach streams a snapshot.
 #[tokio::test]
@@ -6998,6 +7396,80 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #437: a WHITESPACE title must not silently un-promote the draft.
+///
+/// `thread.created` is the only event `orchestrationEventEffects.ts:31`
+/// promotes a draft on, and its contract payload types `title` as
+/// `TrimmedNonEmptyString` — `TrimmedString.check(isNonEmpty())`, so the client
+/// TRIMS FIRST and then requires non-empty. The backend used to accept any
+/// title that was merely `!s.is_empty()`, so a titleSeed of "   " encoded fine
+/// here, decoded to "" there, failed the check, and took the WHOLE EVENT with
+/// it. The durable row still existed and the turn still ran; only the promotion
+/// was lost, which at the glass is "2 minutes for a hi" with the composer stuck
+/// on Thinking — indistinguishable from a hung backend.
+///
+/// The assertion is that a whitespace title falls through to the SAME fallback
+/// an absent title takes, so the payload can never carry a value the client
+/// will refuse. Asserted on the announced thread because it and the event are
+/// built from one `title` binding.
+#[tokio::test]
+async fn a_whitespace_title_falls_back_instead_of_shipping_an_undecodable_event() {
+    let (state, _dir) = test_state().await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "orchestration.subscribeShell", json!({})).await;
+    let _ = drain(&mut rx);
+
+    let command = json!({
+        "type": "thread.turn.start",
+        "commandId": "c-ws",
+        "threadId": "t-ws",
+        // Whitespace everywhere a title can come from, so the fallback is the
+        // only honest source left. The message text is whitespace too —
+        // otherwise it would supply the title and the test would pass without
+        // the trim ever being exercised.
+        "titleSeed": "   ",
+        "message": { "messageId": "m-ws", "role": "user", "text": "   ", "attachments": [] },
+        "runtimeMode": "full-access",
+        "bootstrap": { "createThread": { "projectId": "p-ws", "title": "  \t " }},
+    });
+    ensure_thread_on_shell(&state, &command).await.unwrap();
+
+    let announced = drain_until(&mut rx, std::time::Duration::from_secs(2), |f| {
+        f.get("values")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|x| x.get("kind").and_then(Value::as_str) == Some("thread-upserted"))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    let upsert = announced
+        .iter()
+        .flat_map(|f| f["values"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["kind"] == "thread-upserted")
+        .unwrap_or_else(|| panic!("no thread-upserted in {announced:#?}"));
+    let title = upsert["thread"]["title"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        title.trim(),
+        title,
+        "#437: the title still carries surrounding whitespace, so the contract \
+         trims it to something shorter than what the backend recorded"
+    );
+    assert!(
+        !title.is_empty(),
+        "#437: a whitespace-only title survived as an empty/blank title. \
+         `TrimmedNonEmptyString` refuses it, the client drops `thread.created` \
+         entirely, and the draft never promotes."
+    );
+    assert_eq!(
+        title, "New thread",
+        "#437: a blank title must take the SAME fallback an absent title takes"
+    );
 }
 
 /// #137/#78/#79: the FIRST turn's context reaches the thread.

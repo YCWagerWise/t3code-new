@@ -19,7 +19,7 @@ use axum::{
     body::Bytes,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
-    http::{Method, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -597,8 +597,88 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+/// Whether a browser `Origin` may open the control socket.
+///
+/// FE-PROBE-6. This socket is not a public API: it can start processes, read
+/// the filesystem and WRITE INTO A LIVE PTY. It had no Origin check, no token
+/// and no CORS layer, and the router binds loopback — which stops a remote
+/// attacker and does NOTHING about a browser, because any page the user has
+/// open can reach `ws://127.0.0.1:<port>/ws`. The same-origin policy does not
+/// apply to WebSockets; the server is the only thing that can refuse.
+///
+/// ABSENT Origin is ALLOWED, and that is deliberate rather than an oversight.
+/// Native clients (the desktop shell, `tokio_tungstenite`, CLI tooling) send no
+/// Origin at all, and a BROWSER CANNOT SUPPRESS IT — the header is set by the
+/// user agent and is not script-controllable. So "no Origin" is exactly the set
+/// of non-browser callers, which is the set this check is not aimed at.
+///
+/// Everything else must be loopback. A page served from a real site sends its
+/// own origin and is refused; the app itself is served from localhost and is
+/// not. `null` is allowed for sandboxed/file:// and Tauri-style embeddings,
+/// which is the desktop shell's case.
+///
+/// This does NOT make the owner check unnecessary — see
+/// `a_foreign_owner_can_drive_a_terminal_it_never_opened`. Any non-browser
+/// client still names whatever owner it likes. This closes the vector that
+/// makes the exposure reachable from a web page; the entitlement gap is a
+/// separate fix and is still open.
+pub(crate) fn origin_may_open_control_socket(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let origin = origin.trim();
+    if origin.is_empty() || origin == "null" {
+        return true;
+    }
+    // Scheme-relative parse: everything after "://" up to an optional ":port".
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+        // tauri://, file://, app:// and friends are embeddings, not web pages.
+        return true;
+    }
+    let host = rest.split('/').next().unwrap_or("");
+    // Strip a port, and the brackets around an IPv6 literal.
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() => h,
+        _ => host,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // PARSED as an address, not prefix-matched. `host.starts_with("127.")`
+    // reads as "all of 127/8" and also accepts `127.0.0.1.evil.com`, which is
+    // an attacker-controlled DOMAIN that merely begins with the loopback
+    // literal. The test caught exactly that. Same trap on the other side:
+    // `localhost.evil.com` is not localhost.
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    if !origin_may_open_control_socket(origin) {
+        tracing::warn!(
+            origin = origin.unwrap_or("<none>"),
+            "ws: refused a control-socket upgrade from a non-loopback Origin"
+        );
+        // 403 rather than a silent close: a refused upgrade must be
+        // diagnosable, and a legitimate client misconfigured onto the wrong
+        // origin should see why instead of an unexplained disconnect.
+        return (
+            StatusCode::FORBIDDEN,
+            "this control socket only accepts loopback origins",
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
 }
 
 /// Subscriptions this backend answers with silence rather than data. Anything
@@ -815,8 +895,21 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // away before the runtime ever started — the thread showed one project
     // while the work happened somewhere else (#137/#78/#79).
     let boot = command.pointer("/bootstrap/createThread");
+    // TRIMMED, not merely non-empty (#437). These values are encoded into
+    // `ThreadCreatedPayload`, whose `title` is `TrimmedNonEmptyString` and whose
+    // `branch`/`worktreePath` are `NullOr(TrimmedNonEmptyString)` —
+    // `TrimmedString.check(isNonEmpty())`, so the client TRIMS FIRST and then
+    // requires non-empty. A whitespace-only value passes `!s.is_empty()` here
+    // and decodes to "" there, which fails the check and drops the whole event.
+    //
+    // Dropping `thread.created` is not a cosmetic failure: it is the only event
+    // orchestrationEventEffects.ts:31 promotes a draft on, so the view stays
+    // parked on /draft/<id> while the turn runs to completion somewhere it is
+    // not looking. That is the exact "2 minutes for a hi" symptom this finding
+    // is about, reachable again through a title of "   ".
     let str_of = |v: Option<&Value>| {
         v.and_then(Value::as_str)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
@@ -826,7 +919,11 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
             command
                 .pointer("/message/text")
                 .and_then(|t| t.as_str())
+                // Take the 48 chars FIRST, then trim: truncation can leave a
+                // trailing space, and " hello wor" must not become a title the
+                // client refuses.
                 .map(|t| t.chars().take(48).collect::<String>())
+                .map(|t| t.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "New thread".into());
