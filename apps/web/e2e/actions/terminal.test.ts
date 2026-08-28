@@ -248,6 +248,53 @@ after(async () => {
   await stack?.dispose();
 });
 
+test("the workspace the server ADVERTISES is one it will admit a pane in", async () => {
+  /* THIS TEST IS THE REASON THE FIVE BELOW FAIL UNDER `run.ts`, and it is a real
+   * defect rather than a harness detail — which is why it is asserted here
+   * instead of being worked around.
+   *
+   * Two different values decide "where is the workspace":
+   *   - `server.getConfig` reports `state.cwd`, and that is what a client has to
+   *     go on; the drawer opens its pane at the project's root.
+   *   - pane admission is built from `boot_root` — `ToolRoots::new` canonicalises
+   *     it and hands `RootedAdmission::new([boot_root, worktrees])` to
+   *     `ExecSessions` (backend/src/tools.rs:444-461).
+   *
+   * Nothing forces those two to agree, and under the e2e stack they do not. The
+   * backend advertises the repo root and then refuses it:
+   *
+   *   terminal.open: cwd /home/nala/builds/<cell>/t3code-new is outside every
+   *   admitted root
+   *
+   * Omitting `cwd` does not help — the fallback is the same unadmitted root — so
+   * under this stack NO pane can be opened at all, by this spec or by the app.
+   * The identical assertions passed 6/6 against a backend started directly with
+   * an explicit workspace, so the terminal itself is fine; what is broken is that
+   * the advertised root and the admitted root are allowed to diverge.
+   *
+   * A failing test plus a finding is what the README asks for here, and it is
+   * strictly better than a spec that quietly probes for some other directory
+   * that happens to work: that would go green while the app stayed broken. */
+  const rpc = await Rpc.connect(stack.serverPort);
+  const opened = await rpc.call("terminal.open", {
+    threadId: "e2e-c-advertised",
+    terminalId: "term-advertised",
+    cwd: workspaceRoot,
+    cols: 200,
+    rows: 50,
+  });
+  assert.equal(
+    opened._tag,
+    "Success",
+    `the server advertises cwd=${workspaceRoot} via server.getConfig, so a pane must be ` +
+      `admissible there. If this says "outside every admitted root", getConfig's state.cwd ` +
+      `and ToolRoots' boot_root have diverged (backend/src/tools.rs:444) and the drawer ` +
+      `cannot open a terminal at the project root either. Got: ` +
+      `${JSON.stringify(opened).slice(0, 300)}`,
+  );
+  rpc.close();
+});
+
 test("all eight methods are implemented, and none of them acks a lie", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-thread", terminalId: "term-e2e-1" };
