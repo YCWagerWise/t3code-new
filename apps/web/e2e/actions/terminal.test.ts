@@ -238,6 +238,30 @@ function paneOpen(target: Record<string, unknown>): Record<string, unknown> {
   return { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
 }
 
+/**
+ * Re-read the admitted root from the backend that is answering RIGHT NOW.
+ *
+ * The root is not a constant for the life of the suite. Read once in `before()`
+ * it produced a run where the FIRST test opened a pane at that root happily and
+ * every later test was refused with `cwd <root> is outside every admitted root`
+ * — the same string, admitted and then not. The stack is `vp dev`, which watches
+ * files and can replace the backend mid-run, and `RootedAdmission` is built from
+ * the replacement's own `boot_root` (backend/src/tools.rs:444-461). So a cached
+ * root is a claim about a process that may no longer exist.
+ *
+ * Each test asks the socket it is actually talking to. That is one extra RPC and
+ * it removes a whole class of failure that reads like a product defect.
+ */
+async function admittedRoot(rpc: Rpc): Promise<string> {
+  const config = await rpc.ok("server.getConfig", {});
+  const root = config?.cwd;
+  assert.ok(
+    typeof root === "string" && root.length > 0,
+    `server.getConfig must advertise its cwd; got keys ${Object.keys(config ?? {}).join(",")}`,
+  );
+  return root;
+}
+
 before(async () => {
   stack = await startStack();
   app = await openApp(stack);
@@ -291,6 +315,7 @@ test("the workspace the server ADVERTISES is one it will admit a pane in", async
    * strictly better than a spec that quietly probes for some other directory
    * that happens to work: that would go green while the app stayed broken. */
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
   const opened = await rpc.call("terminal.open", {
     threadId: "e2e-c-advertised",
     terminalId: "term-advertised",
@@ -312,6 +337,7 @@ test("the workspace the server ADVERTISES is one it will admit a pane in", async
 
 test("all eight methods are implemented, and none of them acks a lie", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
   const target = { threadId: "e2e-c-thread", terminalId: "term-e2e-1" };
   const open = paneOpen(target);
 
@@ -422,6 +448,7 @@ test("the pane is ONE persistent PTY: cd and export survive separate writes", as
    * shell per command would pass every method assertion above and fail this
    * one, which is exactly why it is a separate test. */
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
   const target = { threadId: "e2e-c-persist", terminalId: "term-persist" };
   const open = paneOpen(target);
 
@@ -469,6 +496,7 @@ test("the pane is a real tty: isatty() is true inside it", async () => {
    * piped a subprocess's stdout would satisfy every other test in this file and
    * fail this one. `[ -t 0 ]` is the smallest honest probe. */
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
   const target = { threadId: "e2e-c-tty", terminalId: "term-tty" };
   await rpc.ok("terminal.open", paneOpen(target));
 
@@ -504,6 +532,7 @@ test("TerminalTargetInput stays a union: neither-id and both-ids are refused", a
    * which pane the caller gets, which is #149's ownership boundary reached from
    * the other direction. This test is what caught that divergence. */
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
 
   const orphan = await rpc.call("terminal.open", {
     terminalId: "term-orphan",
@@ -531,6 +560,7 @@ test("TerminalTargetInput stays a union: neither-id and both-ids are refused", a
 
 test("panes are independent: writing to one does not reach the other", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
+  workspaceRoot = await admittedRoot(rpc);
   const a = { threadId: "e2e-c-iso", terminalId: "term-a" };
   const b = { threadId: "e2e-c-iso", terminalId: "term-b" };
   await rpc.ok("terminal.open", paneOpen(a));
