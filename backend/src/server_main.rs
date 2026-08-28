@@ -11,7 +11,7 @@
 //! text back as `thread.message.assistant.delta`/`complete` events on that
 //! thread's `subscribeThread` stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use agent_sdk_shell::{
 use tokio::sync::RwLock;
 
 use t3code_agent::{
-    assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol,
+    assets, diagnostics, keybindings, paths, projects, providers, review, settings, sourcecontrol,
     terminal, tools, vcs,
 };
 
@@ -46,6 +46,21 @@ use t3code_agent::{
 /// frame; fire-and-forget senders (RPC exits, the shell stream) pass `None`.
 /// This is what lets the tail ack the bus AFTER delivery, not after enqueue.
 type OutFrame = (String, Option<tokio::sync::oneshot::Sender<bool>>);
+
+#[derive(Default)]
+struct WsAuthority {
+    terminal_scopes: Mutex<HashSet<String>>,
+}
+
+impl WsAuthority {
+    async fn grant_terminal(&self, owner: &terminal::TerminalOwner) {
+        self.terminal_scopes.lock().await.insert(owner.scope());
+    }
+
+    async fn allows_terminal(&self, owner: &terminal::TerminalOwner) -> bool {
+        self.terminal_scopes.lock().await.contains(&owner.scope())
+    }
+}
 
 struct WsThreadSink {
     tx: mpsc::UnboundedSender<OutFrame>,
@@ -369,17 +384,6 @@ fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, Strin
     (ask, instructions)
 }
 
-/// Where the agent works, and where its durable state lives.
-fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::var("T3CODE_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    let data = std::env::var("T3CODE_AGENT_DATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".t3code-agent"));
-    (root, data)
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     // NON-BLOCKING, and this is a liveness property of the server, not a
@@ -415,12 +419,9 @@ async fn main() {
         .with_writer(log_writer)
         .init();
 
-    let data = std::env::var("T3CODE_AGENT_DATA").unwrap_or_else(|_| ".t3code-agent".into());
-    let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| ".".into())
-    });
+    let (ws_root, agent_data) = paths::workspace_paths();
+    let data = agent_data.to_string_lossy().into_owned();
+    let cwd = ws_root.to_string_lossy().into_owned();
     let project_name = std::path::Path::new(&cwd)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -445,7 +446,6 @@ async fn main() {
     // ONE Hearth PTY per workspace, opened before any session exists and shared
     // by every session and subagent: `cd`/env persist across tool calls, and the
     // session id in each run_bash result is what a client attaches to.
-    let (ws_root, agent_data) = workspace_paths();
     // Open the ONE workspace PTY here so the SAME handle backs both the agent's
     // run_bash tools and the human-facing terminal RPCs (#33) — never two PTYs.
     let workspace_runner = tools::open_workspace_shell(&ws_root, agent_data.clone())
@@ -1730,6 +1730,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Outbound frames funnel through this channel so turn tasks can push
     // events while the read loop is parked on `recv`.
     let (tx, mut rx) = mpsc::unbounded_channel::<OutFrame>();
+    let authority = Arc::new(WsAuthority::default());
     let writer = tokio::spawn(async move {
         while let Some((text, done)) = rx.recv().await {
             let ok = sink.send(Message::Text(text.into())).await.is_ok();
@@ -1829,6 +1830,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if frame.get("_tag").and_then(|t| t.as_str()) == Some("Request") {
                     let tx = tx.clone();
                     let state = state.clone();
+                    let authority = authority.clone();
                     inflight.spawn(async move {
                         // The counter is decremented by a GUARD, not by a
                         // statement at the end of the block: a trailing statement
@@ -1844,10 +1846,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .inflight_requests
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _guard = Inflight(state.inflight_requests.clone());
-                        dispatch_ws_frame(frame, &tx, &state).await;
+                        dispatch_ws_frame_authorized(frame, &tx, &state, &authority).await;
                     });
                 } else {
-                    dispatch_ws_frame(frame, &tx, &state).await;
+                    dispatch_ws_frame_authorized(frame, &tx, &state, &authority).await;
                 }
             }
             Message::Close(_) => break,
@@ -1877,12 +1879,30 @@ pub(crate) async fn dispatch_ws_frame(
     tx: &mpsc::UnboundedSender<OutFrame>,
     state: &AppState,
 ) {
+    dispatch_ws_frame_inner(frame, tx, state, None).await;
+}
+
+async fn dispatch_ws_frame_authorized(
+    frame: Value,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    state: &AppState,
+    authority: &WsAuthority,
+) {
+    dispatch_ws_frame_inner(frame, tx, state, Some(authority)).await;
+}
+
+async fn dispatch_ws_frame_inner(
+    frame: Value,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    state: &AppState,
+    authority: Option<&WsAuthority>,
+) {
     match frame.get("_tag").and_then(|t| t.as_str()) {
         Some("Ping") => {
             let _ = tx.send((r#"{"_tag":"Pong"}"#.into(), None));
         }
         Some("Request") => {
-            handle_request(&frame, tx, state).await;
+            handle_request(&frame, tx, state, authority).await;
         }
         Some("Ack") => {
             // #411: Effect RPC's stream-flow-control frame. The client
@@ -2018,6 +2038,75 @@ fn exit_failure(tx: &mpsc::UnboundedSender<OutFrame>, request_id: &Value, messag
     ));
 }
 
+async fn terminal_authorized(
+    authority: Option<&WsAuthority>,
+    state: &AppState,
+    payload: &Value,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    id: &Value,
+    method: &str,
+    owner: &terminal::TerminalOwner,
+) -> bool {
+    let Some(authority) = authority else {
+        return true;
+    };
+    if authority.allows_terminal(owner).await {
+        true
+    } else if let Some(session_id) = owner.session_id() {
+        let parent = payload
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(parent) = parent else {
+            exit_failure(
+                tx,
+                id,
+                &format!("{method}: session terminal owner requires its parent threadId"),
+            );
+            return false;
+        };
+        let parent_owner = terminal::TerminalOwner::thread(parent);
+        if !authority.allows_terminal(&parent_owner).await {
+            exit_failure(
+                tx,
+                id,
+                &format!("{method}: terminal owner is not authorized on this connection"),
+            );
+            return false;
+        }
+        match state.rt.sessions_for_thread(parent).await {
+            Ok(sessions) if sessions.iter().any(|s| s == session_id) => {
+                authority.grant_terminal(owner).await;
+                true
+            }
+            Ok(_) => {
+                exit_failure(
+                    tx,
+                    id,
+                    &format!("{method}: session terminal owner is not bound to parent thread"),
+                );
+                false
+            }
+            Err(e) => {
+                exit_failure(
+                    tx,
+                    id,
+                    &format!("{method}: terminal owner session map is unreadable: {e}"),
+                );
+                false
+            }
+        }
+    } else {
+        exit_failure(
+            tx,
+            id,
+            &format!("{method}: terminal owner is not authorized on this connection"),
+        );
+        false
+    }
+}
+
 /// Fail a request with a DECLARED, tagged error from the RPC's error channel.
 ///
 /// Distinct from [`exit_failure`], which reports a `Die` defect — an unexpected
@@ -2147,7 +2236,7 @@ async fn checkpoint_stack(
 /// absolute roots (a worktree, a container mount) and the runtime data dir is
 /// named relative to it either way.
 fn agent_data_excludes() -> Vec<String> {
-    let (_, agent_data) = workspace_paths();
+    let (_, agent_data) = paths::workspace_paths();
     let name = agent_data
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -2419,7 +2508,12 @@ async fn open_diag_history(agent_data: &std::path::Path) -> agent_sdk_metrics::R
         .expect("open the resource history")
 }
 
-async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, state: &AppState) {
+async fn handle_request(
+    frame: &Value,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    state: &AppState,
+    authority: Option<&WsAuthority>,
+) {
     let method = frame.get("tag").and_then(|t| t.as_str()).unwrap_or("");
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     let payload = frame.get("payload").cloned().unwrap_or(json!({}));
@@ -2774,6 +2868,11 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         "orchestration.subscribeThread" => {
             if let Some(thread_id) = payload.get("threadId").and_then(|t| t.as_str()) {
                 tracing::info!(%thread_id, "subscribeThread");
+                if let Some(authority) = authority {
+                    authority
+                        .grant_terminal(&terminal::TerminalOwner::thread(thread_id))
+                        .await;
+                }
                 // RESUME: a client that already holds a snapshot passes its
                 // sequence and gets only what it missed. Re-sending the whole
                 // thread on every reconnect is what this contract field exists
@@ -3965,9 +4064,14 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             }
         }
 
-        "filesystem.browse" => match projects::browse(&payload, &state.cwd) {
-            Ok(v) => exit_success(tx, &id, v),
-            Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
+        "filesystem.browse" => match req_cwd(&payload, &state).await {
+            Ok(cwd) => match projects::browse(&payload, &cwd) {
+                Ok(v) => exit_success(tx, &id, v),
+                Err((failure, message)) => {
+                    exit_failure(tx, &id, &format!("{message} ({failure})"))
+                }
+            },
+            Err(e) => exit_failure(tx, &id, &e),
         },
         // Launching an editor is a HOST process with a path argument, so it
         // takes the same admission as every other path-bearing RPC: without it a
@@ -4096,6 +4200,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.open: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let thread = owner.thread_id().unwrap_or("").to_string();
             let (cwd, worktree) = match state
                 .admit_pane_dir(
@@ -4161,6 +4268,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
@@ -4181,6 +4291,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
@@ -4210,6 +4323,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
@@ -4239,6 +4355,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let killed = match state.terminals.close(&owner, &term).await {
                 Ok(killed) => killed,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
@@ -4268,6 +4387,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.attach: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let thread = owner.thread_id().unwrap_or("").to_string();
             let (cwd, worktree) = match state
                 .admit_pane_dir(
@@ -4328,6 +4450,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalEvents: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &owner).await {
+                return;
+            }
             let thread = owner.thread_id().unwrap_or("").to_string();
             // Terminal-events fanout is on the SDK's generic named-topic
             // seam; the pump below carries every lifecycle frame to this
@@ -4409,6 +4534,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("subscribeTerminalMetadata: {e}")),
             };
+            if !terminal_authorized(authority, state, &payload, tx, &id, method, &thread_owner).await {
+                return;
+            }
             let thread = thread_owner.thread_id().unwrap_or("").to_string();
             // the agent's shell is always listed — it is the pane a human most
             // wants to find, and it exists whether or not anyone opened it.

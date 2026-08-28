@@ -122,12 +122,17 @@ interface Fixtures {
 export const test = base.extend<Record<string, never>, Fixtures>({
   backend: [
     async ({}, use) => {
-      const bin = join(REPO, "backend", "target", "debug", "t3code-server");
-      const agentBin = join(REPO, "backend", "target", "debug", "t3code-agent");
+      const bin =
+        process.env.T3CODE_E2E_SERVER_BIN ??
+        join(REPO, "backend", "target", "debug", "t3code-server");
+      const agentBin =
+        process.env.T3CODE_E2E_AGENT_BIN ??
+        join(REPO, "backend", "target", "debug", "t3code-agent");
       if (!existsSync(bin) || !existsSync(agentBin)) {
         throw new Error(
           `the Rust backend is not built. Run:\n` +
             `  cd ${join(REPO, "backend")} && cargo build --bin t3code-server --bin t3code-agent\n` +
+            `or set T3CODE_E2E_SERVER_BIN and T3CODE_E2E_AGENT_BIN to the built binaries.\n` +
             `Missing: ${!existsSync(bin) ? bin : ""} ${!existsSync(agentBin) ? agentBin : ""}`,
         );
       }

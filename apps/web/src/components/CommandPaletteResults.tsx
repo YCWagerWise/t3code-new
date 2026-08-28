@@ -130,7 +130,10 @@ function DisabledCommandPaletteResultRow(props: {
   item: CommandPaletteActionItem | CommandPaletteSubmenuItem;
 }) {
   return (
-    <div className="flex min-h-8 select-none items-center gap-2 rounded-sm px-2 py-1.5 text-base opacity-64 sm:min-h-7 sm:text-sm">
+    <div
+      className="flex min-h-8 select-none items-center gap-2 rounded-sm px-2 py-1.5 text-base opacity-64 sm:min-h-7 sm:text-sm"
+      data-command-palette-command={props.item.shortcutCommand ?? undefined}
+    >
       {props.item.icon}
       {props.item.description || props.item.threadContentMatch ? (
         <span className="flex min-w-0 flex-1 flex-col">
@@ -171,6 +174,7 @@ function CommandPaletteResultRow(props: {
   return (
     <CommandItem
       value={props.item.value}
+      data-command-palette-command={props.item.shortcutCommand ?? undefined}
       className={cn(
         "cursor-pointer gap-2 hover:bg-transparent hover:text-inherit data-highlighted:bg-transparent data-highlighted:text-inherit data-selected:bg-transparent data-selected:text-inherit [&[data-highlighted][data-selected]]:bg-transparent [&[data-highlighted][data-selected]]:text-inherit",
         props.isActive && "bg-accent! text-accent-foreground!",

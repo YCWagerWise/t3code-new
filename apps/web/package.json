@@ -9,7 +9,11 @@
     "build": "vp build",
     "preview": "vp preview",
     "typecheck": "tsgo --noEmit",
-    "test": "vp test run --passWithNoTests --project unit"
+    "test": "vp test run --passWithNoTests --project unit",
+    "e2e:terminal-new": "playwright test e2e/actions/terminal-new.spec.ts",
+    "e2e:commandpalette-toggle": "playwright test e2e/actions/commandpalette-toggle.spec.ts",
+    "e2e:projects-files-assets-14": "playwright test e2e/actions/projects-files-assets-14.spec.ts",
+    "e2e:vcs-sourcecontrol-git-16": "playwright test e2e/actions/vcs-sourcecontrol-git-16.spec.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",

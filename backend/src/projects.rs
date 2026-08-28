@@ -723,12 +723,9 @@ mod tests {
 /// Directory completion for a path input (the "where should this project live"
 /// picker), NOT a project file listing.
 ///
-/// This one deliberately reaches outside the workspace: its whole job is
-/// choosing a directory that is not a project yet, so confining it to the
-/// current root would make "add an existing folder" impossible. What it will
-/// not do is read files or follow a partial path into somewhere unreadable —
-/// it lists DIRECTORIES under an existing parent, and says which failure it
-/// hit so the UI can explain itself (#72).
+/// This one is confined to the admitted workspace root. Letting an absolute
+/// `partialPath` replace that root made this the only path-bearing RPC that
+/// could enumerate `/`, `/etc`, or a user's home directory.
 pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String)> {
     let partial = input
         .get("partialPath")
@@ -761,6 +758,14 @@ pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String
     } else {
         std::path::Path::new(cwd).join(&expanded)
     };
+    let root = normalize_path(std::path::Path::new(cwd));
+    let confined = normalize_path(&candidate);
+    if !confined.starts_with(&root) {
+        return Err((
+            "path_escapes_workspace".into(),
+            "path escapes the workspace".into(),
+        ));
+    }
 
     // A trailing separator means "inside this directory"; anything else means
     // "complete this last segment within its parent".
@@ -806,6 +811,22 @@ pub fn browse(input: &Value, default_cwd: &str) -> Result<Value, (String, String
     });
     entries.truncate(500);
     Ok(json!({ "parentPath": parent.to_string_lossy(), "entries": entries }))
+}
+
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // ── shell.openInEditor ───────────────────────────────────────────────────────

@@ -111,7 +111,9 @@ function ChatRouteGlobalShortcuts() {
       if (command === "preview.toggle") {
         event.preventDefault();
         event.stopPropagation();
-        if (!routeThreadRef) return;
+        // Runtime capability is independent of thread context. The default
+        // draft route has no route thread, but this shortcut is advertised
+        // without a `when` guard, so it must still give visible feedback.
         if (!isPreviewSupportedInRuntime()) {
           toastManager.add(
             stackedThreadToast({
@@ -122,6 +124,7 @@ function ChatRouteGlobalShortcuts() {
           );
           return;
         }
+        if (!routeThreadRef) return;
         dispatchPreviewAction("toggle-panel");
         return;
       }
