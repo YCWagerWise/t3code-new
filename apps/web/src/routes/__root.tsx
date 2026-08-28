@@ -76,10 +76,44 @@ export const Route = createRootRoute({
       };
     }
 
-    const authGateState = await resolveInitialServerAuthGateState();
-    return {
-      authGateState,
-    };
+    // #27: A THROW HERE RENDERS NOTHING AT ALL.
+    //
+    // This is `beforeLoad` of the ROOT route, and a route's own `errorComponent`
+    // does not catch a throw from its own `beforeLoad` — TanStack unwinds past
+    // it to the outer CatchBoundary, which has nothing to render. So the fully
+    // built error screen 200 lines below (`RootRouteErrorView`: a message, a
+    // Try again button, a Reload button, expandable details) was UNREACHABLE for
+    // the single most likely startup failure, and the user got an EMPTY BLACK
+    // DOCUMENT instead. Measured: `read_page` returns `text: ""` with the title
+    // still set, while the console carries a complete diagnosis nobody sees.
+    //
+    // How it is reached in normal use, no exotic state required: the backend is
+    // simply not listening yet. `pnpm dev` serves the web immediately while the
+    // Rust backend is still compiling — minutes on a cold build — and every
+    // request 502s. `retryTransientBootstrap` correctly classifies 502 as
+    // transient and retries, but its budget is BOOTSTRAP_RETRY_TIMEOUT_MS =
+    // 15_000, which is two to three orders of magnitude short of a cold cargo
+    // build. It gives up, throws, and the app is blank until a manual reload.
+    // The same path fires whenever the backend restarts and takes over 15s.
+    //
+    // Raising the constant is the wrong fix: it would make the blank window last
+    // longer rather than stop being blank. The fix is that an unreachable
+    // backend is a STATE THIS APP CAN RENDER, not an exception that escapes the
+    // router. So: catch it, and hand the root component something to show.
+    try {
+      const authGateState = await resolveInitialServerAuthGateState();
+      return {
+        authGateState,
+      };
+    } catch (error) {
+      return {
+        authGateState: {
+          status: "environment-unreachable",
+          errorMessage: errorMessage(error),
+          errorDetails: errorDetails(error),
+        } as const,
+      };
+    }
   },
   component: RootRouteView,
   errorComponent: RootRouteErrorView,
@@ -108,6 +142,24 @@ function RootRouteView() {
         <DocumentTitleSync />
         <Outlet />
       </>
+    );
+  }
+
+  // #27: the backend could not be reached at boot. Render the error screen this
+  // file already has instead of an empty document. Placed BEFORE the generic
+  // not-authenticated branch because that one renders `<Outlet />`, and the
+  // child route cannot render anything useful without an environment either —
+  // which is the other half of how this failure ended up looking like a blank
+  // page rather than a message.
+  if (authGateState.status === "environment-unreachable") {
+    return (
+      <AppErrorScreen
+        title="Can't reach the backend."
+        message={authGateState.errorMessage}
+        details={authGateState.errorDetails}
+        onRetry={() => window.location.reload()}
+        retryLabel="Retry"
+      />
     );
   }
 
@@ -252,9 +304,38 @@ function HostedStaticEnvironmentBootstrap() {
 }
 
 function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
-  const message = errorMessage(error);
-  const details = errorDetails(error);
+  return (
+    <AppErrorScreen
+      title="Something went wrong."
+      message={errorMessage(error)}
+      details={errorDetails(error)}
+      onRetry={() => reset()}
+      retryLabel="Try again"
+    />
+  );
+}
 
+/// #27: the error screen, extracted so it is reachable from more than one place.
+///
+/// It was previously inlined in `RootRouteErrorView`, which the router only
+/// mounts for errors thrown BELOW the root route. A failure in the root's own
+/// `beforeLoad` unwinds past it, so this whole screen — which is well built and
+/// says everything a user needs — could not be shown for the most common startup
+/// failure there is. Nothing about the markup changed; it just has two callers
+/// now instead of one.
+function AppErrorScreen({
+  title,
+  message,
+  details,
+  onRetry,
+  retryLabel,
+}: {
+  title: string;
+  message: string;
+  details: string;
+  onRetry: () => void;
+  retryLabel: string;
+}) {
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10 text-foreground sm:px-6">
       <div className="pointer-events-none absolute inset-0 opacity-80">
@@ -267,13 +348,13 @@ function RootRouteErrorView({ error, reset }: ErrorComponentProps) {
           {APP_DISPLAY_NAME}
         </p>
         <h1 className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">
-          Something went wrong.
+          {title}
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{message}</p>
 
         <div className="mt-5 flex flex-wrap gap-2">
-          <Button size="sm" onClick={() => reset()}>
-            Try again
+          <Button size="sm" onClick={onRetry}>
+            {retryLabel}
           </Button>
           <Button size="sm" variant="outline" onClick={() => window.location.reload()}>
             Reload app

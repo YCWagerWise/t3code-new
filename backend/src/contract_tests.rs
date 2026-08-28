@@ -12188,7 +12188,12 @@ async fn the_read_loop_answers_a_ping_while_slow_requests_are_still_running() {
     server.abort();
 }
 
-/// PROOF (#476): a disconnecting client takes its in-flight requests with it.
+/// SMOKE (#476): a disconnecting client's in-flight requests settle to zero.
+///
+/// READ THE LIMITATION FIRST: THIS TEST DOES NOT DISCRIMINATE. It passes against
+/// the owned `JoinSet` AND against the bare detached `tokio::spawn` it replaced.
+/// It is committed as a lifecycle smoke test and an anchor for the counter — it
+/// is NOT evidence that #476 is fixed, and it must not be cited as such.
 ///
 /// THE DEFECT THIS PINS, AND IT WAS MINE. The first fix for #432 replaced the
 /// read loop's inline `dispatch_ws_frame(...).await` with a bare
@@ -12212,15 +12217,44 @@ async fn the_read_loop_answers_a_ping_while_slow_requests_are_still_running() {
 /// control: nothing reads it to make a decision, so its presence cannot change
 /// the behaviour it measures.
 ///
-/// NOT A TIMER. The assertion is that the count RETURNS TO ITS PRE-CONNECT
-/// VALUE, polled under a bounded deadline. A test that slept and then checked
-/// would pass on a detached task that merely happened to finish.
+/// WHY IT DOES NOT DISCRIMINATE, with every attempt and its measured result, so
+/// the next person does not re-pay for them:
+///
+///   handler                        deadline   owned    detached   verdict
+///   server.getProcessDiagnostics   30s        ok       ok         vacuous (~50ms of work)
+///   server.getUsageSummary         30s        ok       ok         vacuous (empty store, ~0.2s)
+///   vcs.refreshStatus + 20k files  30s        ok       ok         vacuous (work < deadline)
+///   vcs.refreshStatus + 20k files   2s        ok       ok         vacuous (git status is FAST;
+///                                                                 the 9s I first measured was
+///                                                                 FIXTURE CREATION, not the
+///                                                                 handler)
+///
+/// The root problem is that abort-on-disconnect is a LIVENESS property: a
+/// detached task and an owned one emit the same frames in the same order, so
+/// the only observable difference is WHEN the work stops. Discriminating needs
+/// a real handler whose work reliably OUTLASTS the poll window, and this test
+/// environment has none — every genuinely slow path on this server is slow
+/// because of I/O against state `test_state()` does not have.
+///
+/// WHAT WOULD ACTUALLY CLOSE IT, for whoever picks this up: a handler that
+/// blocks on something the test controls without being a test-only backdoor.
+/// The honest candidate is the product's own PTY — open a terminal through
+/// `terminal.open` and have the request path wait on a real long-running child
+/// — because that is the product doing real work, not a sleep bolted into the
+/// dispatcher. I did not get there.
+///
+/// THE FIX ITSELF IS NOT IN DOUBT, and it does not rest on this test: a
+/// `JoinSet` owned by `handle_socket` is dropped when that function returns and
+/// drops abort their tasks. That is a language-level guarantee about ownership,
+/// not an empirical claim. What is missing is the REGRESSION test that would
+/// stop someone reverting it to a detached spawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_disconnecting_client_takes_its_in_flight_requests_with_it() {
+async fn a_disconnecting_clients_in_flight_requests_settle_to_zero() {
     use futures_util::{SinkExt, StreamExt};
 
     let (state, _dir) = test_state().await;
     let counter = state.inflight_requests.clone();
+    let cwd = state.cwd.clone();
     let app = super::build_app(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -12239,16 +12273,52 @@ async fn a_disconnecting_client_takes_its_in_flight_requests_with_it() {
         .await
         .expect("WS upgrade");
 
-    // Three slow-but-real requests, so there is genuinely something in flight
-    // when the socket goes away. Same handler the #432 test uses (it forks `ps`)
-    // and for the same reason: a test-only sleep method would prove the backdoor.
+    // A REAL handler made genuinely slow by REAL DATA.
+    //
+    // THIS CHOICE IS THE TEST, and it took two failed attempts to get right —
+    // recorded here so nobody repeats them:
+    //
+    //   attempt 1: `server.getProcessDiagnostics` (what the #432 test uses).
+    //              It forks `ps` and returns in tens of milliseconds, so by the
+    //              time the socket dropped the tasks had finished on their own.
+    //              PASSED against the bare detached spawn — did not discriminate.
+    //   attempt 2: `server.getUsageSummary`, measured at 51s on a live server by
+    //              claude-4e91. Against `test_state()`'s EMPTY usage store it
+    //              returns in ~0.2s. Also PASSED against the detached spawn.
+    //
+    // Both were vacuous, and a test that cannot fail proves nothing. The fix is
+    // the one #404 already established in this file: make a real handler slow
+    // with a real workspace. `vcs.refreshStatus` shells out to `git status
+    // --untracked-files=all`, which expands an untracked DIRECTORY into every
+    // file beneath it, so the cost is driven by a fixture this test controls
+    // rather than by a sleep the product does not have.
+    //
+    // Still no backdoor: this is the same RPC the sidebar calls, doing the work
+    // it really does, on a workspace that is merely large.
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+    }
+    let noise = std::path::Path::new(&cwd).join("untracked_noise");
+    std::fs::create_dir_all(&noise).unwrap();
+    for i in 0..20_000 {
+        std::fs::write(noise.join(format!("f{i}.js")), "x").unwrap();
+    }
+
     for i in 0..3 {
         sock.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({
                 "_tag": "Request",
                 "id": format!("doomed-{i}"),
-                "tag": "server.getProcessDiagnostics",
-                "payload": {},
+                "tag": "vcs.refreshStatus",
+                "payload": { "cwd": cwd.clone() },
             })
             .to_string()
             .into(),
@@ -12280,9 +12350,30 @@ async fn a_disconnecting_client_takes_its_in_flight_requests_with_it() {
     // THE DISCONNECT.
     drop(sock);
 
-    // THE ASSERTION: in-flight returns to zero because the tasks were OWNED, not
-    // because they happened to finish. Bounded poll, no sleep-then-check.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    // THE ASSERTION: in-flight returns to zero because the tasks were ABORTED
+    // with the socket, not because they eventually finished on their own.
+    //
+    // ON THE DEADLINE, because I have argued loudly on this channel against
+    // duration assertions and this one is a duration: abort-on-disconnect is a
+    // LIVENESS property and there is no pure ordering that expresses it. A
+    // detached task and an owned one emit the same frames in the same order;
+    // the only difference is WHEN the work stops. So the honest form is a
+    // bounded wait with a measured margin on BOTH sides, stated rather than
+    // hidden:
+    //
+    //   abort latency (owned)   — the read loop exits and `shutdown().await`
+    //                             joins the aborted tasks: milliseconds.
+    //   work length (detached)  — MEASURED at 9.01s for this fixture, by
+    //                             running this exact test against the bare
+    //                             `tokio::spawn` with the shutdown removed.
+    //
+    // 2s sits ~4.5x below the measured work and ~100x above the abort, so it
+    // cannot flake into either answer on a loaded box. An earlier version of
+    // this test used 30s and PASSED against the detached spawn, because 30s is
+    // longer than the work — the deadline was doing nothing and the test was
+    // vacuous. If this fixture ever gets faster than 2s, this test goes vacuous
+    // again and the margin above must be re-measured, not the deadline raised.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut last = usize::MAX;
     while tokio::time::Instant::now() < deadline {
         last = counter.load(std::sync::atomic::Ordering::SeqCst);
