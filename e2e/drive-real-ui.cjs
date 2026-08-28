@@ -2,7 +2,25 @@ const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const ROOT = process.cwd();
-const { chromium } = require(path.join(ROOT, "apps/desktop/node_modules/playwright-core"));
+// Resolve playwright-core BY NAME first. Whether pnpm hoists it to the workspace
+// root or leaves it under apps/desktop is an install detail, and a hardcoded
+// path makes this rig fail in a fresh checkout for a reason that has nothing to
+// do with the app — which is the entire class of bug #437 is about.
+const { chromium } = (() => {
+  const tried = [];
+  for (const cand of [
+    "playwright-core",
+    path.join(ROOT, "node_modules/playwright-core"),
+    path.join(ROOT, "apps/desktop/node_modules/playwright-core"),
+  ]) {
+    try {
+      return require(cand);
+    } catch (e) {
+      tried.push(cand + ": " + String(e.message).split("\n")[0]);
+    }
+  }
+  throw new Error("playwright-core is not installed in this checkout.\ntried:\n  " + tried.join("\n  "));
+})();
 // Resolve the browser through playwright-core's own registry. A hardcoded
 // absolute path pins the rig to one user's home and one chromium build, which is
 // why it cannot run on the build box.
@@ -54,20 +72,62 @@ function startServer() {
   return new Promise((resolve, reject) => {
     // The workspace bin dir must be on PATH or dev-runner dies with `spawn vp ENOENT`.
     const binDir = path.join(ROOT, "node_modules", ".bin");
-    const env = { ...process.env, PATH: binDir + path.delimiter + process.env.PATH };
+    // ...and cargo's, for the same reason: dev-backend spawns
+    // `cargo run --release`, and on the build box cargo is not on the login PATH
+    // (it lives in ~/.cargo/bin). Without this the runner dies with
+    // `spawn cargo ENOENT` — the same defect as `spawn vp ENOENT`, one process
+    // further down.
+    const cargoBin = path.join(
+      process.env.CARGO_HOME || path.join(require("os").homedir(), ".cargo"),
+      "bin",
+    );
+    const env = {
+      ...process.env,
+      PATH: binDir + path.delimiter + cargoBin + path.delimiter + process.env.PATH,
+    };
     if (!env.T3CODE_BACKEND) env.T3CODE_BACKEND = "rust";
     const p = spawn("node", ["scripts/dev-runner.ts", "dev"], { cwd: ROOT, env });
     let out = "";
     let url = null,
       pair = null;
+    // PAIRING IS OPTIONAL AND MUST NOT BE A BOOT PRECONDITION.
+    //
+    // This used to resolve only when BOTH `url` and `pair` had been seen. A
+    // single-origin localhost `pnpm dev` in browser mode prints NO `pairingUrl:`
+    // line at all — its entire output is the runner banner plus Vite's `Local:`
+    // line — so the rig waited out its full 240s and reported "no url/pair",
+    // which reads as "the app did not start" for an app that started fine and is
+    // listening. That misreading is exactly what #437 is about: the rig failing
+    // for a reason unrelated to the app, and the failure being attributed to the
+    // app (or to the driver's capabilities).
+    //
+    // Boot on the line that always exists. Give pairing a short grace period
+    // after the URL appears, since when a deployment DOES pair, the pairing line
+    // follows the Vite banner rather than preceding it.
+    const PAIR_GRACE_MS = 5000;
+    let settled = false;
+    let graceTimer = null;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      clearTimeout(graceTimer);
+      resolve({ proc: p, url, pair, out });
+    };
     const maybe = () => {
-      if (url && pair) {
-        clearTimeout(t);
-        resolve({ proc: p, url, pair, out });
-      }
+      if (!url) return;
+      if (pair) return done();
+      if (graceTimer === null) graceTimer = setTimeout(done, PAIR_GRACE_MS);
     };
     const t = setTimeout(
-      () => reject(new Error("no url/pair in 240s:\n" + out.slice(-1500))),
+      () =>
+        reject(
+          new Error(
+            "dev-runner never printed Vite's `Local:` line in 240s. This is the app " +
+              "failing to boot, not a missing pairing URL — pairing is optional.\n" +
+              out.slice(-1500),
+          ),
+        ),
       240000,
     );
     const scan = (d) => {
@@ -92,7 +152,11 @@ function startServer() {
   try {
     server = await startServer();
     say("SERVER:  " + server.url);
-    say("PAIRING: " + server.pair.replace(/token=.*/, "token=<redacted>"));
+    say(
+      server.pair
+        ? "PAIRING: " + server.pair.replace(/token=.*/, "token=<redacted>")
+        : "PAIRING: none (single-origin localhost dev does not pair — this is normal)",
+    );
 
     browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox"] });
     const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -108,8 +172,13 @@ function startServer() {
       }),
     );
 
-    // PAIR, then land in the app.
-    await page.goto(server.pair, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Pair WHERE THERE IS PAIRING; otherwise the web origin IS the front door.
+    // Hard-requiring the pairing URL is what made this rig unable to reach an
+    // app that was up and serving.
+    await page.goto(server.pair || server.url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
     await page.waitForTimeout(12000);
     say("AFTER PAIR url: " + page.url());
     say("AFTER PAIR title: " + (await page.title()));

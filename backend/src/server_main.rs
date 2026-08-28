@@ -4773,6 +4773,154 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         return;
                     }
                 }
+                // #433 — THE ELEVEN DURABLE THREAD-STATE MUTATIONS.
+                //
+                // These were part of the 15 that fell through `_ => {}` and were
+                // answered `Success({sequence})` while the runtime did nothing.
+                // The default has since been flipped to REFUSE, which stopped the
+                // lie; it did not give the user back archive, pin, snooze, settle
+                // or the mode switches. This implements them.
+                //
+                // EVERY ONE OF THEM IS A DURABLE FIELD PATCH, so every one goes
+                // through `update_thread_meta` rather than growing its own
+                // save/announce path. That helper already does the three things
+                // this finding says were missing — writes the durable row, upserts
+                // the shell projection, and RECORDS a `thread.meta-updated` event
+                // (not merely publishes it, so a client reconnecting with
+                // `afterSequence` catches up instead of showing stale state). Eleven
+                // hand-rolled copies of that sequence is eleven chances to omit the
+                // record, which is #318 all over again.
+                //
+                // The field vocabulary is the contract's, read off
+                // contracts/src/orchestration.ts: `archivedAt`, `settledAt`,
+                // `snoozedUntil`, `pinnedAt` are nullable ISO timestamps — the
+                // un-* commands write `null`, which is why they are patches and
+                // not deletes. `thread.pin.reorder` carries the client's ordering
+                // and is stored as-is on the thread it names.
+                //
+                // NOT IMPLEMENTED HERE, deliberately: `thread.create`,
+                // `thread.delete`, `project.create`, `project.delete`. The finding
+                // says to settle a design divergence first — the backend
+                // synthesizes ONE project (`p-workspace`, server_main.rs:431)
+                // while the frontend is multi-project — and writing create/delete
+                // handlers before that is decided would bake the wrong side in.
+                // They keep REFUSING, visibly, which is the correct state for a
+                // command whose semantics are undecided.
+                Some(
+                    cmd @ ("thread.archive"
+                    | "thread.unarchive"
+                    | "thread.settle"
+                    | "thread.unsettle"
+                    | "thread.snooze"
+                    | "thread.unsnooze"
+                    | "thread.pin"
+                    | "thread.unpin"
+                    | "thread.pin.reorder"
+                    | "thread.runtime-mode.set"
+                    | "thread.interaction-mode.set"),
+                ) => {
+                    let thread_id = thread_id_of(&command);
+                    let now = now_iso();
+                    let patch = match cmd {
+                        "thread.archive" => json!({ "archivedAt": now }),
+                        "thread.unarchive" => json!({ "archivedAt": Value::Null }),
+                        "thread.settle" => json!({ "settledAt": now }),
+                        "thread.unsettle" => json!({ "settledAt": Value::Null }),
+                        // The client names the wake time; refusing an absent one
+                        // is better than inventing a duration the user did not ask
+                        // for and cannot see.
+                        "thread.snooze" => match command.get("snoozedUntil").and_then(Value::as_str)
+                        {
+                            Some(until) if !until.is_empty() => json!({ "snoozedUntil": until }),
+                            _ => {
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    "thread.snooze requires snoozedUntil (an ISO timestamp); \
+                                     refusing to invent a wake time",
+                                );
+                                return;
+                            }
+                        },
+                        "thread.unsnooze" => json!({ "snoozedUntil": Value::Null }),
+                        "thread.pin" => json!({ "pinnedAt": now }),
+                        "thread.unpin" => json!({ "pinnedAt": Value::Null }),
+                        "thread.pin.reorder" => {
+                            match command.get("pinnedOrder").or_else(|| command.get("order")) {
+                                Some(order) => json!({ "pinnedOrder": order }),
+                                None => {
+                                    exit_failure(
+                                        tx,
+                                        &id,
+                                        "thread.pin.reorder requires the new order; refusing to \
+                                         ack a reorder that carries none",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        // The launch modes are the SDK's vocabulary, not free
+                        // text: an unparsed value here is a thread that runs in a
+                        // mode nobody asked for, which is a permission decision.
+                        "thread.runtime-mode.set" => {
+                            let raw = command
+                                .get("runtimeMode")
+                                .or_else(|| command.pointer("/patch/runtimeMode"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let parsed = agent_sdk_shell::RuntimeMode::parse(raw);
+                            // `parse` NEVER FAILS — an unknown string becomes
+                            // `RuntimeMode::Other(s)`, preserved verbatim so a
+                            // newer product's mode is not silently downgraded on
+                            // round-trip (record.rs:49-51). That is right for
+                            // READING a durable row and wrong for accepting a
+                            // client command: `parsed.as_str() != raw` can never
+                            // be true, so comparing them validates nothing. The
+                            // check has to be for the `Other` variant itself.
+                            if matches!(parsed, agent_sdk_shell::RuntimeMode::Other(_)) {
+                                exit_failure(
+                                    tx,
+                                    &id,
+                                    &format!(
+                                        "thread.runtime-mode.set: {raw:?} is not a runtime mode; \
+                                         refusing rather than defaulting a permission gate"
+                                    ),
+                                );
+                                return;
+                            }
+                            json!({ "runtimeMode": parsed.as_str() })
+                        }
+                        "thread.interaction-mode.set" => {
+                            match command
+                                .get("interactionMode")
+                                .or_else(|| command.pointer("/patch/interactionMode"))
+                                .and_then(Value::as_str)
+                                .filter(|m| !m.is_empty())
+                            {
+                                Some(mode) => json!({ "interactionMode": mode }),
+                                None => {
+                                    exit_failure(
+                                        tx,
+                                        &id,
+                                        "thread.interaction-mode.set requires interactionMode",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        // Unreachable: the arm pattern above is the exhaustive
+                        // list. Refusing beats a silent default if it ever drifts.
+                        other => {
+                            exit_failure(tx, &id, &format!("unhandled thread state command {other}"));
+                            return;
+                        }
+                    };
+                    if let Err(e) = update_thread_meta(&state, &thread_id, &patch).await {
+                        tracing::error!(%thread_id, cmd, %e, "thread state command failed");
+                        exit_failure(tx, &id, &format!("{cmd} failed: {e}"));
+                        return;
+                    }
+                }
                 Some("project.meta.update") => {
                     // Durable UPDATE (#370): the old in-memory patch mutated
                     // this process's Vec and evaporated on restart, so a
