@@ -46,6 +46,18 @@
  *
  * If one of those regresses it is a hearth finding, per the task text.
  *
+ * NO CWD OVERRIDE, deliberately. Every pane below omits `cwd` and takes the
+ * backend's own workspace root. The first run of this file on the box passed the
+ * two tests that never open a pane and failed all four that do, in ~100ms each:
+ * `admit_pane_dir` puts every client-supplied cwd through
+ * `vcs::resolve_cwd(p, self.cwd)` (server_main.rs), which ADMITS against the
+ * server's root, and the dev-runner's root is not the directory the test process
+ * happens to be running in. That refusal is the backend behaving correctly — a
+ * pane must not open anywhere a caller names — so the spec should not be
+ * asserting from outside it. A real client does not send a cwd it invented
+ * either. `cd /tmp` inside the persistence test still proves what it needs to,
+ * because it changes directory from wherever the pane legitimately started.
+ *
  * NO SKIPS, per the README: nothing here is `test.skip` or `test.todo`. A
  * behaviour that does not work is a FAILING test plus a finding.
  */
@@ -212,7 +224,7 @@ after(async () => {
 test("all eight methods are implemented, and none of them acks a lie", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-thread", terminalId: "term-e2e-1" };
-  const open = { ...target, cwd: process.cwd(), cols: 200, rows: 50 };
+  const open = { ...target, cols: 200, rows: 50 };
 
   /* --- terminal.open -------------------------------------------------- */
   const snap = await rpc.ok("terminal.open", open);
@@ -303,7 +315,6 @@ test("all eight methods are implemented, and none of them acks a lie", async () 
    * UI report "opened in Zed" having launched nothing, which is the
    * masking-success defect this backend refuses everywhere else.            */
   const editor = await rpc.call("shell.openInEditor", {
-    cwd: process.cwd(),
     editor: "definitely-not-an-editor",
   });
   assert.equal(
@@ -322,7 +333,7 @@ test("the pane is ONE persistent PTY: cd and export survive separate writes", as
    * one, which is exactly why it is a separate test. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-persist", terminalId: "term-persist" };
-  const open = { ...target, cwd: process.cwd(), cols: 200, rows: 50 };
+  const open = { ...target, cols: 200, rows: 50 };
 
   const pid0 = (await rpc.ok("terminal.open", open)).pid;
 
@@ -369,7 +380,7 @@ test("the pane is a real tty: isatty() is true inside it", async () => {
    * fail this one. `[ -t 0 ]` is the smallest honest probe. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-tty", terminalId: "term-tty" };
-  await rpc.ok("terminal.open", { ...target, cwd: process.cwd(), cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...target, cols: 200, rows: 50 });
 
   const screen = await runAndWait(
     rpc,
@@ -406,7 +417,6 @@ test("TerminalTargetInput stays a union: neither-id and both-ids are refused", a
 
   const orphan = await rpc.call("terminal.open", {
     terminalId: "term-orphan",
-    cwd: process.cwd(),
   });
   assert.equal(
     orphan._tag,
@@ -419,7 +429,6 @@ test("TerminalTargetInput stays a union: neither-id and both-ids are refused", a
     threadId: "e2e-c-union",
     sessionId: "s-e2e-c-union",
     terminalId: "term-both",
-    cwd: process.cwd(),
   });
   assert.equal(
     both._tag,
@@ -434,8 +443,8 @@ test("panes are independent: writing to one does not reach the other", async () 
   const rpc = await Rpc.connect(stack.serverPort);
   const a = { threadId: "e2e-c-iso", terminalId: "term-a" };
   const b = { threadId: "e2e-c-iso", terminalId: "term-b" };
-  await rpc.ok("terminal.open", { ...a, cwd: process.cwd(), cols: 200, rows: 50 });
-  await rpc.ok("terminal.open", { ...b, cwd: process.cwd(), cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...a, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...b, cols: 200, rows: 50 });
 
   await runAndWait(rpc, a, `export T3_ONLY_IN_A=1`);
   const inB = await runAndWait(rpc, b, `printf 'A=[%s]' "$T3_ONLY_IN_A"`);
