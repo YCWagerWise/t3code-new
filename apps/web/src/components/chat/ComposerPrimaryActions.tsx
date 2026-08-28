@@ -98,6 +98,11 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
       )}
       {...pointerFocusProps}
       onClick={onInterrupt}
+      // STABLE HANDLE (#443). e2e must not select this by its rendered label:
+      // the composer swaps between send and stop by STATE, and a spec that
+      // matches text cannot tell "the stop button is gone because the turn
+      // ended" from "the label changed".
+      data-testid="composer-stop"
       aria-label="Stop generation"
     >
       <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
@@ -221,6 +226,12 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   const sendButton = (
     <button
       type="submit"
+      // STABLE HANDLE (#443). This button's aria-label is DYNAMIC — it is
+      // "Send message", "Sending", "Connecting", "Preparing worktree",
+      // "Environment disconnected", or whatever `sendDisabledReason` says. Any
+      // e2e selector keyed on that label breaks the moment the state it is
+      // asserting actually occurs, which is exactly when the assertion matters.
+      data-testid="composer-send"
       className={cn(
         "relative isolate flex h-9 w-9 items-center justify-center overflow-hidden rounded-full shadow-xs transition-all duration-150 enabled:cursor-pointer enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 sm:h-8 sm:w-8",
         stageBackdropVariant
