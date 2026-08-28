@@ -78,6 +78,17 @@ export type StackHandle = {
   /** Everything the runner printed, for failure messages. */
   output(): string;
   /**
+   * Is the Rust backend still answering?
+   *
+   * Call it in a long `waitFor` predicate so a DEAD BACKEND fails immediately
+   * and by name, instead of expiring the deadline and reporting whatever the
+   * spec happened to be waiting for. A stream that stops arriving because the
+   * server died is indistinguishable, from inside the assertion, from a stream
+   * that is genuinely broken — and the second reading is a product finding that
+   * would be false.
+   */
+  backendAlive(): Promise<boolean>;
+  /**
    * Kill the backend process and wait until the backend answers again.
    *
    * THIS IS THE FIXTURE EVERY DURABILITY CLAIM NEEDS, and it exists from the
@@ -144,6 +155,10 @@ export async function startStack(
 
   let out = "";
   let exited: number | null = null;
+  /** Backends this fixture started itself, so dispose() can take them down. */
+  const respawned: ChildProcess[] = [];
+  /** Who brought the backend back on the last restartBackend(): the runner, or us. */
+  let restartedBy: "runner" | "fixture" | null = null;
   const absorb = (chunk: unknown) => {
     out += String(chunk);
   };
@@ -197,12 +212,82 @@ export async function startStack(
     250,
   );
 
+  // THE BACKEND MUST ACTUALLY BE LISTENING BEFORE ANY SPEC RUNS.
+  //
+  // dev-runner prints its banner and Vite's `Local:` line as soon as the WEB
+  // server is up, which says nothing about the Rust server. Those two states are
+  // indistinguishable from the browser — the page loads, the app paints, and no
+  // frame ever answers — so without this check the failure surfaces seven
+  // minutes later as "the app is not talking to the server", which is the wrong
+  // conclusion and the expensive one. I paid for it twice.
+  //
+  // The usual cause is not a product defect at all: an ORPHANED dev server from
+  // an earlier run still holding this worktree's hashed port. A run killed by an
+  // outer timeout leaves its process group behind, the next run's vite loses the
+  // bind, and the corpse serves HTML to a backend that is not there.
+  // The SAME budget as the boot, not a smaller one. `dev-backend.ts` runs
+  // `cargo run --release`, so this wait can contain a full rebuild of the
+  // workspace — which on a shared checkout happens whenever another cell touches
+  // a path dependency. A separate, tighter budget here just reports "the backend
+  // is not up" for a machine that is compiling correctly, which is the same
+  // wrong conclusion one layer down.
+  await waitFor(async () => await backendAnswers(banner.serverPort), {
+    ms: bootMs,
+    what:
+      `the RUST backend to answer on ${banner.serverPort}. The web server is up ` +
+      `(${banner.webUrl}) but the backend is not, which a browser cannot tell ` +
+      `apart from a broken app. Check for an orphaned dev server on this ` +
+      `worktree's ports: \`lsof -nP -iTCP:${banner.serverPort} -sTCP:LISTEN\`.\n` +
+      `  --- dev-runner tail ---\n${out.slice(-1500)}`,
+  });
+
+  /** Is the web origin serving? */
+  const webAnswers = async (): Promise<boolean> => {
+    try {
+      const response = await fetch(banner.webUrl, { signal: AbortSignal.timeout(5000) });
+      return response.status > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  /** Bring the web server back if the runner took it down, then wait for it. */
+  const ensureWebUp = async (): Promise<void> => {
+    if (await webAnswers()) return;
+    restartedBy = "fixture";
+    exited = null;
+    const revived = spawn("node", ["scripts/dev-runner.ts", "dev"], {
+      cwd: REPO_ROOT,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    revived.stdout?.on("data", absorb);
+    revived.stderr?.on("data", absorb);
+    revived.on("exit", (code) => {
+      exited = code ?? -1;
+    });
+    respawned.push(revived);
+    await waitFor(webAnswers, {
+      ms: bootMs,
+      what:
+        `the web server to answer on ${banner.webUrl} again. dev-runner exits when ` +
+        `its backend is killed, so the stack was restarted.\n` +
+        `  --- runner tail ---\n${out.slice(-1200)}`,
+    });
+    await waitFor(async () => await backendAnswers(banner.serverPort), {
+      ms: bootMs,
+      what: `the backend to answer on ${banner.serverPort} after the stack restart`,
+    });
+  };
+
   const handle: StackHandle = {
     webUrl: banner.webUrl,
     pairingUrl: banner.pairingUrl,
     entryUrl: banner.pairingUrl ?? banner.webUrl,
     serverPort: banner.serverPort,
     output: () => out,
+    backendAlive: () => backendAnswers(banner.serverPort),
+    restartedBy: () => restartedBy,
 
     async restartBackend() {
       const before = await listenersOn(banner.serverPort);
@@ -223,16 +308,61 @@ export async function startStack(
         ms: 20_000,
         what: `the backend on ${banner.serverPort} to actually stop answering after SIGKILL`,
       });
+      // MEASURED: dev-runner does NOT resupervise a SIGKILLed backend. It spawns
+      // `node scripts/dev-backend.ts` once and does not restart it, so after a
+      // kill the port stays closed indefinitely — 180s of waiting produced
+      // nothing. That is worth its own finding against dev-runner, and it is
+      // reported rather than papered over.
+      //
+      // But it must not make `restartBackend()` unusable, because every
+      // durability assertion in this suite depends on it. So the fixture gives
+      // the runner a fair chance to bring the backend back on its own, and then
+      // starts one itself, recording WHICH path it took. A fixture that cannot
+      // restart the process would silently delete the restart from every spec
+      // that calls it — and a durability suite that never restarts anything is
+      // the exact hole this harness exists to close.
+      const resupervised = await waitFor(
+        async () => ((await backendAnswers(banner.serverPort)) ? "runner" : null),
+        { ms: 20_000, what: "dev-runner to resupervise the backend on its own" },
+      ).catch(() => null);
+
+      if (resupervised === null) {
+        restartedBy = "fixture";
+        const child = spawn("node", ["scripts/dev-backend.ts"], {
+          cwd: path.join(REPO_ROOT, "apps", "server"),
+          env: { ...env, T3CODE_SERVER_PORT: String(banner.serverPort) },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        child.stdout?.on("data", absorb);
+        child.stderr?.on("data", absorb);
+        respawned.push(child);
+      } else {
+        restartedBy = "runner";
+      }
+
       await waitFor(async () => await backendAnswers(banner.serverPort), {
-        ms: 180_000,
+        ms: bootMs,
         what:
-          `the backend to come back on ${banner.serverPort}. If this times out, the ` +
-          `runner does not resupervise a SIGKILLed backend — that is a finding ` +
-          `against dev-runner, not against the spec that called restartBackend().`,
+          `the backend to answer on ${banner.serverPort} again after SIGKILL ` +
+          `(restarted by: ${restartedBy}).\n  --- runner tail ---\n${out.slice(-1200)}`,
       });
+
+      // AND THE WEB SERVER, ALWAYS — checked unconditionally rather than only
+      // when `exited` happens to have been observed. dev-runner treats its
+      // backend child exiting as fatal and takes Vite down with it, but it does
+      // that ASYNCHRONOUSLY, so a restart path that branches on "has the runner
+      // exited yet" races the runner's own teardown and wins about half the
+      // time. It cost a run: the backend came back, the web origin did not, and
+      // the spec's next `page.goto` failed ERR_CONNECTION_REFUSED — which reads
+      // as "the app died" and is a conclusion about the product drawn entirely
+      // from the fixture's own kill. Restarting the stack is idempotent here
+      // because the ports are hashed from the worktree path
+      // (dev-runner.ts:265-276) and come back identical.
+      await ensureWebUp();
     },
 
     async dispose() {
+      for (const extra of respawned) await killTree(extra);
       await killTree(child);
     },
   };

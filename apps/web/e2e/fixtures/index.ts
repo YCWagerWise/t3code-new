@@ -95,13 +95,29 @@ export async function openApp(stack: StackHandle): Promise<App> {
 
   // Readiness is "the client has spoken to the backend and been answered",
   // observed on the wire. Not a fixed sleep, and not a CSS class.
+  // SAME BUDGET AS THE NAVIGATION. Giving `goto` 240s and then starving the
+  // readiness wait at 90s is the bug I shipped first: the page loads, the app
+  // paints, and the run dies waiting for a handshake it never allowed time for
+  // — reported as "the app is not talking to the server", which is the wrong
+  // conclusion and the expensive one. Readiness costs at least as much as the
+  // navigation on a cold Vite graph, so it gets at least as much room.
   await waitFor(
     () => wire.frames.some((f) => f.dir === "recv" && f.json?._tag === "Exit"),
     {
-      ms: 90_000,
+      ms: NAV_MS,
       what:
         "the paired client to receive its first Exit frame from the backend " +
-        "(i.e. the app is talking to the server, not just painted)",
+        `(i.e. the app is talking to the server, not just painted).\n` +
+        `  web=${stack.webUrl} serverPort=${stack.serverPort} landed=${page.url()}\n` +
+        `  frames seen: ${wire.frames.length}\n` +
+        // THE RUNNER'S OWN OUTPUT, because the failure is almost never in the
+        // browser. A web server that serves HTML while its backend never bound
+        // its port looks EXACTLY like this from the page: navigation succeeds,
+        // the app paints, and no frame ever answers. Without the runner tail the
+        // only reachable conclusion is "the app is broken", and it is the wrong
+        // one — the usual cause is a stale dev server from an earlier run
+        // holding the port this one wanted.
+        `  --- dev-runner tail ---\n${stack.output().slice(-1500)}`,
     },
   );
 
@@ -113,7 +129,7 @@ export async function openApp(stack: StackHandle): Promise<App> {
       await page.goto(stack.webUrl, { waitUntil: "domcontentloaded", timeout: NAV_MS });
       await waitFor(
         () => wire.frames.some((f) => f.dir === "recv" && f.json?._tag === "Exit"),
-        { ms: 90_000, what: "the reloaded client to be answered by the backend" },
+        { ms: NAV_MS, what: "the reloaded client to be answered by the backend" },
       );
     },
     async close() {
