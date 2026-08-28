@@ -19,7 +19,7 @@ use axum::{
     body::Bytes,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
-    http::{Method, Uri},
+    http::{header::ORIGIN, HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -579,8 +579,41 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_upgrade(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if !ws_origin_allowed(headers.get(ORIGIN).and_then(|v| v.to_str().ok())) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    ws.on_upgrade(move |socket| handle_socket(socket, state)).into_response()
+}
+
+fn ws_origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+
+    let configured = std::env::var("T3CODE_WEB_ORIGIN")
+        .or_else(|_| std::env::var("T3CODE_ALLOWED_ORIGINS"))
+        .unwrap_or_default();
+    if configured
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|allowed| allowed == origin)
+    {
+        return true;
+    }
+
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
+    }
+    matches!(uri.host(), Some("localhost" | "127.0.0.1" | "::1" | "[::1]"))
 }
 
 /// Subscriptions this backend answers with silence rather than data. Anything

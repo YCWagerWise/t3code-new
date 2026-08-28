@@ -1,1 +1,20 @@
+#!/bin/sh
+set -u
+
+before_stash="$(git stash list --format=%gd 2>/dev/null || true)"
+
+check_stash_restored() {
+  status=$?
+  after_stash="$(git stash list --format=%gd 2>/dev/null || true)"
+  if [ "$after_stash" != "$before_stash" ]; then
+    printf '%s\n' "pre-commit refused: vp staged left a git stash behind." >&2
+    printf '%s\n' "Recover it before continuing; hook-created stashes hide agent work from the review cell." >&2
+    git stash list >&2 || true
+    exit 1
+  fi
+  exit "$status"
+}
+
+trap check_stash_restored EXIT INT TERM HUP
+
 vp staged

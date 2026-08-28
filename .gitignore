@@ -43,3 +43,5 @@ node_modules/
 # 282MB of it, regenerated on every run, and one .db already blew past
 # GitHub's 100MB file limit and rejected the push.
 .t3code-agent/
+apps/web/e2e/action-inventory.json
+apps/web/e2e/.last-rust-actions.json

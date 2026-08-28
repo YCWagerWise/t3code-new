@@ -73,6 +73,56 @@ async fn drop_threads_table(state: &AppState) {
     db.execute("DROP TABLE threads", vec![]).await.unwrap();
 }
 
+#[test]
+fn websocket_origin_admission_rejects_cross_site_pages() {
+    assert!(
+        ws_origin_allowed(None),
+        "non-browser websocket clients without Origin must still be admitted"
+    );
+    assert!(
+        ws_origin_allowed(Some("http://localhost:5733")),
+        "the local web app origin must be admitted"
+    );
+    assert!(
+        ws_origin_allowed(Some("http://127.0.0.1:5733")),
+        "loopback app origins must be admitted"
+    );
+    assert!(
+        !ws_origin_allowed(Some("https://evil.example.com")),
+        "browser pages from non-loopback origins must not drive the local backend websocket"
+    );
+    assert!(
+        !ws_origin_allowed(Some("file:///tmp/page.html")),
+        "non-http origins are not valid websocket UI origins"
+    );
+}
+
+#[tokio::test]
+async fn served_websocket_route_rejects_cross_site_origin_before_upgrade() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (state, _dir) = test_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, build_app(state)).await.unwrap();
+    });
+
+    let mut request = format!("ws://{addr}/ws")
+        .into_client_request()
+        .expect("websocket request");
+    request
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+
+    let rejected = tokio_tungstenite::connect_async(request).await.unwrap_err();
+    server.abort();
+    assert!(
+        rejected.to_string().contains("403"),
+        "the served /ws route accepted or non-specifically rejected a browser websocket from a foreign Origin: {rejected}"
+    );
+}
+
 /// #202: break the broker's subscriber table so every `topic_publish` fails.
 ///
 /// The bus rides the SAME runtime isolate as `kv` (`ThreadBus::open_db(rt.db)`),
@@ -2374,6 +2424,64 @@ async fn review_diff_preview_and_file_contents_over_cairn() {
     assert_eq!(
         f[0]["exit"]["value"]["newContents"], "two\n",
         "new = worktree file"
+    );
+}
+
+/// E2E-04: the diff panel source must be the repository tree, not a list of
+/// writes the app believes it performed. This edits one tracked file with sed
+/// and creates another through a shell heredoc entirely outside the backend;
+/// both still have to appear in the working-tree diff preview.
+#[tokio::test]
+async fn review_diff_preview_sees_out_of_band_edit_and_new_file() {
+    let (state, dir) = test_state().await;
+    let sh = |cmd: &str| {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "`{cmd}` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    sh("git init -q");
+    std::fs::write(dir.join("tracked.txt"), "alpha\n").unwrap();
+    sh("git add tracked.txt && git commit -qm init");
+
+    sh("sed -i.bak 's/alpha/bravo/' tracked.txt && rm tracked.txt.bak");
+    sh("cat > heredoc-created.txt <<'EOF'\nfrom heredoc\nEOF");
+
+    let cwd = state.cwd.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(&state, &tx, "review.getDiffPreview", json!({ "cwd": cwd })).await;
+    let frames = drain(&mut rx);
+    let exit = frames
+        .iter()
+        .find(|f| f["_tag"] == "Exit")
+        .expect("getDiffPreview exits");
+    assert_eq!(exit["exit"]["_tag"], "Success", "getDiffPreview ok: {exit:?}");
+    let sources = exit["exit"]["value"]["sources"].as_array().unwrap();
+    assert_eq!(
+        sources.len(),
+        1,
+        "one working-tree source should contain both out-of-band changes: {sources:?}"
+    );
+    let diff = sources[0]["diff"].as_str().unwrap_or_default();
+    assert!(
+        diff.contains("tracked.txt") && diff.contains("-alpha") && diff.contains("+bravo"),
+        "tracked sed edit missing from Cairn-backed diff:\n{diff}"
+    );
+    assert!(
+        diff.contains("heredoc-created.txt") && diff.contains("+from heredoc"),
+        "out-of-band heredoc-created file missing from Cairn-backed diff:\n{diff}"
     );
 }
 
