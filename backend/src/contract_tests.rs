@@ -1165,6 +1165,89 @@ fn only_loopback_origins_may_open_the_control_socket() {
     assert!(!allowed(Some("garbage")), "an unparseable Origin is refused, not trusted");
 }
 
+/// The server.* RPCs this runtime does NOT implement must SAY SO, and the set
+/// may only shrink.
+///
+/// Seven of the settings surface's methods are absent from `server_main.rs`:
+/// server.probe, server.updateServer, server.updateServerWithProgress,
+/// server.signalProcess, server.getBackgroundPolicy,
+/// server.reportHostPowerState, server.retryResourceTelemetry.
+///
+/// Absent is FINE. Absent-and-silent is not. This file's own doctrine says
+/// "Genuinely unimplemented RPCs FAIL explicitly rather than returning a
+/// masking Success(null)", because a method that answers Success(null) is
+/// indistinguishable at the glass from one that worked — the UI renders an
+/// affordance, the user clicks it, nothing happens, and nothing anywhere says
+/// why. This pins that doctrine for the methods it currently applies to.
+///
+/// The ratchet is the point: implementing one of these makes this test fail
+/// with "lower the constant", which is the only moment anyone edits it, and
+/// LOSING an implementation fails it the other way.
+#[tokio::test]
+async fn unimplemented_server_rpcs_refuse_explicitly_instead_of_faking_success() {
+    let (state, _d) = test_state().await;
+
+    let absent = [
+        "server.probe",
+        "server.updateServer",
+        "server.updateServerWithProgress",
+        "server.signalProcess",
+        "server.getBackgroundPolicy",
+        "server.reportHostPowerState",
+        "server.retryResourceTelemetry",
+    ];
+
+    let mut refused: Vec<&str> = Vec::new();
+    let mut answered: Vec<&str> = Vec::new();
+    for method in absent {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(&state, &tx, method, json!({})).await;
+        let frames = drain(&mut rx);
+        let text = format!("{frames:?}");
+        // "unsupported method" is the catch-all naming itself. A method that
+        // exists but errors for want of real state is a DIFFERENT fact and is
+        // not counted here.
+        if text.contains("unsupported method") {
+            refused.push(method);
+        } else {
+            answered.push(method);
+        }
+    }
+
+    println!("REFUSED as unsupported ({}): {refused:?}", refused.len());
+    println!("ANSWERED ({}): {answered:?}", answered.len());
+
+    // A Success(null) here is the exact failure the doctrine forbids: the UI
+    // renders the affordance, the user clicks it, nothing happens, and nothing
+    // says why. So an ANSWERED method is only acceptable if it genuinely became
+    // implemented, which the ratchet below forces someone to declare.
+    assert!(
+        answered.is_empty(),
+        "these server.* RPCs answered instead of refusing as unsupported: {answered:?}. \
+         If they were implemented, lower KNOWN_ABSENT below in the same commit. If they \
+         are returning a masking Success(null), that is the defect this test exists for."
+    );
+
+    const KNOWN_ABSENT: usize = 7;
+    assert!(
+        refused.len() <= KNOWN_ABSENT,
+        "more server.* RPCs are unimplemented than before ({} > {}). One LOST its \
+         implementation, and the settings UI will keep offering it. Refused: {:?}",
+        refused.len(),
+        KNOWN_ABSENT,
+        refused,
+    );
+    assert!(
+        refused.len() >= KNOWN_ABSENT,
+        "only {} of the {} known-absent server.* RPCs still refuse. That is GOOD — one gained \
+         an implementation. Lower KNOWN_ABSENT to {} in this commit. Now answering: {:?}",
+        refused.len(),
+        KNOWN_ABSENT,
+        refused.len(),
+        answered,
+    );
+}
+
 /// #462: DUPLICATE DECIDER AUTHORITY, made red instead of merely known.
 ///
 /// There are two deciders for one command set.
