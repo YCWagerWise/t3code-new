@@ -226,6 +226,74 @@ export class Wire {
     };
   }
 
+  /**
+   * Every thread event this page received, newest last, as
+   * `{type, payload, occurredAt, sequence, at}` where `at` is the wall-clock
+   * millisecond THIS BROWSER saw the frame.
+   *
+   * Thread events arrive nested — `Chunk -> values[] -> {kind:"event", event:{...}}`
+   * (agent-sdk-shell/src/thread.rs:794-807) — and a reader that forgets the
+   * nesting silently sees nothing rather than failing, which is the quietest
+   * possible way for a spec to pass over an empty set.
+   */
+  threadEvents(): Array<{
+    readonly type: string;
+    readonly payload: any;
+    readonly occurredAt: string | null;
+    readonly sequence: number | null;
+    readonly at: number;
+  }> {
+    const out: Array<any> = [];
+    for (const frame of this.frames) {
+      if (frame.dir !== "recv" || frame.json?._tag !== "Chunk") continue;
+      const values = Array.isArray(frame.json.values) ? frame.json.values : [];
+      for (const value of values) {
+        const event = value?.event ?? (value?.type ? value : null);
+        if (!event?.type) continue;
+        out.push({
+          type: String(event.type),
+          payload: event.payload ?? {},
+          occurredAt: typeof event.occurredAt === "string" ? event.occurredAt : null,
+          sequence: typeof event.sequence === "number" ? event.sequence : null,
+          at: frame.at,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * HOW LATE WAS THIS EVENT? Milliseconds between the timestamp the SERVER
+   * stamped on the event and the moment this browser received the frame.
+   *
+   * MEASURE SETTLEMENT AGAINST THE EVENT'S OWN CLOCK, NEVER AGAINST WALL-CLOCK
+   * PATIENCE. A turn was measured starting and failing 88ms apart — `updatedAt`
+   * 48.499 and 48.587 in its own two payloads — while the settling
+   * `thread.session-set idle` did not reach the client until 25.00s, because the
+   * tail parked, was never woken by the publication, and returned on its own
+   * `Duration::from_secs(25)` timeout (server_main.rs:1658). The UI spun for
+   * twenty-five seconds on a turn that finished in a tenth of a second.
+   *
+   * A spec asserting "the spinner eventually stops" PASSES that. A spec
+   * asserting "the spinner stopped within 2s of the turn's own updatedAt"
+   * catches it, and needs no magic threshold, because the payload carries the
+   * server's timestamp and the lag can simply be computed.
+   *
+   * This is also what retires the "is it slow, or is it hung" argument: it is
+   * neither — it is a timer, and a delivery lag that keeps landing on a round
+   * number equal to a timeout constant is the signature. Report a lag that
+   * matches a timeout as a LOST WAKE-UP, not as latency.
+   */
+  deliveryLagMs(event: { readonly payload: any; readonly occurredAt: string | null; readonly at: number }): number | null {
+    // `updatedAt` on the payload is the fact the event is ABOUT; `occurredAt` is
+    // when the event was recorded. Prefer the former — it is the one that shows
+    // a turn having already finished long before anyone was told.
+    const stamped = event.payload?.updatedAt ?? event.occurredAt;
+    if (typeof stamped !== "string") return null;
+    const t = Date.parse(stamped);
+    return Number.isNaN(t) ? null : event.at - t;
+  }
+
   /** A short, quotable transcript for a failure message or an evidence blob. */
   transcript(limit = 40): string {
     return this.frames
