@@ -360,6 +360,30 @@ fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, Strin
     (ask, instructions)
 }
 
+/// The client renders the environment row from these and, more importantly,
+/// picks platform-conditional behaviour off them. They were hardcoded to
+/// `darwin`/`arm64`, which is simply false everywhere else — the Linux build
+/// box reports itself as a Mac. Derived from the compile target instead, so the
+/// binary cannot describe a machine it is not running on.
+///
+/// Mapped to the Node `process.platform`/`process.arch` vocabulary the contract
+/// is written in, because that is the alphabet the client already decodes:
+/// Rust says `macos`/`aarch64`, Node says `darwin`/`arm64`.
+fn server_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn server_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
+}
+
 /// Where the agent works, and where its durable state lives.
 fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let root = std::env::var("T3CODE_WORKSPACE")
@@ -758,7 +782,7 @@ fn option_descriptor(d: &agent_sdk_provider::ProviderOptionDescriptor) -> Option
 }
 
 fn environment_descriptor() -> Value {
-    json!({ "environmentId": "local", "label": "Local (Rust)", "platform": { "os": "darwin", "arch": "arm64" }, "serverVersion": "0.0.0", "capabilities": {} })
+    json!({ "environmentId": "local", "label": "Local (Rust)", "platform": { "os": server_os(), "arch": server_arch() }, "serverVersion": env!("T3CODE_APP_VERSION"), "capabilities": {} })
 }
 
 fn now_iso() -> String {
@@ -847,10 +871,37 @@ async fn ensure_thread_on_shell(state: &AppState, command: &Value) -> Result<(),
     // "Is this thread already in the durable store?" — answered by asking
     // the store, not a process-local HashSet (#320). A second backend
     // process (or this one after restart) sees the same answer.
+    // `try_threads()`, NOT `threads()`. The lossy variant is correct for the
+    // shell SNAPSHOT — it replaces an undecodable row with a quarantine
+    // placeholder so corruption is visible instead of reading as a deletion
+    // (#237, thread.rs:2312). It is wrong HERE, because this path is deciding
+    // an ACCESS MODE.
+    //
+    // With the lossy read, a store that cannot be read at all collapses to "no
+    // matching row", which `TurnLaunch::resolve` then reports as "turn names no
+    // runtimeMode ... no durable thread record to recover it from". That tells
+    // the user their COMMAND is malformed when the truth is that the thread
+    // store is broken — a masked infrastructure failure wearing a validation
+    // error's clothes, and the one failure the caller must not mistake for a
+    // bad request. The SDK already anticipated this: `try_threads` exists, in
+    // its own words, "where the caller can handle the error".
     let existing_row = state
         .rt
-        .threads()
+        .try_threads()
         .await
+        .map_err(|e| {
+            // Names BOTH facts, because two contract tests assert two halves of
+            // the same seam and both halves are true: admission failed, and the
+            // durable write it gates was therefore never attempted. A message
+            // that named only the read would leave a reader thinking the thread
+            // might be half-written.
+            format!(
+                "the durable thread store is unreadable, so thread.turn.start \
+                 bootstrap admission failed before any ACK and persisting thread \
+                 {thread_id} was never attempted: {e}. No turn was started, no \
+                 thread was announced, and nothing was persisted."
+            )
+        })?
         .into_iter()
         .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(thread_id.as_str()));
     // ONE precedence order for the launch modes (#337), owned by the SDK:
@@ -2293,7 +2344,34 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
-            let cat = state.catalog.read().await;
+            // The provider half of this body must come from the DURABLE instance
+            // set, not from whatever the boot warm left in the in-memory catalog.
+            // Answering out of the catalog alone is fail-OPEN: corrupt or
+            // unreadable `server_settings:provider_instances` left every provider
+            // reading `ready` from the boot snapshot, so the picker offered
+            // routes whose configuration the server could no longer read. That is
+            // the same defect `server.getSettings` already refuses (:2468) — a
+            // read that cannot see its own durable state must not describe that
+            // state as usable.
+            //
+            // Reconciled rather than merely gated: gating alone would still serve
+            // a catalog that had silently diverged from the store, which is the
+            // in-memory-cache-as-authority shape this stack keeps re-growing. The
+            // load happens BEFORE the lock for the reason the keybinding read
+            // does — holding it across an await stalls every boot handshake.
+            let instances = match settings::load_instances(
+                state.rt.store(),
+                providers::configured_instances(),
+            )
+            .await
+            {
+                Ok(instances) => instances,
+                Err(e) => {
+                    return exit_failure(tx, &id, &format!("provider settings unreadable: {e}"))
+                }
+            };
+            let mut cat = state.catalog.write().await;
+            settings::reconcile(&mut cat, &instances);
             exit_success(tx, &id, server_config(&cat, &loaded, &[]));
         }
 
@@ -2626,6 +2704,42 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
         // honest answer is an ACK: failing it made every client log an error
         // every few seconds for a report that changes nothing.
         "server.reportClientActivity" => exit_success(tx, &id, Value::Null),
+
+        // Settings -> Connections reads this. Answering `unsupported method`
+        // left that page rendering an error where its real state belongs, which
+        // is the same lie the `/api/orchestration/shell` arm below already
+        // documents: the client cannot tell "not implemented" from "empty".
+        //
+        // The empty snapshot is not a placeholder, it is the TRUE answer for
+        // this backend. It runs `policy: "unsafe-no-auth"` (see `capture_http`),
+        // mints no pairing links and tracks no client sessions, and its own HTTP
+        // surface already answers `[]` for `pairing-links` and `clients`. This
+        // makes the socket agree with the HTTP route instead of disagreeing with
+        // it — two answers to one question is the defect, not the emptiness.
+        //
+        // Deliberately NOT invented here: a pairing/session store. If this
+        // backend ever grows one, this arm gets its rows and the revision starts
+        // moving; until then, claiming links it cannot have would be worse than
+        // the error it replaces.
+        //
+        // One snapshot, then the stream stays open with no Exit, matching the
+        // subscription convention documented directly below. Nothing is spawned
+        // and nothing is awaited: under `unsafe-no-auth` the set cannot change,
+        // so there is no later event to wait for — and a handler that parked
+        // here would hold the socket, because the read loop awaits dispatch
+        // inline (#432).
+        "subscribeAuthAccess" => {
+            chunk(
+                tx,
+                &id,
+                json!({
+                    "version": 1,
+                    "revision": 0,
+                    "type": "snapshot",
+                    "payload": { "pairingLinks": [], "clientSessions": [] },
+                }),
+            );
+        }
 
         // Stream subscriptions stay OPEN (no Exit). subscribeThread records the
         // requestId so turn events can be routed to it, and emits `synchronized`
@@ -5361,7 +5475,7 @@ fn server_config(
             .unwrap_or_else(|_| ".".into())
     });
     json!({
-        "environment": { "environmentId": "local", "label": "Local (Rust)", "platform": { "os": "darwin", "arch": "arm64" }, "serverVersion": "0.0.0", "capabilities": {} },
+        "environment": { "environmentId": "local", "label": "Local (Rust)", "platform": { "os": server_os(), "arch": server_arch() }, "serverVersion": env!("T3CODE_APP_VERSION"), "capabilities": {} },
         "auth": { "policy": "unsafe-no-auth", "bootstrapMethods": [], "sessionMethods": [], "sessionCookieName": "t3_session" },
         "cwd": cwd,
         "keybindingsConfigPath": keybindings::config_path(),
