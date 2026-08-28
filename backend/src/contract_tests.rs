@@ -1248,6 +1248,65 @@ async fn unimplemented_server_rpcs_refuse_explicitly_instead_of_faking_success()
     );
 }
 
+/// #469/#436: `GET /api/orchestration/threads/:threadId` must ANSWER, not 404.
+///
+/// The contract defines it (contracts/src/environmentHttp.ts:516) and the client
+/// calls it (client-runtime/src/state/threadSnapshotHttp.ts:50) the moment a
+/// draft becomes a real thread. When the route was absent it fell through to the
+/// capture_http fallback and 404'd ON THE REAL THREAD ID, so promotion never
+/// completed and the view stayed on /draft/<id> while the turn ran to completion
+/// somewhere it was not looking.
+///
+/// The route existing in source is not the same as the router serving it — a
+/// path registered under the wrong prefix, or shadowed by the fallback, reads
+/// identically in a grep. So this binds the REAL router with `build_app` and
+/// speaks HTTP to it over a socket, which is the only form that can tell those
+/// apart.
+///
+/// It asserts NOT-404 rather than 200: with no such thread the honest answer is
+/// a failure body from the handler, and demanding 200 here would force the
+/// handler to invent a snapshot for a thread that does not exist — which is
+/// exactly what its "the DURABLE record is the authority" comment refuses to do.
+#[tokio::test]
+async fn the_thread_snapshot_route_is_served_and_does_not_fall_through_to_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (state, _d) = test_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let app = crate::build_app(state);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(
+        b"GET /api/orchestration/threads/t-snapshot HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .expect("send the request");
+
+    let mut raw = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sock.read_to_end(&mut raw),
+    )
+    .await
+    .expect("the server answered within 20s");
+    server.abort();
+
+    let response = String::from_utf8_lossy(&raw);
+    let status = response.lines().next().unwrap_or("").to_string();
+    assert!(
+        !status.contains("404"),
+        "#469: the router 404'd on GET /api/orchestration/threads/:threadId, so it is not \
+         served — the client's promotion fetch falls through to capture_http exactly as it did \
+         when the route was missing. Status line: {status:?}"
+    );
+}
+
 /// #462: DUPLICATE DECIDER AUTHORITY, made red instead of merely known.
 ///
 /// There are two deciders for one command set.
