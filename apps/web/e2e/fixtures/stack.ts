@@ -20,6 +20,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -241,6 +242,34 @@ export async function startStack(
       `  --- dev-runner tail ---\n${out.slice(-1500)}`,
   });
 
+  /**
+   * Start one backend on the stack's port.
+   *
+   * Prefers the ALREADY-BUILT binary over `node scripts/dev-backend.ts`, which
+   * shells out to `cargo run --release`. That matters here and not in theory:
+   * cargo takes an exclusive lock on the target directory, several cells build
+   * against overlapping path dependencies, and a restart that has to win that
+   * lock took longer than a fifteen-minute deadline on this box — reported as
+   * "the backend never came back", which is a statement about build contention
+   * and not about the product. It is the same executable either way; the runner
+   * log says so itself (`Running .../release/t3code-server`).
+   */
+  const spawnBackend = (): ChildProcess => {
+    const targetDir = process.env.CARGO_TARGET_DIR || path.join(REPO_ROOT, "backend", "target");
+    const prebuilt = path.join(targetDir, "release", "t3code-server");
+    const backendEnv = { ...env, T3CODE_SERVER_PORT: String(banner.serverPort) };
+    const child = fs.existsSync(prebuilt)
+      ? spawn(prebuilt, [], { cwd: REPO_ROOT, env: backendEnv, stdio: ["ignore", "pipe", "pipe"] })
+      : spawn("node", ["scripts/dev-backend.ts"], {
+          cwd: path.join(REPO_ROOT, "apps", "server"),
+          env: backendEnv,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+    child.stdout?.on("data", absorb);
+    child.stderr?.on("data", absorb);
+    return child;
+  };
+
   /** Is the web origin serving? */
   const webAnswers = async (): Promise<boolean> => {
     try {
@@ -328,14 +357,7 @@ export async function startStack(
 
       if (resupervised === null) {
         restartedBy = "fixture";
-        const child = spawn("node", ["scripts/dev-backend.ts"], {
-          cwd: path.join(REPO_ROOT, "apps", "server"),
-          env: { ...env, T3CODE_SERVER_PORT: String(banner.serverPort) },
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        child.stdout?.on("data", absorb);
-        child.stderr?.on("data", absorb);
-        respawned.push(child);
+        respawned.push(spawnBackend());
       } else {
         restartedBy = "runner";
       }
