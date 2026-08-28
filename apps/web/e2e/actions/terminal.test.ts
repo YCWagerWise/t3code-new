@@ -61,10 +61,11 @@
  * under the dev-runner that fallback is ITSELF outside the admitted set, so
  * every pane fails identically and it looks like the same bug.
  *
- * So the spec asks the backend where it may open a pane, via `server.getConfig`
- * -> `projects[0].workspaceRoot` — the exact value the real client uses
- * (ChatView takes `gitCwd ?? activeProject.workspaceRoot`). A spec that made up
- * a path would be testing the admission control rather than the terminal.
+ * So the spec ASKS the backend where it may open a pane: `server.getConfig` ->
+ * `cwd`. A spec that made up a path would be testing the admission control
+ * rather than the terminal. (Guess three, for the record, was
+ * `projects[0].workspaceRoot` — getConfig has no `projects` key at all, so that
+ * read is undefined and fails exactly like guessing.)
  *
  * NO SKIPS, per the README: nothing here is `test.skip` or `test.todo`. A
  * behaviour that does not work is a FAILING test plus a finding.
@@ -228,11 +229,15 @@ before(async () => {
 
   const probe = await Rpc.connect(stack.serverPort);
   const config = await probe.ok("server.getConfig", {});
-  const root = config?.projects?.[0]?.workspaceRoot;
+  // `cwd`, NOT `projects[0].workspaceRoot`. getConfig's value carries
+  // auth/availableEditors/cwd/environment/issues/keybindings/observability/
+  // providers/settings — there is no `projects` key on it, so reading one
+  // yields undefined and every pane then opens at an unadmitted path.
+  const root = config?.cwd;
   assert.ok(
     typeof root === "string" && root.length > 0,
-    `server.getConfig must advertise a project workspaceRoot — it is the only cwd a pane is ` +
-      `guaranteed to be admitted under. Got: ${JSON.stringify(config?.projects)?.slice(0, 300)}`,
+    `server.getConfig must advertise its cwd — it is the root a pane is admitted under. ` +
+      `Got keys: ${Object.keys(config ?? {}).join(",")}`,
   );
   workspaceRoot = root;
   probe.close();
