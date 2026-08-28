@@ -29,14 +29,28 @@ import assert from "node:assert/strict";
 
 import { startStack, openApp, waitFor, type StackHandle, type App } from "../fixtures/index.ts";
 
-type Binding = {
-  readonly command: string;
+/**
+ * The wire shape, taken from a real `server.getConfig` payload rather than
+ * assumed:
+ *   {"command":"sidebar.toggle","shortcut":{"key":"b","modKey":true,
+ *     "altKey":false,"ctrlKey":false,"metaKey":false,"shiftKey":false}}
+ * The modifiers are NESTED under `shortcut`. Reading them from the top level
+ * yields `undefined` for every one, which builds an empty chord and presses
+ * nothing — and then reports the result as the command's behaviour. The first
+ * version of this file did exactly that; the shape assertion below is what
+ * caught it.
+ */
+type Shortcut = {
   readonly key: string;
   readonly modKey?: boolean;
   readonly shiftKey?: boolean;
   readonly altKey?: boolean;
   readonly ctrlKey?: boolean;
   readonly metaKey?: boolean;
+};
+type Binding = {
+  readonly command: string;
+  readonly shortcut?: Shortcut;
   readonly whenAst?: unknown;
 };
 
@@ -72,24 +86,55 @@ after(async () => {
  * nobody bound and "pass" by finding nothing — so this fails loudly instead.
  */
 test("the keybinding surface is advertised by server.getConfig", async () => {
-  const outcome = await app.wire.settle("server.getConfig", {
-    ms: 60_000,
-    what: "server.getConfig to answer so the keybinding surface can be read live",
+  // NAVIGATE FIRST. `server.getConfig` is not dispatched on the landing route,
+  // so settling on it straight after openApp waits out the full timeout against
+  // a request the client was never going to make — which is exactly what the
+  // first version of this test did (111s, "0 commands advertised"), and it
+  // would have been filed as "the product advertises no keybindings" if the
+  // assertion had not printed the count it actually saw.
+  await app.page.goto(`${stack.webUrl}/settings/keybindings`, {
+    waitUntil: "domcontentloaded",
+    timeout: 120_000,
   });
+
+  const outcome = await app.wire
+    .settle("server.getConfig", {
+      ms: 60_000,
+      what: "server.getConfig to answer so the keybinding surface can be read live",
+    })
+    .catch((error: unknown) => {
+      // Name WHAT THE CLIENT DID INSTEAD. A bare "timed out waiting for
+      // server.getConfig" cannot distinguish "the backend never answered" from
+      // "the client never asked", and those have opposite owners.
+      throw new Error(
+        `server.getConfig never settled after navigating to /settings/keybindings. ` +
+          `methods the page actually dispatched: ${JSON.stringify(app.wire.methodsSeen())}. ` +
+          `If that list is EMPTY or missing server.getConfig, the client never asked — which ` +
+          `is the same post-navigation disconnect this cell already recorded in E2E-02, where ` +
+          `the send button read aria-label="Environment disconnected" while 11 methods had ` +
+          `been answered on the previous page. Cause: ${String(error)}`,
+      );
+    });
   assert.equal(outcome.kind, "success", `server.getConfig failed: ${JSON.stringify(outcome)}`);
 
   const value = (outcome as { value: { keybindings?: Binding[] } }).value;
   bindings = Array.isArray(value?.keybindings) ? value.keybindings : [];
+  // Report WHAT CAME BACK, not merely that the expectation missed. "advertised
+  // no keybindings" without the payload is a second investigation handed to the
+  // next reader, and on this surface it would read as a product defect.
   assert.ok(
     bindings.length > 0,
-    "server.getConfig advertised NO keybindings. Every keystroke probe below would then " +
-      "press an unbound key and report 'nothing happened', which is a false pass for the " +
-      "whole surface.",
+    "server.getConfig advertised NO keybindings, so every keystroke probe below would press " +
+      "an unbound key and report 'nothing happened' — a false pass for the whole surface.\n" +
+      `outcome.kind: ${(outcome as { kind: string }).kind}\n` +
+      `top-level config keys: ${JSON.stringify(Object.keys((value ?? {}) as object))}\n` +
+      `typeof value.keybindings: ${typeof (value as { keybindings?: unknown })?.keybindings}\n` +
+      `value (truncated): ${JSON.stringify(value).slice(0, 700)}`,
   );
   for (const b of bindings) {
     assert.ok(
-      typeof b.command === "string" && b.command.length > 0 && typeof b.key === "string",
-      `a binding is missing command/key and cannot be driven: ${JSON.stringify(b)}`,
+      typeof b.command === "string" && b.command.length > 0 && typeof b.shortcut?.key === "string",
+      `a binding is missing command/shortcut.key and cannot be driven: ${JSON.stringify(b)}`,
     );
   }
 });
@@ -118,18 +163,50 @@ test("every ungated keybinding does something when pressed", async () => {
     // open panel does not swallow the next keystroke.
     await app.page.keyboard.press("Escape").catch(() => {});
 
-    const rpcBefore = app.wire.frames.length;
+    // COUNT ONLY REQUESTS THE CLIENT SENT, AND EXCLUDE THE HEARTBEATS.
+    //
+    // `frames.length` counts EVERYTHING, including periodic background traffic
+    // the page emits on its own — `server.reportClientActivity` is literally a
+    // heartbeat. Attributing those to whatever key was pressed in the same
+    // window produces a stable, entirely fictional result: two runs of this
+    // file, one with correct chords and one with EMPTY chords (the shortcut
+    // shape bug), returned byte-identical DISPATCHED/NOOP sets, including
+    // thread.jump.1/.4/.7 dispatching while .2/.3/.5/.6/.8/.9 did not. Every
+    // third 2s window was catching the same periodic frame. Nothing was being
+    // measured except the heartbeat's period.
+    const HEARTBEATS = new Set([
+      "server.reportClientActivity",
+      "server.reportHostPowerState",
+      "subscribeServerLifecycle",
+      "subscribeServerConfig",
+    ]);
+    const requestsSent = () =>
+      app.wire.frames.filter(
+        (f: { dir: string; json?: { _tag?: string; tag?: string } }) =>
+          f.dir === "sent" &&
+          f.json?._tag === "Request" &&
+          !HEARTBEATS.has(String(f.json?.tag ?? "")),
+      ).length;
+    const rpcBefore = requestsSent();
     const domBefore = await app.page.evaluate(() => document.body.innerHTML.length).catch(() => -1);
 
+    const sc = b.shortcut!;
     const chord = [
-      b.metaKey || b.modKey ? "Meta" : null,
-      b.ctrlKey ? "Control" : null,
-      b.altKey ? "Alt" : null,
-      b.shiftKey ? "Shift" : null,
-      b.key,
+      sc.metaKey || sc.modKey ? "Meta" : null,
+      sc.ctrlKey ? "Control" : null,
+      sc.altKey ? "Alt" : null,
+      sc.shiftKey ? "Shift" : null,
+      sc.key,
     ]
       .filter(Boolean)
       .join("+");
+    // A chord that is only the bare key means every modifier read as undefined,
+    // which is the shape bug above. Refuse to press it rather than record a
+    // result for a keystroke the product never binds.
+    assert.ok(
+      chord.length > 0 && chord.includes(sc.key),
+      `built an empty//bad chord for ${b.command} from ${JSON.stringify(sc)}`,
+    );
     await app.page.keyboard.press(chord).catch(() => {});
 
     // Bounded, and named: this is the only timer in the probe. It waits for
@@ -137,7 +214,7 @@ test("every ungated keybinding does something when pressed", async () => {
     // answer being measured, not a failure to wait long enough.
     const changed = await waitFor(
       async () => {
-        if (app.wire.frames.length > rpcBefore) return "rpc";
+        if (requestsSent() > rpcBefore) return "rpc";
         const now = await app.page.evaluate(() => document.body.innerHTML.length).catch(() => -1);
         return now !== domBefore ? "dom" : null;
       },
