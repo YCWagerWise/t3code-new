@@ -317,6 +317,9 @@ pub enum TerminalOwner {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalOwnerError {
     MissingOwner,
+    /// Both ids were supplied. `TerminalTargetInput` is a UNION, so this
+    /// payload is one the contract declares unrepresentable (#149).
+    AmbiguousOwner,
 }
 
 impl std::fmt::Display for TerminalOwnerError {
@@ -325,34 +328,53 @@ impl std::fmt::Display for TerminalOwnerError {
             TerminalOwnerError::MissingOwner => {
                 write!(f, "terminal owner requires a non-empty sessionId or threadId")
             }
+            TerminalOwnerError::AmbiguousOwner => write!(
+                f,
+                "terminal owner names both a sessionId and a threadId; \
+                 TerminalTargetInput is a union and permits exactly one"
+            ),
         }
     }
 }
 
 impl TerminalOwner {
-    /// Read the owner out of a request.
+    /// Read the owner out of a request. EXACTLY ONE id, never both.
     ///
-    /// `sessionId` WINS over `threadId`. A client attaching to a child session
-    /// naturally also knows the parent thread and will send both; treating the
-    /// thread as authoritative there would silently hand it the parent's pane —
-    /// the exact "wrong ownership boundary" #149 describes, and it would look
-    /// like it worked.
+    /// This used to implement a PRECEDENCE RULE — sessionId wins — on the theory
+    /// that a client attaching to a child session also knows the parent thread
+    /// and will send both. The contract says otherwise, in as many words:
+    /// `TerminalTargetInput` (packages/contracts/src/terminal.ts:72) is a UNION
+    /// whose variants each forbid the other's id with
+    /// `Schema.optional(Schema.Never)`, precisely so the ambiguity is "resolved
+    /// at the type level instead of by a precedence rule every caller has to
+    /// remember", and `terminal.test.ts:334` asserts the both-ids payload is
+    /// REJECTED. No client sends both; nothing in apps/web passes a sessionId to
+    /// a terminal RPC at all.
+    ///
+    /// So the precedence rule only ever fired for a payload the contract calls
+    /// unrepresentable, and its effect was to accept that payload and pick a
+    /// winner silently — the backend being MORE PERMISSIVE than the wire schema,
+    /// which is how a non-TS client (or any caller that skips schema encoding)
+    /// gets a pane it did not ask for while every layer reports success. That is
+    /// the same "wrong ownership boundary" #149 is about, arrived at from the
+    /// other direction. Refusing is what makes the two sides agree.
     pub fn parse(input: &Value) -> Result<TerminalOwner, TerminalOwnerError> {
-        let session = input.get("sessionId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        match session {
-            Some(session_id) => Ok(TerminalOwner::ChildSession {
-                session_id: session_id.to_string(),
+        let nonempty = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match (nonempty("sessionId"), nonempty("threadId")) {
+            (Some(_), Some(_)) => Err(TerminalOwnerError::AmbiguousOwner),
+            (Some(session_id), None) => Ok(TerminalOwner::ChildSession {
+                session_id,
                 worktree_path: worktree_of(input),
             }),
-            None => {
-                let thread_id = input
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or(TerminalOwnerError::MissingOwner)?;
-                Ok(TerminalOwner::Thread { thread_id: thread_id.to_string() })
-            }
+            (None, Some(thread_id)) => Ok(TerminalOwner::Thread { thread_id }),
+            (None, None) => Err(TerminalOwnerError::MissingOwner),
         }
     }
 
@@ -633,6 +655,55 @@ impl TerminalRegistry {
 mod wait_tests {
     use super::*;
     use agent_sdk_do::ObjectDb;
+
+    /// `TerminalTargetInput` is a UNION (contracts/src/terminal.ts:72) whose
+    /// variants forbid each other's id with `Schema.optional(Schema.Never)`, and
+    /// `terminal.test.ts:334` asserts a both-ids target is REJECTED. This is the
+    /// Rust half of that same assertion: the backend must not be more permissive
+    /// than the wire schema, because the extra permission is a SILENT choice of
+    /// which pane the caller gets.
+    #[test]
+    fn a_target_naming_both_a_thread_and_a_session_is_refused() {
+        let err = TerminalOwner::parse(&json!({
+            "threadId": "t-1",
+            "sessionId": "s-1",
+            "terminalId": "term-1"
+        }))
+        .expect_err("both ids is unrepresentable in the contract and must not decode");
+        assert_eq!(err, TerminalOwnerError::AmbiguousOwner);
+        // The message has to NAME the conflict. "invalid target" would send the
+        // reader looking for a missing field.
+        let text = err.to_string();
+        assert!(text.contains("sessionId") && text.contains("threadId"), "{text}");
+
+        // The two legitimate single-id targets are UNCHANGED — this is the
+        // control, without which the assertion above is also satisfied by a
+        // parse that refuses everything.
+        assert_eq!(
+            TerminalOwner::parse(&json!({ "threadId": "t-1" })).unwrap(),
+            TerminalOwner::thread("t-1")
+        );
+        assert_eq!(
+            TerminalOwner::parse(&json!({ "sessionId": "s-1" }))
+                .unwrap()
+                .session_id(),
+            Some("s-1")
+        );
+
+        // An EMPTY sessionId alongside a real threadId is a thread target, not a
+        // conflict: `""` is not an id, and refusing it would break every caller
+        // that spreads an optional field.
+        assert_eq!(
+            TerminalOwner::parse(&json!({ "threadId": "t-1", "sessionId": "  " })).unwrap(),
+            TerminalOwner::thread("t-1")
+        );
+
+        // And naming neither is still the ORIGINAL error, not the new one.
+        assert_eq!(
+            TerminalOwner::parse(&json!({ "terminalId": "term-1" })).unwrap_err(),
+            TerminalOwnerError::MissingOwner
+        );
+    }
 
     /// Returns the scratch-dir GUARD as well: the registry and its hearth
     /// runner keep using this directory, so it must outlive the helper. When

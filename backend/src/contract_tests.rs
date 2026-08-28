@@ -6636,13 +6636,31 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
     );
 
     // A child session's pane, same terminal id AND same literal owner id.
+    //
+    // THE CHILD IS ADDRESSED BY `sessionId` ALONE, and this line used to send
+    // BOTH ids. The property under test is unchanged and so are every one of the
+    // assertions below: it is that a session id which COLLIDES with a thread id
+    // must not land on that thread's pane, which `TerminalOwner::scope()`
+    // guarantees by prefixing (`thread:collides` vs `session:collides`). Sending
+    // both ids was only ever this test's way of writing "the same literal owner
+    // id", and it is not required to say that — `SAME` is still the same string.
+    //
+    // It had to change because it was asserting the OPPOSITE of the wire
+    // contract. `TerminalTargetInput` (contracts/src/terminal.ts:72) is a union
+    // whose variants forbid each other's id with `Schema.optional(Schema.Never)`
+    // precisely so there is no precedence rule, and `terminal.test.ts:334`
+    // asserts a both-ids target is REJECTED. So this test required the backend
+    // to accept, and silently resolve, a payload no client can encode and the
+    // contract's own suite rejects. Two layers asserting opposite things about
+    // the same payload is the contradiction; the contract wins, `parse` now
+    // refuses both-ids, and the collision property keeps its coverage.
     let (tx, mut rx) = mpsc::unbounded_channel();
     request(
         &state,
         &tx,
         "terminal.open",
         json!({
-            "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
+            "sessionId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
         }),
     )
     .await;
@@ -6658,8 +6676,11 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
          boundary being fixed: {child:?}"
     );
 
-    // TWO panes, not one. sessionId WINS over threadId, so sending both did not
-    // hand the caller the parent's pane.
+    // TWO panes, not one. The ids are the SAME STRING, and the two owners are
+    // still distinct because `TerminalOwner::scope()` namespaces them
+    // (`thread:collides` vs `session:collides`) — that, not a precedence rule
+    // over a both-ids payload, is what keeps a child session off the parent's
+    // pane.
     let thread_owner = terminal::TerminalOwner::thread(SAME);
     let child_owner = terminal::TerminalOwner::ChildSession {
         session_id: SAME.to_string(),
@@ -6693,7 +6714,12 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
         &tx,
         "terminal.close",
         json!({
-            "threadId": SAME, "sessionId": SAME, "terminalId": "pane-1",
+            // Addressed by sessionId ALONE, for the same reason as the open
+            // above: the union permits exactly one id. The assertions that
+            // follow — the child's pane is gone and the THREAD's survives — are
+            // untouched, and they are the lifecycle-isolation property this
+            // test exists for.
+            "sessionId": SAME, "terminalId": "pane-1",
         }),
     )
     .await;
