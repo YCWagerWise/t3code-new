@@ -121,7 +121,31 @@ test("a typed draft survives a reload (composerDraftStore)", async () => {
     { ms: 15_000, what: "the typed draft to appear in the composer editor" },
   );
 
-  await app.reload();
+  // RELOAD THE SAME ROUTE. `app.reload()` goes to the web ROOT, and the app
+  // lands a new composer on a fresh `/draft/<id>` — a different draft key, so
+  // "not restored" would be this test asking the wrong question rather than
+  // composerDraftStore losing anything.
+  const routeBefore = app.page.url();
+  const framesBeforeReload = app.wire.frames.length;
+  await app.page.goto(routeBefore, { waitUntil: "domcontentloaded", timeout: 120_000 });
+
+  // WAIT FOR THE BACKEND TO ANSWER THE NEW PAGE, not just for the composer to
+  // paint. `app.reload()` does this and my hand-rolled goto did not, and the
+  // cost was visible two tests later: the send button was found, and
+  // `disabled` with aria-label "Environment disconnected", because the reloaded
+  // client had not reconnected yet. A mounted composer is not a connected one.
+  await waitFor(
+    () =>
+      app.wire.frames
+        .slice(framesBeforeReload)
+        .some((f: { dir: string; json?: { _tag?: string } }) => f.dir === "recv" && f.json?._tag === "Exit") ||
+      null,
+    { ms: 90_000, what: `the reloaded client on ${routeBefore} to be answered by the backend` },
+  );
+  await waitFor(() => app.page.$('[data-testid="composer-editor"]'), {
+    ms: 60_000,
+    what: `the composer to mount again on ${routeBefore} after the reload`,
+  });
 
   const restored = await waitFor(
     async () => {
@@ -157,6 +181,31 @@ test("send dispatches thread.turn.start on the wire", async () => {
   await app.page.keyboard.type(draft);
 
   const before = app.wire.requestIds("orchestration.dispatchCommand").length;
+  // Wait for the control to be ENABLED and say why if it never is. A bare
+  // click() here reports "Timeout 30000ms exceeded", which is true and useless;
+  // the button's aria-label carries the actual reason ("Environment
+  // disconnected", "Connecting", a sendDisabledReason) and that is the finding.
+  const readSend = () =>
+    app.page.$eval('[data-testid="composer-send"]', (el: HTMLButtonElement) => ({
+      disabled: el.disabled,
+      why: el.getAttribute("aria-label"),
+    }));
+
+  await waitFor(() => readSend().then((st: { disabled: boolean }) => (st.disabled ? null : st)), {
+    ms: 60_000,
+    what: "the send button to become enabled",
+  }).catch(async (error: unknown) => {
+    // Carry the REASON into the failure. `waitFor` records the probe's last
+    // value, and the probe returns null while disabled, so "last observation:
+    // null" throws away the one fact that matters. The button's aria-label is
+    // the product's own explanation of why it refused.
+    const st = await readSend().catch(() => null);
+    throw new Error(
+      `the composer refused to send and stayed disabled for 60s. ` +
+        `aria-label="${st?.why ?? "<unreadable>"}" — that is the product's own reason. ` +
+        `methods seen: ${app.wire.methodsSeen().join(", ")}. Cause: ${String(error)}`,
+    );
+  });
   await app.page.click('[data-testid="composer-send"]');
 
   await waitFor(
@@ -169,15 +218,34 @@ test("send dispatches thread.turn.start on the wire", async () => {
     },
   );
 
-  const sentTurnStart = app.wire.frames.some(
-    (f: { dir: string; json?: { tag?: string; payload?: { input?: { type?: string } } } }) =>
-      f.dir === "sent" && f.json?.payload?.input?.type === "thread.turn.start",
+  // Report WHAT WAS SENT, not merely that the expectation missed. An assertion
+  // that says "not thread.turn.start" without naming the command it did see
+  // hands the next reader a second investigation instead of a finding.
+  const dispatches = app.wire.frames
+    .filter(
+      (f: { dir: string; json?: { _tag?: string; tag?: string } }) =>
+        f.dir === "sent" &&
+        f.json?._tag === "Request" &&
+        f.json?.tag === "orchestration.dispatchCommand",
+    )
+    .map((f: { json?: { payload?: unknown } }) => f.json?.payload);
+  // `type` is TOP-LEVEL on the dispatchCommand payload, not nested under
+  // `input`. I assumed `input.type` from the backend's own contract_tests,
+  // which build the frame as `{"input": {...}}`; the real client sends it flat.
+  // The first version of this assertion therefore reported "send is broken"
+  // for a send that works — the payload dump is in the message precisely so a
+  // shape mismatch cannot masquerade as a product defect.
+  const types = dispatches.map(
+    (p: unknown) => (p as { type?: string })?.type ?? "<no type>",
   );
+  const sentTurnStart = types.includes("thread.turn.start");
   assert.ok(
     sentTurnStart,
-    "send produced a dispatchCommand that was NOT thread.turn.start. The " +
-      "composer's send path is the only way a turn begins; a different command " +
-      `type here means the button is wired to something else. Transcript:\n${app.wire.transcript()}`,
+    "send did not put thread.turn.start on the wire. The composer's send path " +
+      "is the only way a turn begins.\n" +
+      `dispatchCommand input.type values observed: ${JSON.stringify(types)}\n` +
+      `first dispatchCommand payload: ${JSON.stringify(dispatches[0] ?? null).slice(0, 600)}\n` +
+      `all methods seen: ${app.wire.methodsSeen().join(", ")}`,
   );
   covered.add("send");
 });
@@ -248,8 +316,8 @@ test("stop dispatches thread.turn.interrupt when a turn is running", async () =>
   await waitFor(
     () =>
       app.wire.frames.some(
-        (f: { dir: string; json?: { tag?: string; payload?: { input?: { type?: string } } } }) =>
-          f.dir === "sent" && f.json?.payload?.input?.type === "thread.turn.interrupt",
+        (f: { dir: string; json?: { tag?: string; payload?: { type?: string } } }) =>
+          f.dir === "sent" && f.json?.payload?.type === "thread.turn.interrupt",
       ) || null,
     { ms: 30_000, what: "the composer to dispatch thread.turn.interrupt after stop" },
   );
