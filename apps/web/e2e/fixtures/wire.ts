@@ -141,6 +141,63 @@ export class Wire {
 
   /** Every distinct method this page dispatched. The COVERAGE NUMERATOR — a
    *  spec reports what it actually drove, not what it meant to drive. */
+  /**
+   * COMPLETED assistant replies, off the wire (#435).
+   *
+   * The only honest way to read what the agent said. The DOM cannot answer this
+   * question: the UI echoes the user's own prompt into the user bubble and
+   * renders a live `Working for Ns` string, so `innerText` matching finds the
+   * wrong thing and reports a PASS. Two false passes were written and filed
+   * before that was caught — asserting "51" for "what is 17 times 3" matched
+   * "Working for 51s", and asserting a nonsense token matched the PROMPT that
+   * contained it, both while the turn was still Thinking and the socket was
+   * mid-reconnect.
+   *
+   * This existed only as a snippet in the finding and as a prose rule in the
+   * e2e README, which meant every spec hand-rolled the frame parsing and could
+   * hand-roll it wrong. It is a method now.
+   *
+   * `streaming === false` is the whole point: a partial chunk is not a reply,
+   * and asserting on one races the rest of the sentence.
+   */
+  assistantReplies(): string[] {
+    const out: string[] = [];
+    for (const f of this.frames) {
+      if (f.dir !== "recv" || f.json?._tag !== "Chunk") continue;
+      for (const v of f.json?.values ?? []) {
+        const p = v?.event?.payload;
+        if (p?.role === "assistant" && p?.streaming === false && typeof p?.text === "string") {
+          out.push(p.text);
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Whether the turn SETTLED, as opposed to the spinner merely stopping (#435).
+   *
+   * A spinner that stopped because the socket died is DOM-identical to one that
+   * settled, so settlement is a wire fact: `session-set` to `running` WITH an
+   * `activeTurnId`, then `session-set` to `idle` WITH `activeTurnId: null`.
+   * Both halves are required — an idle with a live turn id is the #92/#210
+   * state that hydrates a spinner with no way out.
+   */
+  turnSettled(): boolean {
+    let ranWithTurn = false;
+    for (const f of this.frames) {
+      if (f.dir !== "recv" || f.json?._tag !== "Chunk") continue;
+      for (const v of f.json?.values ?? []) {
+        const kind = v?.kind ?? v?.event?.kind;
+        if (kind !== "session-set" && v?.event?.payload?.status === undefined) continue;
+        const p = v?.session ?? v?.event?.payload ?? v;
+        if (p?.status === "running" && p?.activeTurnId) ranWithTurn = true;
+        if (ranWithTurn && p?.status === "idle" && p?.activeTurnId === null) return true;
+      }
+    }
+    return false;
+  }
+
   methodsSeen(): string[] {
     return [
       ...new Set(
