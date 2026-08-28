@@ -208,7 +208,7 @@ async function runAndWait(
   });
   return await waitFor(
     async () => {
-      const snap = await rpc.ok("terminal.open", target);
+      const snap = await rpc.ok("terminal.open", paneOpen(target));
       const screen = String(snap?.history ?? "");
       return screen.includes(marker) ? screen : null;
     },
@@ -222,6 +222,21 @@ let app: App;
 
 /** The workspace root the backend will admit a pane under. See the header. */
 let workspaceRoot: string;
+
+/**
+ * A `terminal.open` payload for `target`. EVERY open goes through this.
+ *
+ * The first run of this file on the box failed four tests for a reason that was
+ * mine, not the product's: `runAndWait` and the snapshot re-reads called
+ * `terminal.open` with the bare `target` — no `cwd` — and a pane opened without
+ * one falls back to the server's own root, which is not an admitted root. Only
+ * the FIRST open in each test carried the cwd, so a test would open a pane fine
+ * and then fail on its next read of the same pane. Attaching the cwd in one
+ * place is what stops that being re-introduced one call site at a time.
+ */
+function paneOpen(target: Record<string, unknown>): Record<string, unknown> {
+  return { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
+}
 
 before(async () => {
   stack = await startStack();
@@ -298,7 +313,7 @@ test("the workspace the server ADVERTISES is one it will admit a pane in", async
 test("all eight methods are implemented, and none of them acks a lie", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-thread", terminalId: "term-e2e-1" };
-  const open = { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
+  const open = paneOpen(target);
 
   /* --- terminal.open -------------------------------------------------- */
   const snap = await rpc.ok("terminal.open", open);
@@ -359,9 +374,9 @@ test("all eight methods are implemented, and none of them acks a lie", async () 
   assert.equal(painted.type, "output");
 
   /* --- terminal.clear: repaints, does NOT kill the shell ---------------- */
-  const beforeClear = await rpc.ok("terminal.open", target);
+  const beforeClear = await rpc.ok("terminal.open", paneOpen(target));
   assert.equal((await rpc.call("terminal.clear", target))._tag, "Success");
-  const afterClear = await rpc.ok("terminal.open", target);
+  const afterClear = await rpc.ok("terminal.open", paneOpen(target));
   assert.equal(
     afterClear.pid,
     beforeClear.pid,
@@ -408,7 +423,7 @@ test("the pane is ONE persistent PTY: cd and export survive separate writes", as
    * one, which is exactly why it is a separate test. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-persist", terminalId: "term-persist" };
-  const open = { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
+  const open = paneOpen(target);
 
   const pid0 = (await rpc.ok("terminal.open", open)).pid;
 
@@ -430,7 +445,7 @@ test("the pane is ONE persistent PTY: cd and export survive separate writes", as
   assert.match(screen, /CWD=\[\/(private\/)?tmp\]/, "cd must persist across writes too");
 
   // Same process throughout.
-  const later = await rpc.ok("terminal.open", target);
+  const later = await rpc.ok("terminal.open", paneOpen(target));
   if (pid0 != null && later.pid != null) {
     assert.equal(later.pid, pid0, "same pane, same shell process");
   }
@@ -455,7 +470,7 @@ test("the pane is a real tty: isatty() is true inside it", async () => {
    * fail this one. `[ -t 0 ]` is the smallest honest probe. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-tty", terminalId: "term-tty" };
-  await rpc.ok("terminal.open", { ...target, cwd: workspaceRoot, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", paneOpen(target));
 
   const screen = await runAndWait(
     rpc,
@@ -518,8 +533,8 @@ test("panes are independent: writing to one does not reach the other", async () 
   const rpc = await Rpc.connect(stack.serverPort);
   const a = { threadId: "e2e-c-iso", terminalId: "term-a" };
   const b = { threadId: "e2e-c-iso", terminalId: "term-b" };
-  await rpc.ok("terminal.open", { ...a, cwd: workspaceRoot, cols: 200, rows: 50 });
-  await rpc.ok("terminal.open", { ...b, cwd: workspaceRoot, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", paneOpen(a));
+  await rpc.ok("terminal.open", paneOpen(b));
 
   await runAndWait(rpc, a, `export T3_ONLY_IN_A=1`);
   const inB = await runAndWait(rpc, b, `printf 'A=[%s]' "$T3_ONLY_IN_A"`);
@@ -531,7 +546,7 @@ test("panes are independent: writing to one does not reach the other", async () 
 
   // Closing one must not disturb the other.
   await rpc.ok("terminal.close", a);
-  const stillB = await rpc.ok("terminal.open", b);
+  const stillB = await rpc.ok("terminal.open", paneOpen(b));
   assert.equal(stillB.terminalId, "term-b");
   assert.ok(
     ["starting", "running"].includes(stillB.status),
