@@ -25,6 +25,7 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
@@ -36,7 +37,7 @@ use agent_sdk_shell::{
 use tokio::sync::RwLock;
 
 use t3code_agent::{
-    assets, diagnostics, keybindings, projects, providers, review, settings, sourcecontrol,
+    assets, diagnostics, keybindings, paths, projects, providers, review, settings, sourcecontrol,
     terminal, tools, vcs,
 };
 
@@ -362,13 +363,7 @@ fn policy_for(runtime_mode: &str, interaction_mode: &str) -> (Vec<String>, Strin
 
 /// Where the agent works, and where its durable state lives.
 fn workspace_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let root = std::env::var("T3CODE_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    let data = std::env::var("T3CODE_AGENT_DATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(".t3code-agent"));
-    (root, data)
+    paths::workspace_paths()
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -595,6 +590,87 @@ const INTENTIONALLY_EMPTY_STREAMS: &[&str] = &[
     "subscribeNotifications",
 ];
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "type")]
+enum DispatchCommandKind {
+    #[serde(rename = "project.create")]
+    ProjectCreate,
+    #[serde(rename = "project.meta.update")]
+    ProjectMetaUpdate,
+    #[serde(rename = "project.delete")]
+    ProjectDelete,
+    #[serde(rename = "thread.create")]
+    ThreadCreate,
+    #[serde(rename = "thread.delete")]
+    ThreadDelete,
+    #[serde(rename = "thread.archive")]
+    ThreadArchive,
+    #[serde(rename = "thread.unarchive")]
+    ThreadUnarchive,
+    #[serde(rename = "thread.settle")]
+    ThreadSettle,
+    #[serde(rename = "thread.unsettle")]
+    ThreadUnsettle,
+    #[serde(rename = "thread.snooze")]
+    ThreadSnooze,
+    #[serde(rename = "thread.unsnooze")]
+    ThreadUnsnooze,
+    #[serde(rename = "thread.pin")]
+    ThreadPin,
+    #[serde(rename = "thread.unpin")]
+    ThreadUnpin,
+    #[serde(rename = "thread.pin.reorder")]
+    ThreadPinReorder,
+    #[serde(rename = "thread.meta.update")]
+    ThreadMetaUpdate,
+    #[serde(rename = "thread.runtime-mode.set")]
+    ThreadRuntimeModeSet,
+    #[serde(rename = "thread.interaction-mode.set")]
+    ThreadInteractionModeSet,
+    #[serde(rename = "thread.turn.start")]
+    ThreadTurnStart,
+    #[serde(rename = "thread.turn.interrupt")]
+    ThreadTurnInterrupt,
+    #[serde(rename = "thread.approval.respond")]
+    ThreadApprovalRespond,
+    #[serde(rename = "thread.user-input.respond")]
+    ThreadUserInputRespond,
+    #[serde(rename = "thread.checkpoint.revert")]
+    ThreadCheckpointRevert,
+    #[serde(rename = "thread.session.stop")]
+    ThreadSessionStop,
+}
+
+impl DispatchCommandKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectCreate => "project.create",
+            Self::ProjectMetaUpdate => "project.meta.update",
+            Self::ProjectDelete => "project.delete",
+            Self::ThreadCreate => "thread.create",
+            Self::ThreadDelete => "thread.delete",
+            Self::ThreadArchive => "thread.archive",
+            Self::ThreadUnarchive => "thread.unarchive",
+            Self::ThreadSettle => "thread.settle",
+            Self::ThreadUnsettle => "thread.unsettle",
+            Self::ThreadSnooze => "thread.snooze",
+            Self::ThreadUnsnooze => "thread.unsnooze",
+            Self::ThreadPin => "thread.pin",
+            Self::ThreadUnpin => "thread.unpin",
+            Self::ThreadPinReorder => "thread.pin.reorder",
+            Self::ThreadMetaUpdate => "thread.meta.update",
+            Self::ThreadRuntimeModeSet => "thread.runtime-mode.set",
+            Self::ThreadInteractionModeSet => "thread.interaction-mode.set",
+            Self::ThreadTurnStart => "thread.turn.start",
+            Self::ThreadTurnInterrupt => "thread.turn.interrupt",
+            Self::ThreadApprovalRespond => "thread.approval.respond",
+            Self::ThreadUserInputRespond => "thread.user-input.respond",
+            Self::ThreadCheckpointRevert => "thread.checkpoint.revert",
+            Self::ThreadSessionStop => "thread.session.stop",
+        }
+    }
+}
+
 /// The directory a VCS request targets, ADMITTED.
 ///
 /// The client names a path (a worktree panel operates on its own directory),
@@ -611,6 +687,27 @@ async fn req_cwd(payload: &Value, state: &AppState) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or(&state.cwd);
     vcs::resolve_cwd(requested, &state.cwd).await
+}
+
+async fn browse_payload(payload: &Value, state: &AppState) -> Result<(Value, String), String> {
+    let partial = payload
+        .get("partialPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let admitted_cwd = if partial.starts_with('/') {
+        vcs::resolve_cwd(partial, &state.cwd).await?
+    } else {
+        req_cwd(payload, state).await?
+    };
+    let mut admitted = payload.clone();
+    if let Some(object) = admitted.as_object_mut() {
+        object.insert("cwd".into(), json!(admitted_cwd));
+        if partial.starts_with('/') {
+            object.insert("partialPath".into(), json!(""));
+        }
+    }
+    Ok((admitted, admitted_cwd))
 }
 
 /// The workspace root an asset resource is confined to.
@@ -3824,9 +3921,12 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             }
         }
 
-        "filesystem.browse" => match projects::browse(&payload, &state.cwd) {
-            Ok(v) => exit_success(tx, &id, v),
-            Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
+        "filesystem.browse" => match browse_payload(&payload, &state).await {
+            Ok((payload, cwd)) => match projects::browse(&payload, &cwd) {
+                Ok(v) => exit_success(tx, &id, v),
+                Err((failure, message)) => exit_failure(tx, &id, &format!("{message} ({failure})")),
+            },
+            Err(e) => exit_failure(tx, &id, &format!("filesystem.browse: {e}")),
         },
         // Launching an editor is a HOST process with a path argument, so it
         // takes the same admission as every other path-bearing RPC: without it a
@@ -4379,8 +4479,19 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // selection that cannot route must not become a turn at all: acking
             // and then substituting the default is how the thread ends up
             // showing one provider while another one ran (#50).
-            let model = if command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start")
+            let command_kind = match serde_json::from_value::<DispatchCommandKind>(command.clone())
             {
+                Ok(kind) => kind,
+                Err(e) => {
+                    exit_failure(
+                        tx,
+                        &id,
+                        &format!("orchestration.dispatchCommand: invalid or unknown command: {e}"),
+                    );
+                    return;
+                }
+            };
+            let model = if matches!(command_kind, DispatchCommandKind::ThreadTurnStart) {
                 // #77 / packet EK: attachments in the command must not be
                 // dropped silently. This runtime does not yet forward image
                 // or file bytes to any provider — the ONLY current provider
@@ -4496,10 +4607,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             // the thread the user had just created vanished on reload with
             // nothing on the wire to say why. Accepted still means accepted;
             // it just cannot precede the durable write it depends on.
-            let async_lane =
-                command.get("type").and_then(|t| t.as_str()) == Some("thread.turn.start");
-            match command.get("type").and_then(|t| t.as_str()) {
-                Some("thread.turn.start") => {
+            let async_lane = matches!(command_kind, DispatchCommandKind::ThreadTurnStart);
+            match command_kind {
+                DispatchCommandKind::ThreadTurnStart => {
                     if let Some(model) = model {
                         // Durable bootstrap FIRST, then the accepted-ack, then
                         // the turn (#362). A failure here is reported as a
@@ -4520,7 +4630,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // to happen — the SDK's durable turn cancel, and Hearth's
                 // foreground interrupt for a bash command already running in
                 // the shared PTY.
-                Some(kind @ ("thread.turn.interrupt" | "thread.session.stop")) => {
+                kind @ (DispatchCommandKind::ThreadTurnInterrupt
+                | DispatchCommandKind::ThreadSessionStop) => {
+                    let kind = kind.as_str();
                     let thread_id =
                         command.get("threadId").and_then(|t| t.as_str()).unwrap_or("").to_string();
                     match stop_thread_checked(&state, &thread_id, kind).await {
@@ -4545,7 +4657,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // and doing nothing was the worst available behaviour — the UI
                 // reports the files restored while the worktree still holds
                 // every edit the user just rejected.
-                Some("thread.checkpoint.revert") => {
+                DispatchCommandKind::ThreadCheckpointRevert => {
                     let thread_id = thread_id_of(&command);
                     let turn_count = command
                         .get("turnCount")
@@ -4592,7 +4704,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // picker, runtime/interaction mode, title, branch. Acking these
                 // and dropping them means the UI shows a setting the runtime
                 // never received, and the next turn silently uses the old one.
-                Some("thread.meta.update") => {
+                DispatchCommandKind::ThreadMetaUpdate => {
                     let thread_id = thread_id_of(&command);
                     let patch = command.get("patch").cloned().unwrap_or(command.clone());
                     // FAIL VISIBLY. This arm used to log the error and fall
@@ -4610,7 +4722,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         return;
                     }
                 }
-                Some("project.meta.update") => {
+                DispatchCommandKind::ProjectMetaUpdate => {
                     // Durable UPDATE (#370): the old in-memory patch mutated
                     // this process's Vec and evaporated on restart, so a
                     // renamed project reverted on the next boot and a second
@@ -4703,7 +4815,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 // vocabulary. The requestId carries session|turn|callId, so
                 // nothing here has to remember which session asked — that map
                 // is what the SDK seam removed.
-                Some("thread.approval.respond") => {
+                DispatchCommandKind::ThreadApprovalRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -4817,7 +4929,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                Some("thread.user-input.respond") => {
+                DispatchCommandKind::ThreadUserInputRespond => {
                     let request_id = command
                         .get("requestId")
                         .and_then(Value::as_str)
@@ -4902,7 +5014,32 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                         }
                     }
                 }
-                _ => {}
+                DispatchCommandKind::ProjectCreate
+                | DispatchCommandKind::ProjectDelete
+                | DispatchCommandKind::ThreadCreate
+                | DispatchCommandKind::ThreadDelete
+                | DispatchCommandKind::ThreadArchive
+                | DispatchCommandKind::ThreadUnarchive
+                | DispatchCommandKind::ThreadSettle
+                | DispatchCommandKind::ThreadUnsettle
+                | DispatchCommandKind::ThreadSnooze
+                | DispatchCommandKind::ThreadUnsnooze
+                | DispatchCommandKind::ThreadPin
+                | DispatchCommandKind::ThreadUnpin
+                | DispatchCommandKind::ThreadPinReorder
+                | DispatchCommandKind::ThreadRuntimeModeSet
+                | DispatchCommandKind::ThreadInteractionModeSet => {
+                    let kind = command_kind.as_str();
+                    exit_typed_failure(
+                        tx,
+                        &id,
+                        json!({
+                            "_tag": "OrchestrationDispatchCommandError",
+                            "message": format!("{kind} is not implemented by this runtime"),
+                        }),
+                    );
+                    return;
+                }
             }
             // The applied-ack. Any arm that failed has already sent its own
             // terminal and returned, so this cannot double-send.

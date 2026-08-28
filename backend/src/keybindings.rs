@@ -109,7 +109,7 @@ fn default_rules() -> Vec<Rule> {
     push("mod+shift+o", "chat.new", Some("!terminalFocus"));
     push("mod+shift+n", "chat.newLocal", Some("!terminalFocus"));
     push("mod+shift+m", "modelPicker.toggle", Some("!terminalFocus"));
-    push("mod+o", "editor.openFavorite", None);
+    push("mod+o", "editor.openFavorite", Some("openInCwd && preferredEditor"));
     push("mod+shift+[", "thread.previous", None);
     push("mod+shift+]", "thread.next", None);
     for i in 1..=9 {
@@ -678,6 +678,24 @@ mod tests {
         let out = default_resolved();
         assert!(out.len() > 30, "defaults must be served, got {}", out.len());
         assert!(out.iter().any(|r| r["command"] == "commandPalette.toggle"));
+    }
+
+    #[test]
+    fn open_favorite_editor_advertises_its_real_preconditions() {
+        let out = default_resolved();
+        let open_favorite = out
+            .iter()
+            .find(|r| r["command"] == "editor.openFavorite")
+            .expect("default editor.openFavorite binding is served");
+        assert_eq!(
+            open_favorite["whenAst"],
+            json!({
+                "type": "and",
+                "left": {"type": "identifier", "name": "openInCwd"},
+                "right": {"type": "identifier", "name": "preferredEditor"},
+            }),
+            "settings must not advertise CMD-O as Always when the handler requires cwd+editor"
+        );
     }
 
     #[test]
