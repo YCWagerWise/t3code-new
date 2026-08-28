@@ -607,9 +607,26 @@ async fn seed_prompt(state: &AppState, thread_id: &str, message_id: &str, text: 
         .unwrap();
 }
 
+/// A per-call socket scope, which is the RIGHT default for almost every test
+/// here: each `request` stands alone and claims nothing (#503).
+///
+/// Terminal tests are the exception — a pane opened by one call must be
+/// drivable by the next — so they use [`request_on`] with one shared scope,
+/// exactly as a real connection would.
 async fn request(
     state: &AppState,
     tx: &mpsc::UnboundedSender<OutFrame>,
+    method: &str,
+    payload: Value,
+) {
+    request_on(state, tx, &SocketScope::default(), method, payload).await;
+}
+
+/// `request`, but on a caller-supplied connection scope.
+async fn request_on(
+    state: &AppState,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    scope: &SocketScope,
     method: &str,
     payload: Value,
 ) {
@@ -617,6 +634,7 @@ async fn request(
         &json!({ "_tag": "Request", "id": 7, "tag": method, "payload": payload }),
         tx,
         state,
+        scope,
     )
     .await;
 }
@@ -1529,43 +1547,41 @@ async fn the_rust_decider_refuses_every_command_it_does_not_implement() {
     }
 }
 
-/// FE-PROBE-6: is the terminal owner CHECKED, or merely REQUIRED?
+/// FE-PROBE-6 / #503: the terminal owner is CHECKED, not merely required.
 ///
-/// Every `terminal.*` method takes an owner (sessionId or threadId) plus a
-/// terminal id, and the pane store is keyed by `(owner.scope(), terminal_id)`.
-/// That keying is real and it does prevent an ACCIDENTAL collision between a
-/// subagent and its parent (#149). It is not access control, because the owner
-/// is parsed out of the REQUEST PAYLOAD — `TerminalOwner::parse(&payload)` at
-/// server_main.rs — and nothing anywhere ties a connection to an owner it is
-/// entitled to name. "Non-empty" is not "yours".
+/// This test used to assert the OPPOSITE. It was a recorded-exposure witness:
+/// `TerminalOwner::parse` read the owner out of the request payload, nothing
+/// tied a connection to an owner it was entitled to name, and a client that had
+/// never opened a pane could write into it. Its doc comment said "if this
+/// assertion has started failing, the hole is closed: invert it." It started
+/// failing the moment `SocketScope` landed, so here is the inversion.
 ///
-/// This test DOES NOT assert that the cross-owner write is refused, because it
-/// is not. It pins the exposure as it currently stands so the fix has a
-/// failing-by-design witness to flip, and so nobody reads the (scope, id)
-/// keying as a security boundary it was never built to be.
+/// The rule: a socket may drive a terminal owner it OPENED on that socket.
+/// The pane store's `(scope, terminal_id)` key was never an access boundary —
+/// it prevents an ACCIDENTAL collision between a subagent and its parent
+/// (#149), and cannot prevent a deliberate one, because the scope is
+/// caller-supplied.
 ///
-/// Why this is arbitrary command execution and not a tidiness complaint:
-///   * `ws_upgrade` (server_main.rs) takes no Origin, no token, no auth of any
-///     kind, and the router mounts no CORS layer — so ANY web page the user has
-///     open can `new WebSocket("ws://127.0.0.1:<port>/ws")` and be a client.
-///   * `terminal_id` defaults to the literal "term-1" (terminal.rs:267), so the
-///     attacker does not even have to guess a terminal id.
-///   * hearth's model is ONE persistent PTY per session carrying cd/export/venv
-///     state, so a foreign write both executes and corrupts state the real
-///     owner will later trust.
-///
-/// If a later change makes cross-owner writes refuse, THIS TEST SHOULD FAIL and
-/// be inverted to assert the refusal. That is the intended end state.
+/// WHAT THIS STILL IS NOT: authentication. The deployment reports
+/// `auth.policy: "unsafe-no-auth"`, and a client that opens an owner first can
+/// still claim it. This stops one connection driving ANOTHER connection's pane.
+/// Combined with the loopback-only Origin check on the upgrade, the reachable
+/// surface is a non-browser process on this machine rather than any web page
+/// the user has open — materially smaller, not zero.
 #[tokio::test]
-async fn a_foreign_owner_can_drive_a_terminal_it_never_opened() {
+async fn a_foreign_owner_cannot_drive_a_terminal_it_never_opened() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _d) = test_state().await;
 
-    // VICTIM opens its pane. Default terminal id on purpose: it is what the
-    // product uses and what an attacker would assume.
+    // VICTIM opens its pane on ITS OWN connection scope.
+    let victim = SocketScope::default();
     let (tx_victim, mut rx_victim) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx_victim,
+        &victim,
         "terminal.open",
         json!({ "threadId": "t-victim", "terminalId": "term-1", "cwd": state.cwd, "cols": 80, "rows": 24 }),
     )
@@ -1577,29 +1593,48 @@ async fn a_foreign_owner_can_drive_a_terminal_it_never_opened() {
         opened[0]
     );
 
-    // ATTACKER is a different client that never opened anything and never
-    // identified as t-victim. It simply SAYS it is t-victim.
+    // ATTACKER is a DIFFERENT connection that never opened anything. It simply
+    // says it is t-victim — which is all the old code required.
+    let attacker = SocketScope::default();
     let (tx_attacker, mut rx_attacker) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx_attacker,
+        &attacker,
         "terminal.write",
         json!({ "threadId": "t-victim", "terminalId": "term-1", "data": "echo pwned\n" }),
     )
     .await;
     let wrote = drain(&mut rx_attacker);
 
-    assert_eq!(
+    assert_ne!(
         wrote[0]["exit"]["_tag"], "Success",
-        "FE-PROBE-6: recorded exposure — a client that never opened this pane \
-         and holds no claim to `t-victim` wrote into its PTY and the server \
-         accepted it. The owner is taken from the request payload \
-         (TerminalOwner::parse) and never checked against the connection, so \
-         `terminal.write` is arbitrary command execution in another session's \
-         shell for anyone who can reach /ws — which, with no Origin check and \
-         no auth on the upgrade, is any web page the user has open. If this \
-         assertion has started failing, the hole is closed: invert it. \
-         Frames: {wrote:?}"
+        "#503: a connection that never opened this pane wrote into its PTY. Writing to a \
+         terminal you do not own is arbitrary command execution in another session's shell, \
+         and hearth keeps ONE persistent shell per session, so a foreign write also corrupts \
+         cd/export state the real owner goes on trusting. Frames: {wrote:?}"
+    );
+    assert!(
+        format!("{wrote:?}").contains("has not opened terminal owner"),
+        "the refusal must name the reason — a generic failure here reads as a broken write \
+         rather than a refused one: {wrote:?}"
+    );
+
+    // And the OWNER is unaffected: the guard must refuse the stranger without
+    // costing the legitimate connection its pane.
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    request_on(
+        &state,
+        &tx2,
+        &victim,
+        "terminal.write",
+        json!({ "threadId": "t-victim", "terminalId": "term-1", "data": "echo ok\n" }),
+    )
+    .await;
+    let owner_write = drain(&mut rx2);
+    assert_eq!(
+        owner_write[0]["exit"]["_tag"], "Success",
+        "the connection that OPENED the pane must still drive it: {owner_write:?}"
     );
 }
 
@@ -1607,12 +1642,19 @@ async fn a_foreign_owner_can_drive_a_terminal_it_never_opened() {
 /// TerminalSessionSnapshot; write/resize succeed; attach streams a snapshot.
 #[tokio::test]
 async fn terminal_rpcs_map_to_the_shared_pty() {
+    // ONE connection scope for the whole test (#503): a real client opens a
+    // pane and then drives it on the SAME socket, and the guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _d) = test_state().await;
     let input = json!({ "threadId": "t-1", "terminalId": "term-1", "cwd": state.cwd, "cols": 80, "rows": 24 });
 
     // open → a real snapshot, NOT an unsupported-method failure.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.open", input.clone()).await;
+    request_on(
+        &state,
+        &tx,
+        &conn,
+        "terminal.open", input.clone()).await;
     let f = drain(&mut rx);
     assert_eq!(
         f[0]["exit"]["_tag"], "Success",
@@ -1630,16 +1672,18 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 
     // write + resize → void success.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.write",
         json!({ "threadId": "t-1", "terminalId": "term-1", "data": "echo hi\n" }),
     )
     .await;
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.resize",
         json!({ "threadId": "t-1", "terminalId": "term-1", "cols": 100, "rows": 40 }),
     )
@@ -1656,7 +1700,11 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 
     // attach → an initial snapshot stream event (stays open, no Exit).
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(&state, &tx, "terminal.attach", input).await;
+    request_on(
+        &state,
+        &tx,
+        &conn,
+        "terminal.attach", input).await;
     let f = drain(&mut rx);
     assert_eq!(
         f[0]["values"][0]["type"], "snapshot",
@@ -1673,6 +1721,9 @@ async fn terminal_rpcs_map_to_the_shared_pty() {
 /// while the PTY rejected the write/control operation.
 #[tokio::test]
 async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (mut state, dir) = test_state().await;
     let bad = hearth::Runner::open(
         hearth::Config::new(dir.to_path_buf(), dir.join("bad-hearth"), "bad-terminal")
@@ -1683,16 +1734,18 @@ async fn terminal_control_rpcs_fail_when_hearth_rejects_control() {
     state.terminal = Arc::new(bad);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.write",
         json!({ "threadId": "t-1", "terminalId": "missing-pane", "data": "echo hidden\n" }),
     )
     .await;
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.resize",
         json!({ "threadId": "t-1", "terminalId": "missing-pane", "cols": 100, "rows": 40 }),
     )
@@ -1771,6 +1824,9 @@ async fn terminal_subscriptions_fail_when_durable_topic_tail_cannot_attach() {
 /// namespace, because that scope is shared by every malformed caller.
 #[tokio::test]
 async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _d) = test_state().await;
     let empty_owner = terminal::TerminalOwner::Thread { thread_id: String::new() };
 
@@ -1843,16 +1899,27 @@ async fn terminal_rpcs_without_an_owner_fail_closed_before_touching_thread_empty
 /// regression, which is the only way the edge swap can fail.
 #[tokio::test]
 async fn an_attached_and_a_reconnecting_terminal_pane_both_receive_later_output() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _d) = test_state().await;
     let input = json!({ "threadId": "t-1", "terminalId": "term-1", "cwd": state.cwd });
 
     // pane A attaches first.
     let (tx_a, mut rx_a) = mpsc::unbounded_channel();
-    request(&state, &tx_a, "terminal.attach", input.clone()).await;
+    request_on(
+        &state,
+        &tx_a,
+        &conn,
+        "terminal.attach", input.clone()).await;
 
     // pane B attaches afterwards — the reconnect case, sharing the one PTY.
     let (tx_b, mut rx_b) = mpsc::unbounded_channel();
-    request(&state, &tx_b, "terminal.attach", input).await;
+    request_on(
+        &state,
+        &tx_b,
+        &conn,
+        "terminal.attach", input).await;
 
     // Drive the shell only AFTER both are attached, so anything they receive
     // below had to arrive through a live tail rather than the open snapshot.
@@ -7133,14 +7200,18 @@ async fn tool_activity_reaches_the_thread_stream_in_contract_shape() {
 /// thread's pane and every assertion below would still pass except this one.
 #[tokio::test]
 async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
+    // ONE connection scope for the whole test (#503): a real client opens a
+    // pane and then drives it on the SAME socket, and the guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _dir) = test_state().await;
     const SAME: &str = "collides";
 
     // The thread's pane.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "threadId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
@@ -7176,9 +7247,10 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
     // the same payload is the contradiction; the contract wins, `parse` now
     // refuses both-ids, and the collision property keeps its coverage.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "sessionId": SAME, "terminalId": "pane-1", "cols": 80, "rows": 24,
@@ -7230,9 +7302,10 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
 
     // And closing the CHILD leaves the thread's pane alone.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.close",
         json!({
             // Addressed by sessionId ALONE, for the same reason as the open
@@ -7268,15 +7341,19 @@ async fn a_child_session_terminal_is_addressed_separately_from_its_threads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, dir) = test_state().await;
     let sub = dir.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
 
     // a pane opened for a directory LANDS there — not just echoes it back
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
@@ -7308,9 +7385,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
 
     // a SECOND pane is a different shell — not the first one's cursor
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "threadId": "t-1", "terminalId": "pane-b", "worktreePath": dir.to_string_lossy(),
@@ -7368,9 +7446,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .run("export LEAKED=yes", false, Some(10), false)
         .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.restart",
         json!({
             "threadId": "t-1", "terminalId": "pane-a", "cwd": sub.to_string_lossy(),
@@ -7397,9 +7476,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .run("echo BEFORE-CLEAR", false, Some(10), false)
         .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.clear",
         json!({ "threadId": "t-1", "terminalId": "pane-a" }),
     )
@@ -7432,9 +7512,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         .and_then(|t| t.parse::<i32>().ok())
         .expect("the pane shell has a pid");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.close",
         json!({ "threadId": "t-1", "terminalId": "pane-a" }),
     )
@@ -7500,9 +7581,10 @@ async fn terminal_panes_have_their_own_identity_shell_and_lifecycle() {
         )
         .await;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.close",
         json!({ "threadId": "t-1", "terminalId": terminal::AGENT_TERMINAL_ID }),
     )
@@ -8859,6 +8941,9 @@ async fn source_control_repository_actions_are_wired() {
 /// tested, not just the happy paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_paths_are_admitted_before_any_tool_runs() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, dir) = test_state().await;
     let outside = std::env::temp_dir().join(format!("t3-outside-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&outside).unwrap();
@@ -8935,9 +9020,10 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
 
     // #179: a terminal cannot be opened outside the environment either
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "threadId": "t-1", "terminalId": "escape", "cwd": outside.to_string_lossy(),
@@ -8958,9 +9044,10 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
 
     // …nor attached to one
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.attach",
         json!({
             "threadId": "t-1", "terminalId": "escape2", "worktreePath": outside.to_string_lossy(),
@@ -8973,9 +9060,10 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
     // and the workspace itself is still allowed — the boundary admits, it
     // does not just refuse
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.open",
         json!({
             "threadId": "t-1", "terminalId": "inside", "cwd": state.cwd.clone(),
@@ -9001,6 +9089,9 @@ async fn client_paths_are_admitted_before_any_tool_runs() {
 /// client can actually attach to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_shell_tool_carries_its_attachable_terminal() {
+    // ONE connection scope for the whole test (#503): a real client opens a
+    // pane and then drives it on the SAME socket, and the guard is per-socket.
+    let conn = SocketScope::default();
     let (state, dir) = test_state().await;
     let projector = t3_projector(state.rt.clone());
     let tail = state.rt.tail("t-1").await.unwrap();
@@ -9032,9 +9123,10 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
     // and that id really attaches to the agent's live shell — before the
     // tool completes
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.attach",
         json!({ "threadId": "t-1", "terminalId": terminal_id }),
     )
@@ -9081,6 +9173,9 @@ async fn a_running_shell_tool_carries_its_attachable_terminal() {
 /// with no error to show for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, dir) = test_state().await;
     let sub_dir = dir.join("wt");
     std::fs::create_dir_all(&sub_dir).unwrap();
@@ -9114,9 +9209,10 @@ async fn subscribing_to_a_terminal_does_not_decide_its_identity() {
 
     // The real open supplies the identity.
     let (tx2, mut rx2) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx2,
+        &conn,
         "terminal.open",
         json!({
             "threadId": "t-9", "terminalId": "pane-x",
@@ -11254,7 +11350,7 @@ async fn ws_ack_frame_is_recognized_and_no_op() {
         json!({ "_tag": "Ack", "requestId": "r-1", "cursor": 3 }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
     let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
         .map(|(s, _)| serde_json::from_str(&s).unwrap())
@@ -11426,7 +11522,7 @@ async fn ws_interrupt_frame_cancels_a_running_turn() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     // THE ASSERTION THAT MATTERS: the turn SETTLES, and settles as interrupted.
@@ -11576,7 +11672,7 @@ async fn the_frontend_startup_burst_does_not_wedge_the_server() {
     let (tx3, mut rx3) = mpsc::unbounded_channel();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        super::dispatch_ws_frame(json!({ "_tag": "Ping" }), &tx3, &state),
+        super::dispatch_ws_frame(json!({ "_tag": "Ping" }), &tx3, &state, &SocketScope::default()),
     )
     .await
     .expect("#404: the WS dispatcher stopped answering Ping after the burst");
@@ -11719,7 +11815,7 @@ async fn ws_interrupt_for_another_thread_does_not_cancel_this_turn() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     // It must NOT settle. Generous window: far longer than the ~40ms tick the
@@ -11767,7 +11863,7 @@ async fn ws_interrupt_frame_routes_to_runtime_interrupt() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     // Interrupt is fire-and-forget from the wire's POV: no reply frame,
@@ -11823,7 +11919,7 @@ async fn ws_interrupt_frame_reports_runtime_cancel_failure() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     let frames = drain(&mut rx);
@@ -11853,7 +11949,7 @@ async fn ws_interrupt_frame_without_thread_id_does_not_error() {
         json!({ "_tag": "Interrupt", "requestId": "r-99" }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
     let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
         .map(|(s, _)| serde_json::from_str(&s).unwrap())
@@ -12195,6 +12291,9 @@ async fn a_thread_with_no_durable_row_still_snapshots_with_declared_defaults() {
 /// the same data directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     // RAII: removed on drop, so a panicking test cannot leak it (see TestDir).
     let dir = tempfile::Builder::new()
         .prefix("t3ct-")
@@ -12207,10 +12306,11 @@ async fn a_pane_opened_before_a_restart_is_still_listed_after_one() {
     {
         let state = state_at(&dir).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        request(
-            &state,
-            &tx,
-            "terminal.open",
+        request_on(
+        &state,
+        &tx,
+        &conn,
+        "terminal.open",
             json!({ "threadId": "t-pane", "terminalId": "term-1" }),
         )
         .await;
@@ -12449,14 +12549,18 @@ async fn an_app_state_opens_a_bounded_number_of_isolates() {
 /// contract, so a failed publish is a visible failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_published() {
+    // ONE connection scope (#503): a real client opens a pane and then drives
+    // it on the SAME socket, and the ownership guard is per-socket.
+    let conn = SocketScope::default();
     let (state, _dir) = test_state().await;
 
     for pane in ["pane-a", "pane-b"] {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        request(
-            &state,
-            &tx,
-            "terminal.open",
+        request_on(
+        &state,
+        &tx,
+        &conn,
+        "terminal.open",
             json!({ "threadId": "t-1", "terminalId": pane, "cwd": state.cwd.clone() }),
         )
         .await;
@@ -12470,9 +12574,10 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
     break_topic_publish(&state).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.clear",
         json!({ "threadId": "t-1", "terminalId": "pane-a" }),
     )
@@ -12491,9 +12596,10 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    request(
+    request_on(
         &state,
         &tx,
+        &conn,
         "terminal.close",
         json!({ "threadId": "t-1", "terminalId": "pane-b" }),
     )
@@ -12518,7 +12624,7 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
 // The read loop used to `.await` each decoded frame inline:
 //
 //     while let Some(Ok(msg)) = stream.next().await {
-//         Message::Text(text) => { ... dispatch_ws_frame(frame, &tx, &state).await; }
+//         Message::Text(text) => { ... dispatch_ws_frame(frame, &tx, &state, &SocketScope::default()).await; }
 //
 // `orchestration.subscribeThread` attaches a durable tail and never returns, so
 // awaiting it there parked the READER. Every frame that arrived afterwards was
@@ -12691,7 +12797,7 @@ mod ws_head_of_line {
 ///
 ///     while let Some(msg) = reader.next().await {
 ///         ...
-///         dispatch_ws_frame(frame, &tx, &state).await;   // <-- same task
+///         dispatch_ws_frame(frame, &tx, &state, &SocketScope::default()).await;   // <-- same task
 ///     }
 ///
 /// Reader and handler were one task, so nothing was read from the socket while
@@ -12817,7 +12923,7 @@ async fn the_read_loop_answers_a_ping_while_slow_requests_are_still_running() {
 /// is NOT evidence that #476 is fixed, and it must not be cited as such.
 ///
 /// THE DEFECT THIS PINS, AND IT WAS MINE. The first fix for #432 replaced the
-/// read loop's inline `dispatch_ws_frame(...).await` with a bare
+/// read loop's inline `dispatch_ws_frame(..., &SocketScope::default()).await` with a bare
 /// `tokio::spawn`. That un-starves the reader — the #432 test above proves it —
 /// and in the same line it detaches the work. `orchestration.subscribeThread`
 /// attaches a durable tail and streams for the life of the thread, so a client
@@ -13071,7 +13177,7 @@ async fn ws_interrupt_frame_reports_runtime_interrupt_failure() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -13143,7 +13249,7 @@ async fn ws_interrupt_frame_reports_hearth_interrupt_failure() {
         }),
         &tx,
         &state,
-    )
+    &SocketScope::default())
     .await;
 
     let frames: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())

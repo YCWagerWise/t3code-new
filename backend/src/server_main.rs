@@ -1906,6 +1906,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // A `JoinSet` makes the lifetime structural instead of hoping the task ends:
     // it is owned by this function, so it cannot outlive the connection. The
     // design is claude-4e91's and it is better than the bare spawn I wrote.
+    // ONE scope per connection (#503). Cloned into each spawned request task so
+    // a claim made by `terminal.open` is visible to the `terminal.write` that
+    // follows on the same socket, and to nothing else.
+    let scope = std::sync::Arc::new(SocketScope::default());
     let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     while let Some(Ok(msg)) = stream.next().await {
@@ -1977,6 +1981,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if frame.get("_tag").and_then(|t| t.as_str()) == Some("Request") {
                     let tx = tx.clone();
                     let state = state.clone();
+                    let scope = scope.clone();
                     inflight.spawn(async move {
                         // The counter is decremented by a GUARD, not by a
                         // statement at the end of the block: a trailing statement
@@ -1992,10 +1997,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .inflight_requests
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _guard = Inflight(state.inflight_requests.clone());
-                        dispatch_ws_frame(frame, &tx, &state).await;
+                        dispatch_ws_frame(frame, &tx, &state, &scope).await;
                     });
                 } else {
-                    dispatch_ws_frame(frame, &tx, &state).await;
+                    dispatch_ws_frame(frame, &tx, &state, &scope).await;
                 }
             }
             Message::Close(_) => break,
@@ -2020,17 +2025,64 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Route one already-decoded WebSocket Text frame. Extracted so tests can
 /// exercise every `_tag` arm (including #411's Ack + Interrupt) without
 /// standing up the full axum serve loop.
+/// The set of terminal owners THIS CONNECTION has opened (#503).
+///
+/// `TerminalOwner::parse` reads the owner out of the REQUEST PAYLOAD, so before
+/// this existed "non-empty" was the only check: any client could name any
+/// thread or session and drive its PTY. The pane store's `(scope, terminal_id)`
+/// key prevents an ACCIDENTAL collision between a subagent and its parent
+/// (#149); it cannot prevent a deliberate one, because the scope is
+/// caller-supplied.
+///
+/// The rule is now: a socket may drive a terminal owner it OPENED on this
+/// socket. `terminal.open` records the claim; every other `terminal.*` method
+/// checks it. That closes exactly the case the witness test names — driving a
+/// terminal you never opened — and it is per-connection rather than global, so
+/// two browser tabs cannot reach into each other's panes.
+///
+/// WHAT THIS IS NOT: authentication. This deployment reports
+/// `auth.policy: "unsafe-no-auth"`, and a client that opens an owner first can
+/// still claim it. Socket scoping stops one client driving ANOTHER client's
+/// pane; it does not establish who either client is. Combined with the
+/// loopback-only Origin check on the upgrade, the reachable attack surface is a
+/// non-browser process on this machine, which is a materially smaller thing
+/// than "any web page the user has open" — but it is not zero and should not be
+/// described as solved.
+#[derive(Default)]
+pub(crate) struct SocketScope {
+    owned: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl SocketScope {
+    /// Record that this connection opened `scope` (an owner's `scope()` string).
+    pub(crate) fn claim(&self, scope: &str) {
+        if let Ok(mut set) = self.owned.lock() {
+            set.insert(scope.to_string());
+        }
+    }
+
+    /// Whether this connection may drive `scope`.
+    ///
+    /// A poisoned lock answers FALSE. The alternative — treating "I could not
+    /// check" as "allowed" — is the fail-open shape this whole change exists to
+    /// remove.
+    pub(crate) fn may_drive(&self, scope: &str) -> bool {
+        self.owned.lock().map(|s| s.contains(scope)).unwrap_or(false)
+    }
+}
+
 pub(crate) async fn dispatch_ws_frame(
     frame: Value,
     tx: &mpsc::UnboundedSender<OutFrame>,
     state: &AppState,
+    scope: &SocketScope,
 ) {
     match frame.get("_tag").and_then(|t| t.as_str()) {
         Some("Ping") => {
             let _ = tx.send((r#"{"_tag":"Pong"}"#.into(), None));
         }
         Some("Request") => {
-            handle_request(&frame, tx, state).await;
+            handle_request(&frame, tx, state, scope).await;
         }
         Some("Ack") => {
             // #411: Effect RPC's stream-flow-control frame. The client
@@ -2567,7 +2619,12 @@ async fn open_diag_history(agent_data: &std::path::Path) -> agent_sdk_metrics::R
         .expect("open the resource history")
 }
 
-async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, state: &AppState) {
+async fn handle_request(
+    frame: &Value,
+    tx: &mpsc::UnboundedSender<OutFrame>,
+    state: &AppState,
+    scope: &SocketScope,
+) {
     let method = frame.get("tag").and_then(|t| t.as_str()).unwrap_or("");
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     let payload = frame.get("payload").cloned().unwrap_or(json!({}));
@@ -4339,6 +4396,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
             };
             let cwd = cwd.as_deref();
             let env = terminal::env_of(&payload);
+            // THE CLAIM (#503). Opening is what entitles this connection to drive
+            // this owner later; every other terminal.* method checks it below.
+            scope.claim(&owner.scope());
             let restarting = method == "terminal.restart";
             let opened = if restarting {
                 state
@@ -4391,6 +4451,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
             };
+            if !scope.may_drive(&owner.scope()) {
+                // #503: the owner came from the request payload, so "you named
+                // it" is not "it is yours". This connection never opened this
+                // pane. Refusing is the whole fix: writing to a PTY you do not
+                // own is arbitrary command execution in someone else's shell,
+                // and hearth keeps ONE persistent shell per session, so a
+                // foreign write also corrupts cd/export state the real owner
+                // goes on trusting.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!(
+                        "{method}: this connection has not opened terminal owner {}. Open it on \
+                         this socket first — a terminal is driven by the connection that opened \
+                         it, not by whoever names it.",
+                        owner.scope()
+                    ),
+                );
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.write: {e}")),
@@ -4411,6 +4490,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
             };
+            if !scope.may_drive(&owner.scope()) {
+                // #503: the owner came from the request payload, so "you named
+                // it" is not "it is yours". This connection never opened this
+                // pane. Refusing is the whole fix: writing to a PTY you do not
+                // own is arbitrary command execution in someone else's shell,
+                // and hearth keeps ONE persistent shell per session, so a
+                // foreign write also corrupts cd/export state the real owner
+                // goes on trusting.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!(
+                        "{method}: this connection has not opened terminal owner {}. Open it on \
+                         this socket first — a terminal is driven by the connection that opened \
+                         it, not by whoever names it.",
+                        owner.scope()
+                    ),
+                );
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.resize: {e}")),
@@ -4440,6 +4538,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
             };
+            if !scope.may_drive(&owner.scope()) {
+                // #503: the owner came from the request payload, so "you named
+                // it" is not "it is yours". This connection never opened this
+                // pane. Refusing is the whole fix: writing to a PTY you do not
+                // own is arbitrary command execution in someone else's shell,
+                // and hearth keeps ONE persistent shell per session, so a
+                // foreign write also corrupts cd/export state the real owner
+                // goes on trusting.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!(
+                        "{method}: this connection has not opened terminal owner {}. Open it on \
+                         this socket first — a terminal is driven by the connection that opened \
+                         it, not by whoever names it.",
+                        owner.scope()
+                    ),
+                );
+            }
             let runner = match state.pane_runner(&owner, &term).await {
                 Ok(runner) => runner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.clear: {e}")),
@@ -4469,6 +4586,25 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
             };
+            if !scope.may_drive(&owner.scope()) {
+                // #503: the owner came from the request payload, so "you named
+                // it" is not "it is yours". This connection never opened this
+                // pane. Refusing is the whole fix: writing to a PTY you do not
+                // own is arbitrary command execution in someone else's shell,
+                // and hearth keeps ONE persistent shell per session, so a
+                // foreign write also corrupts cd/export state the real owner
+                // goes on trusting.
+                return exit_failure(
+                    tx,
+                    &id,
+                    &format!(
+                        "{method}: this connection has not opened terminal owner {}. Open it on \
+                         this socket first — a terminal is driven by the connection that opened \
+                         it, not by whoever names it.",
+                        owner.scope()
+                    ),
+                );
+            }
             let killed = match state.terminals.close(&owner, &term).await {
                 Ok(killed) => killed,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.close: {e}")),
@@ -4498,6 +4634,24 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(owner) => owner,
                 Err(e) => return exit_failure(tx, &id, &format!("terminal.attach: {e}")),
             };
+            // NO OWNERSHIP GUARD ON ATTACH, deliberately (#503).
+            //
+            // Attach is how a RECONNECTING client re-reads a pane it opened on a
+            // PREVIOUS connection — `an_attached_and_a_reconnecting_terminal_pane_
+            // both_receive_later_output` is named for exactly that. Requiring a
+            // same-socket open here would break reconnect, which is a real
+            // regression traded for an incomplete guard.
+            //
+            // SO THE SCROLLBACK EXPOSURE IS STILL OPEN and I am not pretending
+            // otherwise: FE-PROBE-6 asked "does attach hand over the scrollback
+            // of a terminal owned by another thread? A transcript is not a
+            // neutral object; it can contain secrets that hearth scrubbed on ITS
+            // output path." It does. Closing that needs a way to tell a
+            // reconnecting owner from a stranger, which is authentication — and
+            // this deployment reports `auth.policy: "unsafe-no-auth"`. The
+            // MUTATING methods (write/resize/clear/close) are guarded below,
+            // because those are arbitrary command execution rather than
+            // disclosure.
             let thread = owner.thread_id().unwrap_or("").to_string();
             let (cwd, worktree) = match state
                 .admit_pane_dir(
