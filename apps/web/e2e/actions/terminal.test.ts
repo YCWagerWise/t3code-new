@@ -46,17 +46,25 @@
  *
  * If one of those regresses it is a hearth finding, per the task text.
  *
- * NO CWD OVERRIDE, deliberately. Every pane below omits `cwd` and takes the
- * backend's own workspace root. The first run of this file on the box passed the
- * two tests that never open a pane and failed all four that do, in ~100ms each:
- * `admit_pane_dir` puts every client-supplied cwd through
- * `vcs::resolve_cwd(p, self.cwd)` (server_main.rs), which ADMITS against the
- * server's root, and the dev-runner's root is not the directory the test process
- * happens to be running in. That refusal is the backend behaving correctly — a
- * pane must not open anywhere a caller names — so the spec should not be
- * asserting from outside it. A real client does not send a cwd it invented
- * either. `cd /tmp` inside the persistence test still proves what it needs to,
- * because it changes directory from wherever the pane legitimately started.
+ * THE PANE CWD IS DISCOVERED, NOT INVENTED, and two wrong guesses paid for that
+ * sentence. A pane may only open under an ADMITTED ROOT — `RootedAdmission`
+ * (agent-sdk-rs/crates/agent-sdk-exec/src/lib.rs:121) canonicalises the cwd and
+ * refuses anything not under one, which is a real authority boundary and not a
+ * detail to route around:
+ *
+ *   terminal.open: cwd /home/nala/builds/<cell>/t3code-new is outside every
+ *   admitted root
+ *
+ * Guess one was `process.cwd()` — the directory the TEST happens to run in,
+ * which has nothing to do with the server's roots. Guess two was omitting `cwd`
+ * entirely, which is worse: the backend then falls back to its own root, and
+ * under the dev-runner that fallback is ITSELF outside the admitted set, so
+ * every pane fails identically and it looks like the same bug.
+ *
+ * So the spec asks the backend where it may open a pane, via `server.getConfig`
+ * -> `projects[0].workspaceRoot` — the exact value the real client uses
+ * (ChatView takes `gitCwd ?? activeProject.workspaceRoot`). A spec that made up
+ * a path would be testing the admission control rather than the terminal.
  *
  * NO SKIPS, per the README: nothing here is `test.skip` or `test.todo`. A
  * behaviour that does not work is a FAILING test plus a finding.
@@ -211,9 +219,23 @@ async function runAndWait(
 let stack: StackHandle;
 let app: App;
 
+/** The workspace root the backend will admit a pane under. See the header. */
+let workspaceRoot: string;
+
 before(async () => {
   stack = await startStack();
   app = await openApp(stack);
+
+  const probe = await Rpc.connect(stack.serverPort);
+  const config = await probe.ok("server.getConfig", {});
+  const root = config?.projects?.[0]?.workspaceRoot;
+  assert.ok(
+    typeof root === "string" && root.length > 0,
+    `server.getConfig must advertise a project workspaceRoot — it is the only cwd a pane is ` +
+      `guaranteed to be admitted under. Got: ${JSON.stringify(config?.projects)?.slice(0, 300)}`,
+  );
+  workspaceRoot = root;
+  probe.close();
 });
 
 after(async () => {
@@ -224,7 +246,7 @@ after(async () => {
 test("all eight methods are implemented, and none of them acks a lie", async () => {
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-thread", terminalId: "term-e2e-1" };
-  const open = { ...target, cols: 200, rows: 50 };
+  const open = { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
 
   /* --- terminal.open -------------------------------------------------- */
   const snap = await rpc.ok("terminal.open", open);
@@ -315,6 +337,7 @@ test("all eight methods are implemented, and none of them acks a lie", async () 
    * UI report "opened in Zed" having launched nothing, which is the
    * masking-success defect this backend refuses everywhere else.            */
   const editor = await rpc.call("shell.openInEditor", {
+    cwd: workspaceRoot,
     editor: "definitely-not-an-editor",
   });
   assert.equal(
@@ -333,7 +356,7 @@ test("the pane is ONE persistent PTY: cd and export survive separate writes", as
    * one, which is exactly why it is a separate test. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-persist", terminalId: "term-persist" };
-  const open = { ...target, cols: 200, rows: 50 };
+  const open = { ...target, cwd: workspaceRoot, cols: 200, rows: 50 };
 
   const pid0 = (await rpc.ok("terminal.open", open)).pid;
 
@@ -380,7 +403,7 @@ test("the pane is a real tty: isatty() is true inside it", async () => {
    * fail this one. `[ -t 0 ]` is the smallest honest probe. */
   const rpc = await Rpc.connect(stack.serverPort);
   const target = { threadId: "e2e-c-tty", terminalId: "term-tty" };
-  await rpc.ok("terminal.open", { ...target, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...target, cwd: workspaceRoot, cols: 200, rows: 50 });
 
   const screen = await runAndWait(
     rpc,
@@ -443,8 +466,8 @@ test("panes are independent: writing to one does not reach the other", async () 
   const rpc = await Rpc.connect(stack.serverPort);
   const a = { threadId: "e2e-c-iso", terminalId: "term-a" };
   const b = { threadId: "e2e-c-iso", terminalId: "term-b" };
-  await rpc.ok("terminal.open", { ...a, cols: 200, rows: 50 });
-  await rpc.ok("terminal.open", { ...b, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...a, cwd: workspaceRoot, cols: 200, rows: 50 });
+  await rpc.ok("terminal.open", { ...b, cwd: workspaceRoot, cols: 200, rows: 50 });
 
   await runAndWait(rpc, a, `export T3_ONLY_IN_A=1`);
   const inB = await runAndWait(rpc, b, `printf 'A=[%s]' "$T3_ONLY_IN_A"`);
