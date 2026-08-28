@@ -167,6 +167,23 @@ export async function startStack(
     cwd: REPO_ROOT,
     env,
     stdio: ["ignore", "pipe", "pipe"],
+    // DETACHED so the runner LEADS ITS OWN PROCESS GROUP, which is what makes
+    // `killTree`'s `process.kill(-pid)` mean anything.
+    //
+    // Without it the runner shares this process's group, `-pid` is not a valid
+    // pgid, the group kill throws, and the fallback `child.kill()` reaps only
+    // the runner — leaving `vite` and `t3code-server` alive and REPARENTED TO
+    // PID 1. Measured on woodbine: after all five specs reported, the suite
+    // would not exit, with an orphaned vite (ppid 1) and a live
+    // target/release/t3code-server still holding the port. Six stray dev
+    // servers were up across cells at the time, which is the same leak in
+    // everyone else's runs.
+    //
+    // This is hearth's own rule one layer up: kill the process GROUP, do not
+    // orphan the tree. The tradeoff is that a detached child outlives an
+    // abrupt parent death, so `dispose()` is now mandatory rather than
+    // best-effort — which it already was, via the `after` hook.
+    detached: true,
   });
 
   let out = "";
