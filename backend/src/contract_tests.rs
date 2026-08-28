@@ -1165,6 +1165,144 @@ fn only_loopback_origins_may_open_the_control_socket() {
     assert!(!allowed(Some("garbage")), "an unparseable Origin is refused, not trusted");
 }
 
+/// #462: DUPLICATE DECIDER AUTHORITY, made red instead of merely known.
+///
+/// There are two deciders for one command set.
+/// `apps/server/src/orchestration/decider.ts` has 27 typed `case` arms; this
+/// backend implements 7. Which one runs is decided by `T3CODE_BACKEND`, so the
+/// same UI and the same contract produce different thread lifecycle behaviour
+/// depending on an env var, and any semantics edited on the TS side diverges
+/// from the Rust side with no compile error and no failing test.
+///
+/// THE REAL FIX IS NOT HERE. Orchestration semantics belong in agent-sdk-shell
+/// once, behind a typed command enum, with both backends reduced to transport.
+/// Porting the missing arms into `server_main.rs` would close the gap while
+/// making the architecture worse — it doubles down on the product owning the
+/// decider. That port is not this test.
+///
+/// What this test does is stop the gap being INVISIBLE. It dispatches every
+/// dispatchable command at the real dispatcher and sorts them into implemented
+/// and refused, then ratchets on the refused count. So:
+///   * a command that gains an implementation makes this test fail LOUDLY with
+///     "the ratchet moved, lower it" — a good failure, and the only way the
+///     number is ever revised;
+///   * a command that silently LOSES one fails the same way;
+///   * and the exact list is printed, so nobody has to re-derive which 16.
+///
+/// It asserts REFUSAL, not silence. `server_main.rs`'s catch-all fails the
+/// request explicitly rather than acking a no-op as applied, which is the
+/// behaviour that makes this measurable at all — an unimplemented command that
+/// answered Success(null) would be indistinguishable from a working one.
+#[tokio::test]
+async fn the_rust_decider_refuses_every_command_it_does_not_implement() {
+    let (state, _d) = test_state().await;
+
+    // The dispatchable command set, from packages/contracts/src/orchestration.ts.
+    // Server-ORIGINATED types (thread.activity.append, thread.message.assistant.*,
+    // thread.session.set, thread.revert.complete, thread.title.regeneration.complete,
+    // thread.turn.diff.complete) are deliberately excluded: the client never
+    // dispatches them, so their absence here is not a divergence a user can hit.
+    let dispatchable = [
+        "project.create",
+        "project.delete",
+        "project.meta.update",
+        "thread.approval.respond",
+        "thread.archive",
+        "thread.checkpoint.revert",
+        "thread.create",
+        "thread.delete",
+        "thread.meta.update",
+        "thread.pin",
+        "thread.pin.reorder",
+        "thread.session.stop",
+        "thread.settle",
+        "thread.snooze",
+        "thread.turn.interrupt",
+        "thread.turn.start",
+        "thread.unarchive",
+        "thread.unpin",
+        "thread.unsettle",
+        "thread.unsnooze",
+    ];
+
+    let mut implemented: Vec<&str> = Vec::new();
+    let mut refused: Vec<&str> = Vec::new();
+
+    for kind in dispatchable {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        request(
+            &state,
+            &tx,
+            "orchestration.dispatchCommand",
+            json!({ "type": kind, "commandId": format!("c-{kind}"), "threadId": "t-decider" }),
+        )
+        .await;
+        let frames = drain(&mut rx);
+        // The catch-all names itself, so "not implemented by this runtime" in the
+        // failure is the discriminator — NOT merely "did it fail". A command that
+        // IS implemented can still fail here for want of a real thread, and that
+        // is implemented-but-erroring, which is a different fact.
+        let unimplemented = frames.iter().any(|f| {
+            f["exit"]["cause"][0]["error"]
+                .as_str()
+                .or_else(|| f["exit"]["cause"][0]["defect"].as_str())
+                .or_else(|| f["exit"]["value"].as_str())
+                .unwrap_or_default()
+                .contains("is not implemented by this runtime")
+                || format!("{f}").contains("is not implemented by this runtime")
+        });
+        if unimplemented {
+            refused.push(kind);
+        } else {
+            implemented.push(kind);
+        }
+    }
+
+    println!("#462 IMPLEMENTED by the Rust decider ({}): {implemented:?}", implemented.len());
+    println!("#462 REFUSED as unimplemented ({}): {refused:?}", refused.len());
+
+    // RATCHET. This number is the size of the divergence between the two
+    // deciders, and it may only ever go DOWN. Raising it means a command lost
+    // its implementation; lowering it means one gained an implementation and
+    // the constant should be edited in the same commit that did so.
+    // MEASURED, not assumed. My first guess was 14; the test said 13 and named
+    // the set, which is exactly the correction this ratchet exists to force.
+    const KNOWN_UNIMPLEMENTED: usize = 13;
+    assert!(
+        refused.len() <= KNOWN_UNIMPLEMENTED,
+        "#462: the Rust decider now refuses {} of {} dispatchable commands, up from {}. \
+         A command LOST its implementation, which silently changes behaviour for \
+         T3CODE_BACKEND=rust users while the TS decider still handles it. \
+         Refused: {:?}",
+        refused.len(),
+        dispatchable.len(),
+        KNOWN_UNIMPLEMENTED,
+        refused,
+    );
+    assert!(
+        refused.len() >= KNOWN_UNIMPLEMENTED,
+        "#462: the Rust decider now refuses only {} of {} dispatchable commands, \
+         down from {}. That is GOOD — a command gained an implementation. Lower \
+         KNOWN_UNIMPLEMENTED to {} in this commit so the ratchet holds the new \
+         ground. Refused: {:?}",
+        refused.len(),
+        dispatchable.len(),
+        KNOWN_UNIMPLEMENTED,
+        refused.len(),
+        refused,
+    );
+
+    // Whatever is implemented must STILL be implemented. This is the half that
+    // catches a regression rather than measuring the gap.
+    for kind in ["thread.turn.start", "thread.turn.interrupt", "thread.meta.update"] {
+        assert!(
+            implemented.contains(&kind),
+            "#462: '{kind}' is dispatched by the product's own UI and this runtime \
+             now refuses it. Refused set: {refused:?}"
+        );
+    }
+}
+
 /// FE-PROBE-6: is the terminal owner CHECKED, or merely REQUIRED?
 ///
 /// Every `terminal.*` method takes an owner (sessionId or threadId) plus a
