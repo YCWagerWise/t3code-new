@@ -157,7 +157,10 @@ class Rpc {
     assert.equal(
       exit._tag,
       "Success",
-      `${method} must succeed; got ${JSON.stringify(exit).slice(0, 400)}`,
+      // The PAYLOAD is in the message on purpose. A refusal that names a cwd is
+      // unreadable without the cwd that was sent — two runs were spent deciding
+      // whether the spec or the backend chose the offending path.
+      `${method} must succeed.\n  sent:     ${JSON.stringify(payload)}\n  got:      ${JSON.stringify(exit).slice(0, 400)}`,
     );
     return exit.value;
   }
