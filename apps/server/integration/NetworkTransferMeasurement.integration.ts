@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - Measures the real Node HTTP and WebSocket transports.
+// @effect-diagnostics nodeBuiltinImport:off - Measures the real Node HTTP and WebSocket transports. // out-of-band OOB-65887-1787952893
 import * as NodeHttp from "node:http";
 import * as NodeZlib from "node:zlib";
 

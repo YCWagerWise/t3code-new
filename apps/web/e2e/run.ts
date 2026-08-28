@@ -57,13 +57,45 @@ const childOptions = [process.env.NODE_OPTIONS, "--experimental-strip-types"]
   .join(" ")
   .trim();
 
+// TWO REPORTERS, ON PURPOSE. `spec` is readable, but it drops the error body
+// when a failure originates in a `before` hook — which is where a real-stack
+// suite fails most often, and a run that prints three red lines and no reason
+// is worse than no run at all. `tap` carries the full diagnostic including the
+// stack and the assertion message, so the reason always survives somewhere.
+const tapPath = process.env.T3_E2E_TAP ?? "/tmp/t3-e2e.tap";
 const result = spawnSync(
   process.execPath,
-  ["--test", "--test-concurrency=1", "--test-reporter=spec", ...specs],
+  [
+    "--test",
+    "--test-concurrency=1",
+    "--test-reporter=spec",
+    "--test-reporter-destination=stdout",
+    "--test-reporter=tap",
+    `--test-reporter-destination=${tapPath}`,
+    ...specs,
+  ],
   {
     stdio: "inherit",
     cwd: path.resolve(HERE, "..", "..", ".."),
     env: childOptions ? { ...process.env, NODE_OPTIONS: childOptions } : process.env,
   },
 );
+
+// Echo the failures out of the TAP stream so a terminal reader never has to be
+// told to go and open a file to find out what broke.
+try {
+  const tap = fs.readFileSync(tapPath, "utf8");
+  const failures = tap
+    .split(/\nnot ok /)
+    .slice(1)
+    .map((chunk) => "not ok " + chunk.split(/\n(?:ok|not ok|# )/)[0]);
+  if (failures.length > 0) {
+    console.log(`\n=== ${failures.length} FAILURE(S), full diagnostic ===\n`);
+    for (const failure of failures) console.log(failure.slice(0, 4000) + "\n");
+  }
+  console.log(`=== full TAP: ${tapPath}`);
+} catch {
+  console.log(`(no TAP written at ${tapPath})`);
+}
+
 process.exit(result.status ?? 1);

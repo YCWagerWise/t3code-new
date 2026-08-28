@@ -47,3 +47,5 @@ node_modules/
 # Playwright run artifacts — regenerated on every e2e run.
 apps/web/test-results/
 apps/web/playwright-report/
+.manual-worktrees/
+target/
