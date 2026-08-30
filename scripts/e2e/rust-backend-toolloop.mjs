@@ -74,6 +74,7 @@ async function launchBrowser() {
 }
 
 const APP = process.argv[2] ?? "http://127.0.0.1:5199/";
+const E2E_MODEL = process.env.T3CODE_E2E_MODEL?.trim() ?? "";
 const SCRATCH = mkdtempSync(join(tmpdir(), "t3e2e-toolloop-"));
 const DENY_FILE = join(SCRATCH, "must-not-exist.txt");
 const ALLOW_FILE = join(SCRATCH, "must-exist.txt");
@@ -175,6 +176,18 @@ try {
   await page.goto(APP, { waitUntil: "commit", timeout: 60_000 });
   await composer().waitFor({ state: "visible", timeout: 180_000 });
   check("composer renders", true, `url=${page.url()}`);
+
+  // A build host can expose several provider adapters even when only one is
+  // authenticated. Select the provider the test declaration names through the
+  // same picker a person uses; otherwise the harness silently exercises the
+  // first configured CLI and can fail before reaching the approval boundary.
+  if (E2E_MODEL) {
+    await page.locator('[data-chat-provider-model-picker="true"]').click();
+    const model = page.getByText(E2E_MODEL, { exact: false }).first();
+    await model.waitFor({ state: "visible", timeout: 30_000 });
+    await model.click();
+    check("declared E2E model selected through the real picker", true, E2E_MODEL);
+  }
 
   // ---------------------------------------------------------------- empty send
   step(2, "whitespace-only send must be a no-op");
