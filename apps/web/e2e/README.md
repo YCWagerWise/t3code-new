@@ -10,6 +10,7 @@ duplicate-authority defect this channel rejects, spelled in TypeScript. Import
 ```
 node apps/web/e2e/run.ts                 # everything
 node apps/web/e2e/run.ts settings        # one spec file
+node apps/web/e2e/coverage-ledger.ts     # contract-derived action denominator
 ```
 
 Environment:
@@ -115,6 +116,15 @@ Every spec ends by naming what it drove **and what it did not**. A method the UI
 never dispatched is a NOOP, and a NOOP is a finding, not a pass. "All green"
 over 4 of 21 is a blocker. Silent truncation of the action list reads as full
 coverage.
+
+`coverage-ledger.ts` derives the closed action list from
+`STATIC_KEYBINDING_COMMANDS` and `DispatchableClientOrchestrationCommand`. It
+counts only `actions/*.test.ts`, exactly matching `run.ts`; files the runner
+cannot execute cannot claim coverage. The ledger exits non-zero while any row
+is uncovered, while `run.ts` prints the same ledger without replacing the test
+suite's own exit status.
+Use `--allow-incomplete` only when another check needs to validate and print the
+ledger without treating the known coverage backlog as that check's failure.
 
 ## `restartBackend()` exists from the first commit
 

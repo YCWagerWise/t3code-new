@@ -1,0 +1,8 @@
+{
+  "checks": {
+    "e2e-coverage": "export NODE_OPTIONS=--experimental-strip-types; node --test apps/web/e2e/coverage-ledger.test.ts && node apps/web/e2e/coverage-ledger.ts --allow-incomplete"
+  },
+  "check_targets": {
+    "e2e-coverage": "linux"
+  }
+}

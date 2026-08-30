@@ -25,6 +25,14 @@ const specs = fs
   .map((f) => path.join(actionsDir, f))
   .sort();
 
+// Coverage and correctness answer different questions. Print the contract-
+// derived denominator on every run, but preserve the test runner's exit code:
+// incomplete coverage is an explicit backlog, while a red spec is a regression.
+spawnSync(process.execPath, [path.join(HERE, "coverage-ledger.ts"), "--allow-incomplete"], {
+  stdio: "inherit",
+  cwd: path.resolve(HERE, "..", "..", ".."),
+});
+
 if (specs.length === 0) {
   console.error(`no specs matched ${filters.join(" ") || "(everything)"} in ${actionsDir}`);
   process.exit(2);
