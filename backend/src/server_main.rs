@@ -2531,8 +2531,9 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
+            let settings_value = server_config_settings(state.rt.store()).await;
             let cat = state.catalog.read().await;
-            exit_success(tx, &id, server_config(&cat, &loaded, &[]));
+            exit_success(tx, &id, server_config(&cat, &loaded, &[], settings_value));
         }
 
         // Diagnostics (#67). The settings Diagnostics page is the one screen that
@@ -3352,6 +3353,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                 Ok(loaded) => loaded,
                 Err(e) => return exit_failure(tx, &id, &format!("keybindings unreadable: {e}")),
             };
+            let settings_value = server_config_settings(state.rt.store()).await;
             chunk(
                 tx,
                 &id,
@@ -3359,6 +3361,7 @@ async fn handle_request(frame: &Value, tx: &mpsc::UnboundedSender<OutFrame>, sta
                     &*state.catalog.read().await,
                     &loaded,
                     &[],
+                    settings_value,
                 )),
             );
             // Fanout attaches through the SDK's durable config topic (packet
@@ -5736,6 +5739,7 @@ fn server_config(
     catalog: &Catalog,
     custom: &[keybindings::Rule],
     issues: &[Value],
+    settings: Value,
 ) -> Value {
     let cwd = std::env::var("T3CODE_WORKSPACE").unwrap_or_else(|_| {
         std::env::current_dir()
@@ -5758,8 +5762,24 @@ fn server_config(
         // its reason instead of vanishing (#35).
         "providers": catalog.snapshots().iter().map(provider_entry).collect::<Vec<_>>(),
         "observability": { "logsDirectoryPath": "/tmp", "localTracingEnabled": false, "otlpTracesEnabled": false, "otlpMetricsEnabled": false },
-        "settings": {},
+        "settings": settings,
     })
+}
+
+/// The `settings` field `server_config` embeds: the same durable
+/// `providerInstances` + other-settings shape `server.getSettings` answers
+/// with, NOT the boot-only env catalog. Without this, a custom provider
+/// instance a user just saved through Settings is durable and routable (the
+/// catalog above already reconciles it) but invisible everywhere the wire
+/// `config.settings` is the only source the client reads — the composer's
+/// own model picker among them — until some OTHER client's `updateSettings`
+/// happens to push a live `settingsUpdated` event into the same session.
+async fn server_config_settings(store: &agent_sdk_shell::OrchStore) -> Value {
+    let instances = settings::load_instances(store, providers::configured_instances())
+        .await
+        .unwrap_or_default();
+    let other = settings::load_other(store).await.unwrap_or_default();
+    settings::settings_wire(&instances, &other)
 }
 
 /// Redeem a signed asset URL: `GET /api/assets/{token}/{name}`.
