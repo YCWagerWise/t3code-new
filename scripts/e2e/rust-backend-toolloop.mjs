@@ -17,7 +17,7 @@
  * Usage: node scripts/e2e/rust-backend-toolloop.mjs [appUrl]
  */
 import { createRequire } from "node:module";
-import { existsSync, rmSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -76,7 +76,11 @@ async function launchBrowser() {
 const APP = process.argv[2] ?? "http://127.0.0.1:5199/";
 const SCRATCH = mkdtempSync(join(tmpdir(), "t3e2e-toolloop-"));
 const DENY_FILE = join(SCRATCH, "must-not-exist.txt");
+const CANCEL_FILE = join(SCRATCH, "cancel-must-not-exist.txt");
 const ALLOW_FILE = join(SCRATCH, "must-exist.txt");
+const SESSION_FIRST_FILE = join(SCRATCH, "session-first.txt");
+const SESSION_SECOND_FILE = join(SCRATCH, "session-second.txt");
+const INTERRUPTED_FILE = join(SCRATCH, "interrupted-must-not-exist.txt");
 
 const step = (n, m) => console.log(`\n=== ${n} :: ${m}`);
 let failures = 0;
@@ -84,15 +88,21 @@ const check = (name, ok, detail = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
   if (!ok) failures++;
 };
+const shellPath = (path) => JSON.stringify(path);
 
 const frames = [];
+const frameWaiters = new Set();
 const consoleErrors = [];
 
 const browser = await launchBrowser();
 const page = await browser.newPage();
 page.on("websocket", (ws) => {
-  ws.on("framesent", (f) => frames.push({ dir: "c2s", payload: String(f.payload) }));
-  ws.on("framereceived", (f) => frames.push({ dir: "s2c", payload: String(f.payload) }));
+  const record = (dir, frame) => {
+    frames.push({ dir, payload: String(frame.payload) });
+    for (const notify of frameWaiters) notify();
+  };
+  ws.on("framesent", (f) => record("c2s", f));
+  ws.on("framereceived", (f) => record("s2c", f));
 });
 page.on("console", (m) => {
   if (m.type() === "error") consoleErrors.push(m.text());
@@ -100,6 +110,7 @@ page.on("console", (m) => {
 page.on("pageerror", (e) => consoleErrors.push(`pageerror: ${e.message}`));
 
 const composer = () => page.locator('[contenteditable="true"]').first();
+const composerForm = () => page.locator('[data-chat-composer-form="true"]');
 
 /**
  * WIRE ASSERTIONS, NOT DOM ASSERTIONS (#435).
@@ -127,15 +138,38 @@ const turnStarted = () =>
 const turnSettled = () =>
   frames.filter((f) => f.dir === "s2c" && /"activeTurnId"\s*:\s*null/.test(f.payload));
 
-/** Wait for a wire predicate rather than sleeping on the DOM. */
+/** Wait for a WebSocket frame notification rather than polling or sleeping. */
 async function waitForWire(pred, timeout, label) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    if (pred()) return true;
-    await page.waitForTimeout(250);
-  }
-  console.log(`  (wire wait timed out: ${label})`);
-  return false;
+  if (pred()) return true;
+  return new Promise((resolveWait) => {
+    const finish = (value) => {
+      clearTimeout(timer);
+      frameWaiters.delete(onFrame);
+      if (!value) console.log(`  (wire wait timed out: ${label})`);
+      resolveWait(value);
+    };
+    const onFrame = () => {
+      if (pred()) finish(true);
+    };
+    const timer = setTimeout(() => finish(pred()), timeout);
+    frameWaiters.add(onFrame);
+  });
+}
+
+/** Wait for the process side effect itself, using the filesystem notification. */
+async function waitForFile(path, timeout = 120_000) {
+  if (existsSync(path)) return true;
+  return new Promise((resolveWait) => {
+    const finish = (value) => {
+      clearTimeout(timer);
+      watcher.close();
+      resolveWait(value);
+    };
+    const watcher = watch(SCRATCH, () => {
+      if (existsSync(path)) finish(true);
+    });
+    const timer = setTimeout(() => finish(existsSync(path)), timeout);
+  });
 }
 
 /** Type a prompt into the real Lexical composer and send it. */
@@ -146,14 +180,16 @@ async function send(text) {
 }
 
 /** Wait for an approval prompt, returning the button names offered. */
-async function waitForApproval(timeout = 120_000) {
-  const approve = page.getByRole("button", { name: /^Approve$/ });
-  const decline = page.getByRole("button", { name: /^Decline$/ });
-  await Promise.race([
-    approve.first().waitFor({ state: "visible", timeout }),
-    decline.first().waitFor({ state: "visible", timeout }),
-  ]);
-  return { approve, decline };
+async function waitForApproval(path, timeout = 120_000) {
+  const detail = composerForm().locator('[data-approval-detail="complete"]').filter({
+    hasText: path,
+  });
+  const approve = composerForm().getByRole("button", { name: /^Approve$/ });
+  const decline = composerForm().getByRole("button", { name: /^Decline$/ });
+  const cancel = composerForm().getByRole("button", { name: /^Cancel$/ });
+  const always = composerForm().getByRole("button", { name: /^Always allow this session$/ });
+  await detail.waitFor({ state: "visible", timeout });
+  return { always, approve, cancel, decline, detail };
 }
 
 /** The transcript text with the composer's own contents removed. */
@@ -206,21 +242,27 @@ try {
   step(3, "tool call + approval DENY must block the tool on disk");
   rmSync(DENY_FILE, { force: true });
   await send(
-    `Create a file at the absolute path ${DENY_FILE} containing the single word DENIED. ` +
-      `Use your file-writing tool. Do not ask me anything first.`,
+    `Use the shell tool exactly once to run: printf DENIED > ${shellPath(DENY_FILE)}. ` +
+      `Do not create or modify that path by another mechanism.`,
   );
 
   let denyGated = null;
   try {
-    const { decline } = await waitForApproval();
+    const { decline } = await waitForApproval(DENY_FILE);
     const before = await transcriptText();
     check(
       "tool call renders its ARGUMENTS, not just a name",
       before.includes(DENY_FILE) || before.includes("must-not-exist.txt"),
       `looked for ${DENY_FILE} in the transcript`,
     );
+    const settledBeforeDeny = turnSettled().length;
     await decline.first().click();
-    await page.waitForTimeout(4000);
+    const denySettled = await waitForWire(
+      () => turnSettled().length > settledBeforeDeny,
+      120_000,
+      "declined turn settlement",
+    );
+    check("declined turn reached a durable terminal state", denySettled);
     denyGated = !existsSync(DENY_FILE);
     check(
       "DENY ACTUALLY BLOCKED THE TOOL (file absent on disk)",
@@ -247,27 +289,67 @@ try {
     );
   }
 
+  // --------------------------------------------------------------- CANCEL gates
+  step(4, "approval CANCEL must also block the tool on disk");
+  rmSync(CANCEL_FILE, { force: true });
+  await send(
+    `Use the shell tool exactly once to run: printf CANCELLED > ${shellPath(CANCEL_FILE)}. ` +
+      "Do not create or modify that path by another mechanism.",
+  );
+  try {
+    const { cancel } = await waitForApproval(CANCEL_FILE);
+    const settledBeforeCancel = turnSettled().length;
+    await cancel.first().click();
+    const cancelSettled = await waitForWire(
+      () => turnSettled().length > settledBeforeCancel,
+      120_000,
+      "cancelled turn settlement",
+    );
+    check("cancelled turn reached a durable terminal state", cancelSettled);
+    check(
+      "CANCEL ACTUALLY BLOCKED THE TOOL (file absent on disk)",
+      !existsSync(CANCEL_FILE),
+      existsSync(CANCEL_FILE)
+        ? `BLOCKER: ${CANCEL_FILE} EXISTS — the tool ran despite cancel`
+        : `${CANCEL_FILE} correctly absent`,
+    );
+  } catch (e) {
+    check("a cancel-capable approval prompt appeared", false, e.message);
+    check("no cancel prompt AND no unapproved write", !existsSync(CANCEL_FILE));
+  }
+
   // ---------------------------------------------------------------- APPROVE runs
-  step(4, "second turn on the SAME thread + approval ALLOW must run the tool");
+  step(5, "next turn on the SAME thread + approval ALLOW must run the tool");
   const threadUrl = page.url();
   const transcriptBefore = (await transcriptText()).length;
   rmSync(ALLOW_FILE, { force: true });
   await send(
-    `Now create a file at the absolute path ${ALLOW_FILE} containing the single word ALLOWED. ` +
-      `Use your file-writing tool. Do not ask me anything first.`,
+    `Use the shell tool exactly once to run: printf ALLOWED > ${shellPath(ALLOW_FILE)}. ` +
+      `Do not create or modify that path by another mechanism.`,
   );
   check("second turn stayed on the same thread route", page.url() === threadUrl, page.url());
 
   try {
-    const { approve } = await waitForApproval();
+    const { approve } = await waitForApproval(ALLOW_FILE);
+    const settledBeforeApprove = turnSettled().length;
     await approve.first().click();
-    await page.waitForTimeout(6000);
+    const appeared = await waitForFile(ALLOW_FILE);
+    const approveSettled = await waitForWire(
+      () => turnSettled().length > settledBeforeApprove,
+      120_000,
+      "approved turn settlement",
+    );
+    check("approved turn reached a durable terminal state", approveSettled);
     check(
       "APPROVE ran the tool (file present on disk)",
-      existsSync(ALLOW_FILE),
-      existsSync(ALLOW_FILE)
+      appeared && existsSync(ALLOW_FILE),
+      appeared && existsSync(ALLOW_FILE)
         ? `${ALLOW_FILE} written`
         : `${ALLOW_FILE} never appeared after approve`,
+    );
+    check(
+      "APPROVE granted exactly the requested write",
+      existsSync(ALLOW_FILE) && readFileSync(ALLOW_FILE, "utf8").trim() === "ALLOWED",
     );
   } catch (e) {
     check("an approval prompt appeared for the second tool call", false, e.message);
@@ -286,8 +368,118 @@ try {
     `${turnStarted().length} started / ${turnSettled().length} settled`,
   );
 
+  // ------------------------------------------------------- session-wide approval
+  step(6, "Always allow this session applies to a later tool call in the same turn");
+  rmSync(SESSION_FIRST_FILE, { force: true });
+  rmSync(SESSION_SECOND_FILE, { force: true });
+  const settledBeforeSession = turnSettled().length;
+  await send(
+    `Use two separate shell tool calls in order. First run: printf FIRST > ${shellPath(
+      SESSION_FIRST_FILE,
+    )}. Only after that call completes, run: printf SECOND > ${shellPath(
+      SESSION_SECOND_FILE,
+    )}. ` +
+      "Do not combine the commands or create either path by another mechanism.",
+  );
+  try {
+    const { always, detail } = await waitForApproval(SESSION_FIRST_FILE);
+    check(
+      "the first approval contains only the first write",
+      !(await detail.innerText()).includes(SESSION_SECOND_FILE),
+    );
+    await always.first().click();
+    check("first session-approved write reached disk", await waitForFile(SESSION_FIRST_FILE));
+
+    const secondApproval = waitForApproval(SESSION_SECOND_FILE)
+      .then(() => "approval")
+      .catch(() => "timeout");
+    const secondWrite = waitForFile(SESSION_SECOND_FILE).then((created) =>
+      created ? "file" : "timeout",
+    );
+    const secondOutcome = await Promise.race([secondApproval, secondWrite]);
+    check(
+      "the second same-session tool call ran without another prompt",
+      secondOutcome === "file",
+      `first observed outcome: ${secondOutcome}`,
+    );
+    if (secondOutcome === "approval") {
+      const { decline } = await waitForApproval(SESSION_SECOND_FILE);
+      await decline.first().click();
+    }
+    const sessionSettled = await waitForWire(
+      () => turnSettled().length > settledBeforeSession,
+      120_000,
+      "session-wide turn settlement",
+    );
+    check("session-wide turn reached a durable terminal state", sessionSettled);
+  } catch (e) {
+    check("session-wide approval lifecycle completed", false, e.message);
+  }
+
+  // ---------------------------------------------- interrupt invalidates approval
+  step(7, "an approval response sent after interrupt cannot execute");
+  rmSync(INTERRUPTED_FILE, { force: true });
+  const settledBeforeInterrupted = turnSettled().length;
+  await send(
+    `Use the shell tool exactly once to run: printf INTERRUPTED > ${shellPath(
+      INTERRUPTED_FILE,
+    )}. ` +
+      "Do not create or modify that path by another mechanism.",
+  );
+  try {
+    const { approve } = await waitForApproval(INTERRUPTED_FILE);
+    const interruptsBefore = frames.filter(
+      (f) => f.dir === "c2s" && f.payload.includes('"thread.turn.interrupt"'),
+    ).length;
+    const responsesBefore = frames.filter(
+      (f) => f.dir === "c2s" && f.payload.includes('"thread.approval.respond"'),
+    ).length;
+    const stop = page.getByRole("button", { name: "Stop generation" });
+    await stop.click();
+    check(
+      "interrupt command reached the socket before the late answer",
+      await waitForWire(
+        () =>
+          frames.filter(
+            (f) => f.dir === "c2s" && f.payload.includes('"thread.turn.interrupt"'),
+          ).length > interruptsBefore,
+        30_000,
+        "interrupt command",
+      ),
+    );
+    const lateAnswerVisible = await approve.first().isVisible();
+    check("approval remained operable for the late-response probe", lateAnswerVisible);
+    if (lateAnswerVisible) await approve.first().click();
+    check(
+      "late approval response reached the socket",
+      lateAnswerVisible &&
+        (await waitForWire(
+          () =>
+            frames.filter(
+              (f) => f.dir === "c2s" && f.payload.includes('"thread.approval.respond"'),
+            ).length > responsesBefore,
+          30_000,
+          "late approval response",
+        )),
+    );
+    const interruptedSettled = await waitForWire(
+      () => turnSettled().length > settledBeforeInterrupted,
+      120_000,
+      "interrupted turn settlement",
+    );
+    check("interrupted turn reached a durable terminal state", interruptedSettled);
+    check(
+      "interrupted approval never executed the process side effect",
+      !existsSync(INTERRUPTED_FILE),
+      existsSync(INTERRUPTED_FILE) ? `BLOCKER: ${INTERRUPTED_FILE} exists` : "correctly absent",
+    );
+  } catch (e) {
+    check("post-interrupt approval lifecycle completed", false, e.message);
+    check("interrupted tool still left no file", !existsSync(INTERRUPTED_FILE));
+  }
+
   // ---------------------------------------------------------------- stop
-  step(5, "stop must actually stop a running turn");
+  step(8, "stop must actually stop a running turn");
   await send("Count slowly from 1 to 500, one number per line, with a short pause between each.");
   const stop = page.getByRole("button", { name: /stop|cancel/i }).first();
   const sawStop = await stop
@@ -332,14 +524,22 @@ try {
 } finally {
   step("disk", "final on-disk state — the evidence deny/allow is judged by");
   console.log(`  ${DENY_FILE}  exists=${existsSync(DENY_FILE)}   (MUST be false)`);
+  console.log(`  ${CANCEL_FILE}  exists=${existsSync(CANCEL_FILE)}   (MUST be false)`);
   console.log(`  ${ALLOW_FILE}  exists=${existsSync(ALLOW_FILE)}   (MUST be true)`);
+  console.log(
+    `  ${SESSION_FIRST_FILE}  exists=${existsSync(SESSION_FIRST_FILE)}   (MUST be true)`,
+  );
+  console.log(
+    `  ${SESSION_SECOND_FILE}  exists=${existsSync(SESSION_SECOND_FILE)}   (MUST be true)`,
+  );
+  console.log(`  ${INTERRUPTED_FILE}  exists=${existsSync(INTERRUPTED_FILE)}   (MUST be false)`);
   step("frames", `${frames.length} websocket frames captured`);
   for (const t of [
     "thread.turn.start",
-    "thread.message.assistant.delta",
+    '"role":"assistant"',
     "tool",
-    "approval",
-    "thread.turn.stop",
+    "thread.approval.respond",
+    "thread.turn.interrupt",
   ]) {
     console.log(
       `  ${String(frames.filter((f) => f.payload.includes(t)).length).padStart(4)}  ${t}`,
