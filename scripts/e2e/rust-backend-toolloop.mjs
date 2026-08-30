@@ -181,13 +181,47 @@ try {
   // authenticated. Select the provider the test declaration names through the
   // same picker a person uses; otherwise the harness silently exercises the
   // first configured CLI and can fail before reaching the approval boundary.
+  //
+  // The picker's own model list is PER-TAB: it renders only the currently
+  // selected provider's models plus a left rail of provider icons
+  // (`[data-model-picker-provider]`), and the in-picker search box filters
+  // within that same tab rather than across all of them. A `getByText` for
+  // the declared model therefore only ever finds it when the picker already
+  // happens to default to that provider — true for the first tab, false for
+  // every other configured instance. Click through each tab (skipping
+  // "favorites", which is not a provider) until the model becomes visible.
   if (E2E_MODEL) {
     await page.locator('[data-chat-provider-model-picker="true"]').click();
     const model = page.getByText(E2E_MODEL, { exact: false }).first();
+    const tabs = page.locator(
+      '[data-model-picker-sidebar="true"] [data-model-picker-provider]:not([data-model-picker-provider="favorites"]) button',
+    );
+    const tabCount = await tabs.count();
+    for (let i = 0; i < tabCount; i++) {
+      if (await model.isVisible().catch(() => false)) break;
+      await tabs.nth(i).click();
+      await page.waitForTimeout(200);
+    }
     await model.waitFor({ state: "visible", timeout: 30_000 });
     await model.click();
     check("declared E2E model selected through the real picker", true, E2E_MODEL);
   }
+
+  // A new thread starts in "Full access" (`gated=0` in the server's own turn
+  // policy log): the runtime executes tools without ever raising an approval
+  // prompt. Sending the DENY/APPROVE probes against that default would not
+  // test the gate at all — a run with no approval prompt and no unapproved
+  // write looks identical whether the gate works or the mode never asked in
+  // the first place. Switch to "Supervised" through the same Runtime mode
+  // control a person uses, so the boundary this file exists to prove is the
+  // one actually in effect.
+  await page.locator('[aria-label="Runtime mode"]').click();
+  await page.getByRole("option", { name: /^Supervised/ }).click();
+  await page.waitForTimeout(300);
+  check(
+    "runtime mode switched to Supervised through the real control",
+    (await page.locator('[aria-label="Runtime mode"]').innerText()).includes("Supervised"),
+  );
 
   // ---------------------------------------------------------------- empty send
   step(2, "whitespace-only send must be a no-op");
