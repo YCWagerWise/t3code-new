@@ -16,7 +16,11 @@
     "e2e:preview-refresh-focus-zoom": "node e2e/run.ts preview-refresh-focus-zoom",
     "e2e:rust-actions": "node e2e/rust-backend-actions.mjs",
     "e2e:chat-new-draft-promotion": "node e2e/actions/verify-chat-new-draft-promotion.mjs",
-    "e2e:diff-source-control": "node e2e/actions/verify-diff-source-control-right-panel.mjs"
+    "e2e:diff-source-control": "node e2e/actions/verify-diff-source-control-right-panel.mjs",
+    "e2e:terminal-new": "playwright test e2e/actions/terminal-new.spec.ts",
+    "e2e:commandpalette-toggle": "playwright test e2e/actions/commandpalette-toggle.spec.ts",
+    "e2e:projects-files-assets-14": "playwright test e2e/actions/projects-files-assets-14.spec.ts",
+    "e2e:vcs-sourcecontrol-git-16": "playwright test e2e/actions/vcs-sourcecontrol-git-16.spec.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.1",

@@ -754,6 +754,7 @@ async fn request_on(
         tx,
         state,
         scope,
+        None,
     )
     .await;
 }
@@ -8758,6 +8759,26 @@ async fn filesystem_browse_and_open_in_editor_are_implemented() {
         "the failure is an admission refusal, not a host directory listing: {msg}"
     );
 
+
+    // Supplying a foreign cwd does not move the browse root outside the
+    // workspace admission gate either.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    request(
+        &state,
+        &tx,
+        "filesystem.browse",
+        json!({ "cwd": "/etc", "partialPath": "pam" }),
+    )
+    .await;
+    let foreign = drain(&mut rx);
+    assert_eq!(foreign[0]["exit"]["_tag"], "Failure");
+    let msg = foreign[0]["exit"]["cause"].to_string();
+    assert!(
+        msg.contains("not this environment's workspace")
+            || msg.contains("path escapes the workspace"),
+        "the failure is classified: {msg}"
+    );
+
     // open-in-editor: an installed editor launch crosses hearth, so the result
     // is a durable job id and the process is observable/killable through the
     // same background lane as agent commands.
@@ -13796,6 +13817,60 @@ async fn terminal_lifecycle_does_not_ack_success_when_the_event_cannot_be_publis
     );
 }
 
+/// #469: the promoted-thread HTTP snapshot route must be a real Rust backend
+/// route, not the capture fallback.
+///
+/// The client calls this after a draft becomes a durable thread. Before the
+/// route existed, the request fell through to `capture_http` and 404'd on the
+/// REAL thread id, leaving reload/deep-link hydration with no authoritative
+/// snapshot. Bind the real router and speak HTTP so the route table is part of
+/// the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promoted_thread_snapshot_is_served_over_http_without_a_tail() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (state, _dir) = test_state().await;
+    state.rt.save_thread(&thread_row_ck("t-http-snapshot")).await.unwrap();
+    seed_prompt(&state, "t-http-snapshot", "u1", "promote this draft").await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, super::build_app(state)).await;
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to real router");
+    stream
+        .write_all(
+            b"GET /api/orchestration/threads/t-http-snapshot HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    server.abort();
+
+    let raw = String::from_utf8(raw).expect("utf8 response");
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .expect("HTTP response has headers and body");
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "snapshot route fell through or failed: {raw}"
+    );
+    let body: Value = serde_json::from_str(body).expect("snapshot JSON");
+    assert_eq!(body["thread"]["id"], "t-http-snapshot");
+    assert_eq!(body["thread"]["messages"][0]["id"], "u1");
+    assert!(
+        body.get("snapshot_tail").is_none() && body.get("snapshotTail").is_none(),
+        "HTTP snapshots must not attach a durable tail nobody drains: {body:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #432 — WebSocket head-of-line blocking.
 //
@@ -13877,6 +13952,303 @@ mod ws_head_of_line {
     fn is_exit_for(v: &Value, id: &str) -> bool {
         v.get("_tag").and_then(Value::as_str) == Some("Exit")
             && v.get("requestId").and_then(Value::as_str) == Some(id)
+    }
+
+    fn is_failure_exit_for(v: &Value, id: &str) -> bool {
+        is_exit_for(v, id)
+            && v.pointer("/exit/_tag").and_then(Value::as_str) == Some("Failure")
+    }
+
+    async fn assert_failure_exit<S>(stream: &mut S, id: &str)
+    where
+        S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let (failed, seen) =
+            read_until(stream, std::time::Duration::from_secs(20), |v| is_failure_exit_for(v, id))
+                .await;
+        assert!(failed, "{id} was not refused; frames seen: {seen:?}");
+    }
+
+    async fn assert_success_exit<S>(stream: &mut S, id: &str)
+    where
+        S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let (succeeded, seen) = read_until(stream, std::time::Duration::from_secs(20), |v| {
+            is_exit_for(v, id) && v.pointer("/exit/_tag").and_then(Value::as_str) == Some("Success")
+        })
+        .await;
+        assert!(succeeded, "{id} did not succeed; frames seen: {seen:?}");
+    }
+
+    async fn subscribe_thread<S>(stream: &mut S, id: &str, thread_id: &str)
+    where
+        S: futures::Sink<WsMessage>
+            + StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+        <S as futures::Sink<WsMessage>>::Error: std::fmt::Debug,
+    {
+        stream
+            .send(request(
+                id,
+                "orchestration.subscribeThread",
+                json!({ "threadId": thread_id }),
+            ))
+            .await
+            .expect("send subscribeThread");
+        let (live, seen) = read_until(stream, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Chunk")
+                && v.get("requestId").and_then(Value::as_str) == Some(id)
+        })
+        .await;
+        assert!(live, "subscribeThread never streamed a Chunk; frames seen: {seen:?}");
+    }
+
+    /// Terminal ownership is enforced at the WebSocket boundary, not just by
+    /// namespacing pane ids in the registry. A client that knows another
+    /// thread's owner and terminal id must not be able to drive, replace, close,
+    /// or attach to that pane.
+    #[tokio::test]
+    async fn terminal_control_from_another_socket_is_refused() {
+        let (state, _dir) = test_state().await;
+        let cwd = state.cwd.clone();
+        state.rt.save_thread(&thread_row_ck("owner-1")).await.unwrap();
+        state.rt.save_thread(&thread_row_ck("owner-2")).await.unwrap();
+
+        let (url, server) = serve(state).await;
+        let (mut owner1, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect owner-1");
+        let (mut owner2, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect owner-2");
+
+        subscribe_thread(&mut owner1, "sub-1", "owner-1").await;
+        subscribe_thread(&mut owner2, "sub-2", "owner-2").await;
+
+        owner2
+            .send(request(
+                "open-2",
+                "terminal.open",
+                json!({
+                    "threadId": "owner-2",
+                    "terminalId": "shared",
+                    "cwd": cwd.clone(),
+                }),
+            ))
+            .await
+            .expect("owner-2 opens its pane");
+        assert_success_exit(&mut owner2, "open-2").await;
+
+        let attempts = [
+            (
+                "cross-open",
+                "terminal.open",
+                json!({ "threadId": "owner-2", "terminalId": "fresh-cross", "cwd": cwd.clone() }),
+            ),
+            (
+                "cross-restart",
+                "terminal.restart",
+                json!({ "threadId": "owner-2", "terminalId": "shared", "cwd": cwd.clone() }),
+            ),
+            (
+                "cross-write",
+                "terminal.write",
+                json!({ "threadId": "owner-2", "terminalId": "shared", "data": "echo stolen\n" }),
+            ),
+            (
+                "cross-resize",
+                "terminal.resize",
+                json!({ "threadId": "owner-2", "terminalId": "shared", "cols": 80, "rows": 24 }),
+            ),
+            (
+                "cross-clear",
+                "terminal.clear",
+                json!({ "threadId": "owner-2", "terminalId": "shared" }),
+            ),
+            (
+                "cross-attach",
+                "terminal.attach",
+                json!({ "threadId": "owner-2", "terminalId": "shared", "cwd": cwd.clone() }),
+            ),
+            (
+                "cross-events",
+                "subscribeTerminalEvents",
+                json!({ "threadId": "owner-2", "terminalId": "shared" }),
+            ),
+            (
+                "cross-metadata",
+                "subscribeTerminalMetadata",
+                json!({ "threadId": "owner-2" }),
+            ),
+            (
+                "cross-close",
+                "terminal.close",
+                json!({ "threadId": "owner-2", "terminalId": "shared" }),
+            ),
+        ];
+
+        for (id, method, payload) in attempts {
+            owner1
+                .send(request(id, method, payload))
+                .await
+                .expect("send cross-owner terminal request");
+            assert_failure_exit(&mut owner1, id).await;
+        }
+
+        owner2
+            .send(request(
+                "owner-2-still-controls",
+                "terminal.write",
+                json!({ "threadId": "owner-2", "terminalId": "shared", "data": "echo owned\n" }),
+            ))
+            .await
+            .expect("owner-2 still writes its pane");
+        assert_success_exit(&mut owner2, "owner-2-still-controls").await;
+
+        server.abort();
+    }
+
+    /// #496: parent-thread WebSocket authority also authorizes that thread's
+    /// durable child/session terminal owners, but only after the server proves
+    /// the session is actually bound to the subscribed parent thread.
+    #[tokio::test]
+    async fn parent_thread_subscriber_can_drive_its_bound_session_terminal() {
+        let (state, _dir) = test_state().await;
+        let cwd = state.cwd.clone();
+        state
+            .rt
+            .save_thread(&thread_row_ck("parent-thread"))
+            .await
+            .unwrap();
+        state
+            .rt
+            .save_thread(&thread_row_ck("other-thread"))
+            .await
+            .unwrap();
+
+        let binding = SessionBinding {
+            thread_id: "parent-thread".into(),
+            provider_instance_id: "claude_resume:test".into(),
+            model_key: "k".into(),
+        };
+        let def = AgentDefinition {
+            name: "t3code".into(),
+            instructions: String::new(),
+            model: ModelRef::ClaudeResume {
+                model: "test".into(),
+            },
+            tools: vec![],
+            ask_tools: vec![],
+            subagents: vec![],
+            mcp_servers: vec![],
+            labels: Default::default(),
+            options: vec![],
+            cwd: Some(cwd.clone()),
+        };
+        let session_id = state.rt.session_for(&binding, def).await.unwrap();
+        assert!(
+            state
+                .rt
+                .sessions_for_thread("parent-thread")
+                .await
+                .unwrap()
+                .contains(&session_id),
+            "precondition: session is durably bound to parent-thread"
+        );
+
+        let (url, server) = serve(state).await;
+        let (mut parent, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect parent socket");
+        let (mut stranger, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect stranger socket");
+
+        subscribe_thread(&mut parent, "sub-parent", "parent-thread").await;
+        subscribe_thread(&mut stranger, "sub-other", "other-thread").await;
+
+        let child_payload = json!({
+            "threadId": "parent-thread",
+            "sessionId": session_id,
+            "terminalId": "child-pane",
+            "cwd": cwd,
+        });
+
+        parent
+            .send(request(
+                "parent-attach-child",
+                "terminal.attach",
+                child_payload.clone(),
+            ))
+            .await
+            .expect("parent attaches child-session pane");
+        let (attached, seen) = read_until(&mut parent, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Chunk")
+                && v.get("requestId").and_then(Value::as_str) == Some("parent-attach-child")
+                && v.pointer("/values/0/type").and_then(Value::as_str) == Some("snapshot")
+        })
+        .await;
+        assert!(
+            attached,
+            "parent thread subscriber could not attach child session pane: {seen:?}"
+        );
+
+        let mut write_payload = child_payload.clone();
+        write_payload["data"] = json!("echo child-authorized\n");
+        parent
+            .send(request(
+                "parent-write-child",
+                "terminal.write",
+                write_payload.clone(),
+            ))
+            .await
+            .expect("parent writes child-session pane");
+        assert_success_exit(&mut parent, "parent-write-child").await;
+
+        parent
+            .send(request(
+                "parent-events-child",
+                "subscribeTerminalEvents",
+                child_payload.clone(),
+            ))
+            .await
+            .expect("parent subscribes child-session terminal events");
+        let (events, seen) = read_until(&mut parent, std::time::Duration::from_secs(20), |v| {
+            v.get("_tag").and_then(Value::as_str) == Some("Chunk")
+                && v.get("requestId").and_then(Value::as_str) == Some("parent-events-child")
+                && v.pointer("/values/0/type").and_then(Value::as_str) == Some("started")
+        })
+        .await;
+        assert!(
+            events,
+            "parent thread subscriber could not subscribe child terminal events: {seen:?}"
+        );
+
+        for (id, method, payload) in [
+            (
+                "stranger-attach-child",
+                "terminal.attach",
+                child_payload.clone(),
+            ),
+            (
+                "stranger-write-child",
+                "terminal.write",
+                write_payload.clone(),
+            ),
+            (
+                "stranger-events-child",
+                "subscribeTerminalEvents",
+                child_payload.clone(),
+            ),
+        ] {
+            stranger
+                .send(request(id, method, payload))
+                .await
+                .expect("send stranger child-session terminal request");
+            assert_failure_exit(&mut stranger, id).await;
+        }
+
+        server.abort();
     }
 
     /// THE REGRESSION. A request sent after a live subscription must still be
